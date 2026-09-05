@@ -2340,7 +2340,7 @@ def _write_synthetic_table_b1_csv(route: LineString, output_path: Path) -> None:
             "source_comment": "",
             "asset_scope": "PL854_PL855_PIGGYBACK_CORRIDOR",
             "evidence_role": "HISTORICAL_SPATIAL_FREESPAN_CORRIDOR_EVIDENCE",
-            "source_page": "",
+            "source_page": 44,
             "source_table": "Appendix B Table B.1",
         }
 
@@ -2521,6 +2521,12 @@ def test_build_freespan_spatial_evidence_command_end_to_end(
     map_2018_path = processed_dir / "maps" / "pl854_observed_freespans_2018.png"
     map_historical_path = processed_dir / "maps" / "pl854_historical_freespans_2012_2018.png"
     profile_path = processed_dir / "maps" / "pl854_2018_freespan_model_context_profile.png"
+    temporal_figure_path = processed_dir / "maps" / "pl854_source_stated_freespan_evolution.png"
+    temporal_evidence_path = (
+        processed_dir
+        / "pipeline_condition"
+        / "anglia_freespan_temporal_relationship_evidence.parquet"
+    )
 
     for path in (
         evidence_parquet_path,
@@ -2533,6 +2539,8 @@ def test_build_freespan_spatial_evidence_command_end_to_end(
         map_2018_path,
         map_historical_path,
         profile_path,
+        temporal_figure_path,
+        temporal_evidence_path,
     ):
         assert path.exists(), path
         assert path.stat().st_size > 0
@@ -2541,6 +2549,7 @@ def test_build_freespan_spatial_evidence_command_end_to_end(
     assert len(evidence_df) == 17
     assert set(evidence_df["individual_line_attribution"]) == {"UNRESOLVED"}
     assert set(evidence_df["asset_scope"]) == {"PL854_PL855_PIGGYBACK_CORRIDOR"}
+    assert (evidence_df["source_page"] == 44).all()
 
     evidence_2018_df = pd.read_parquet(evidence_2018_path)
     assert len(evidence_2018_df) == 8
@@ -2556,6 +2565,33 @@ def test_build_freespan_spatial_evidence_command_end_to_end(
         reconciliation["source_crs_status"]
         == "CRS_INFERRED_FROM_SPATIAL_CONSISTENCY_NOT_SOURCE_STATED"
     )
+    assert reconciliation["table_b1_source_comments_preserved"] is True
+    assert reconciliation["source_stated_temporal_relationships_available"] is True
+    assert reconciliation["automatic_cross_survey_matching_applied"] is False
+    assert reconciliation["2014_partial_coverage_source_stated"] is True
+    assert reconciliation["2018_full_route_negative_label_assumption_applied"] is False
+    assert (
+        reconciliation["survey_coverage_semantics"]["2014"]["coverage_status"]
+        == "PARTIAL_ROUTE_COVERAGE_SOURCE_STATED"
+    )
+    assert (
+        reconciliation["survey_coverage_semantics"]["2018"]["coverage_status"]
+        == "PRE_DECOMMISSIONING_SURVEY"
+    )
+
+    temporal_evidence_df = pd.read_parquet(temporal_evidence_path)
+    assert len(temporal_evidence_df) == 14
+    forbidden_temporal = ("score", "probability", "prediction", "rank")
+    assert not any(
+        token in c.lower() for c in temporal_evidence_df.columns for token in forbidden_temporal
+    )
+    same_span = temporal_evidence_df[
+        temporal_evidence_df["relationship_type"] == "SOURCE_STATED_SAME_SPAN"
+    ]
+    assert len(same_span) == 3  # 2014-05<->2018-06, 2014-06<->2018-07, 2012-02<->(unresolved)
+
+    benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    assert benchmark["comparative_assessment_freespan_locations_tabulated"] is True
 
     benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
     assert benchmark["2018_freespan_spatial_evidence_available"] is True

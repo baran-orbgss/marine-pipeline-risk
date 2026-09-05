@@ -50,10 +50,17 @@ from marine_engine.providers.nsta import (
     print_ingestion_report,
 )
 from marine_engine.providers.sediment import bgs as sediment_bgs
-from marine_engine.resources import AngliaTableB1ChecksumError, load_anglia_table_b1_freespans
+from marine_engine.resources import (
+    ANGLIA_TABLE_B1_FREESPAN_RELATIONSHIPS_CSV,
+    AngliaFreespanRelationshipValidationError,
+    AngliaTableB1ChecksumError,
+    load_anglia_table_b1_freespan_relationships,
+    load_anglia_table_b1_freespans,
+)
 from marine_engine.scour import (
     freespan_evidence,
     freespan_evidence_map,
+    freespan_temporal_provenance,
     pipeline_condition,
     scour_onset,
     scour_onset_map,
@@ -3467,6 +3474,12 @@ def _cmd_build_freespan_spatial_evidence(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    try:
+        relationships_df = load_anglia_table_b1_freespan_relationships()
+    except AngliaFreespanRelationshipValidationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     # --- CRS candidate evaluation + acceptance guard (Sections 7-9) ------------
     diagnostics_by_epsg = {
         epsg: freespan_evidence.evaluate_crs_candidate(events_df, route, working_crs, epsg)
@@ -3517,6 +3530,14 @@ def _cmd_build_freespan_spatial_evidence(args: argparse.Namespace) -> int:
         scour_onset_segments_df=scour_onset_segments_df,
     )
 
+    # --- MAR-014B: source-stated temporal/lineage relationship evidence --------
+    temporal_evidence_df = (
+        freespan_temporal_provenance.build_freespan_temporal_relationship_evidence(
+            relationships_df, events_all_gdf
+        )
+    )
+    coverage_metadata = freespan_temporal_provenance.build_survey_coverage_metadata()
+
     # --- write canonical outputs -------------------------------------------------
     freespan_dir = study_dir / "freespan_evidence"
     validation_dir = study_dir / "validation"
@@ -3539,6 +3560,12 @@ def _cmd_build_freespan_spatial_evidence(args: argparse.Namespace) -> int:
     )
     model_context_path = metocean_evidence.write_parquet(
         context_df, validation_dir / "2018_freespan_model_context.parquet"
+    )
+    temporal_evidence_path = (
+        freespan_temporal_provenance.write_freespan_temporal_relationship_evidence(
+            temporal_evidence_df,
+            pipeline_condition_dir / "anglia_freespan_temporal_relationship_evidence.parquet",
+        )
     )
 
     # --- Section 20: refresh the 2018 condition benchmark with corrected flags --
@@ -3568,6 +3595,9 @@ def _cmd_build_freespan_spatial_evidence(args: argparse.Namespace) -> int:
 
     profile_path = freespan_evidence_map.render_freespan_model_context_profile(
         context_df=context_df,
+        events_2018_span_df=events_2018_df[
+            ["event_id", "canonical_chainage_min_m", "canonical_chainage_max_m"]
+        ],
         combined_bed_shear_segments_df=combined_bed_shear_segments_df,
         noncohesive_mobility_segments_df=noncohesive_mobility_segments_df,
         scour_onset_segments_df=scour_onset_segments_df,
@@ -3575,6 +3605,14 @@ def _cmd_build_freespan_spatial_evidence(args: argparse.Namespace) -> int:
         output_path=maps_dir / "pl854_2018_freespan_model_context_profile.png",
     )
     profile_dimensions = freespan_evidence_map.read_png_dimensions(profile_path)
+
+    temporal_figure_path = freespan_evidence_map.render_freespan_temporal_evolution_figure(
+        temporal_evidence_df=temporal_evidence_df,
+        route=route,
+        output_path=maps_dir / "pl854_source_stated_freespan_evolution.png",
+        background_raster_path=background_raster_path,
+    )
+    temporal_figure_dimensions = freespan_evidence_map.read_png_dimensions(temporal_figure_path)
 
     # --- CRS/route reconciliation metadata (Section 24) -------------------------
     gaps_2014 = freespan_evidence_map.compute_2014_coverage_gap_zones(events_all_gdf)
@@ -3674,6 +3712,13 @@ def _cmd_build_freespan_spatial_evidence(args: argparse.Namespace) -> int:
             "No score, probability, rank, or accuracy metric has been computed anywhere in "
             "this output.",
         ],
+        # --- MAR-014B Section 12 -------------------------------------------------
+        "table_b1_source_comments_preserved": True,
+        "source_stated_temporal_relationships_available": True,
+        "automatic_cross_survey_matching_applied": False,
+        "2014_partial_coverage_source_stated": True,
+        "2018_full_route_negative_label_assumption_applied": False,
+        "survey_coverage_semantics": coverage_metadata,
         "outputs": {
             "anglia_freespan_spatial_evidence_parquet": str(evidence_parquet_path),
             "anglia_freespan_spatial_evidence_gpkg": str(evidence_gpkg_path),
@@ -3681,9 +3726,14 @@ def _cmd_build_freespan_spatial_evidence(args: argparse.Namespace) -> int:
             "freespan_segment_event_counts_2018_parquet": str(segment_counts_path),
             "2018_freespan_model_context_parquet": str(model_context_path),
             "anglia_2018_condition_benchmark_json": str(benchmark_path),
+            "anglia_table_b1_freespan_relationships_csv": str(
+                ANGLIA_TABLE_B1_FREESPAN_RELATIONSHIPS_CSV
+            ),
+            "anglia_freespan_temporal_relationship_evidence_parquet": str(temporal_evidence_path),
             "map_2018_png": str(map_2018_path),
             "map_historical_png": str(map_historical_path),
             "model_context_profile_png": str(profile_path),
+            "freespan_temporal_evolution_figure_png": str(temporal_figure_path),
         },
     }
     metadata_path = freespan_dir / "anglia_freespan_spatial_reconciliation_metadata.json"
@@ -3699,11 +3749,16 @@ def _cmd_build_freespan_spatial_evidence(args: argparse.Namespace) -> int:
     )
     print(f"Segment event counts: {len(segment_counts_df)} segment(s) -> {segment_counts_path}")
     print(f"2018 model context: {len(context_df)} event(s) -> {model_context_path}")
+    print(
+        f"Temporal relationship evidence: {len(temporal_evidence_df)} row(s) -> "
+        f"{temporal_evidence_path}"
+    )
     print(f"2018 condition benchmark (refreshed): {benchmark_path}")
     print(f"Reconciliation metadata: {metadata_path}")
     print(f"Map (2018): {map_2018_path}")
     print(f"Map (historical): {map_historical_path}")
     print(f"Model-context profile: {profile_path}")
+    print(f"Temporal evolution figure: {temporal_figure_path}")
     print()
     freespan_evidence_map.print_freespan_evidence_report(
         events_all_df=events_all_gdf,
@@ -3722,6 +3777,16 @@ def _cmd_build_freespan_spatial_evidence(args: argparse.Namespace) -> int:
         map_historical_dimensions=map_historical_dimensions,
         profile_path=profile_path,
         profile_dimensions=profile_dimensions,
+    )
+    print()
+    freespan_temporal_provenance.print_freespan_temporal_provenance_report(
+        freespans_df=events_all_gdf,
+        relationships_df=relationships_df,
+        temporal_evidence_df=temporal_evidence_df,
+        coverage_metadata=coverage_metadata,
+        temporal_evidence_path=temporal_evidence_path,
+        figure_path=temporal_figure_path,
+        figure_dimensions=temporal_figure_dimensions,
     )
     return 0
 

@@ -983,3 +983,62 @@ otherwise, never an interactive credential prompt.
   repo-wide `ruff format`/`ruff check` pass clean. No exposure probability,
   free-span probability, scour depth, VIV, fatigue, or arbitrary risk score
   is computed anywhere in this ticket -- no further ticket has started.
+
+- `MAR-014B`: repairs a real evidence gap MAR-014A left behind -- the
+  tracked Table B.1 CSV's `source_comment`/`source_page` columns were
+  blank, losing the source's own per-row remarks about which spans it
+  calls "the same span" across surveys, which changed length, and which
+  areas simply were not surveyed earlier. `source_page=44` (never
+  zero-based PDF numbering) is now set on all 17 rows, and 8 rows carry
+  their own preserved comment text (`scour/pipeline_condition.py` and the
+  CSV itself are unchanged in shape; only these two columns are filled
+  in). A brand-new tracked resource
+  (`resources/anglia_table_b1_freespan_relationships.csv`, loaded via
+  `load_anglia_table_b1_freespan_relationships`) separately encodes 14
+  machine-readable relationships: 8 event-level rows -- 3 same-span pairs
+  (2014-05<->2018-06 +8.14 m in 2018, 2014-06<->2018-07 +0.8 m in 2018,
+  both length deltas verified exactly against the tracked lengths; a third,
+  2012-02<->2014, whose SPECIFIC 2014 counterpart is genuinely ambiguous
+  from this transcription and is therefore recorded with a null
+  `event_id_b` rather than a guessed one) and 3
+  not-surveyed-in-2014 statements (2018-01/02/03) -- plus 6 pure
+  group/narrative statements (e.g. "the 2014 survey mapped only Anglia
+  West/Anglia A NUI/LOGGS, not the full route") that Table B.1's layout
+  does not tie to specific event IDs, and which are therefore NEVER forced
+  into a fabricated pair. `relationship_type` and `attribution_method` are
+  both hard allow-listed at load time (`DIRECT_TABLE_COMMENT` /
+  `DIRECT_DOCUMENT_NARRATIVE` only -- `SPATIAL_NEAREST_NEIGHBOUR` and
+  `INFERRED_MATCH` are deliberately never valid values, so a future edit
+  that tried to sneak in a spatially-inferred relationship would hard-fail
+  the loader, not silently pass).
+
+  A new module (`scour/freespan_temporal_provenance.py`) joins these
+  source-stated relationships against MAR-014A's own canonical chainage
+  (context only, never used to invent an unstated pairing) and writes
+  `pipeline_condition/anglia_freespan_temporal_relationship_evidence.parquet`
+  (14 rows, role `SOURCE_STATED_HISTORICAL_FREESPAN_EVOLUTION_EVIDENCE`,
+  no score/probability/prediction/rank field anywhere) plus explicit
+  survey coverage semantics: 2014 is
+  `PARTIAL_ROUTE_COVERAGE_SOURCE_STATED` (citing the source's own
+  Anglia-West/A-NUI/LOGGS-only statement), while 2018 is recorded only as
+  `PRE_DECOMMISSIONING_SURVEY` -- deliberately never promoted to a
+  route-wide "no freespan here" negative-coverage label
+  (`2018_full_route_negative_label_assumption_applied = false`) without a
+  future source explicitly stating that stronger claim. A new, genuinely
+  optional map (`maps/pl854_source_stated_freespan_evolution.png`) draws a
+  link ONLY between unambiguous same-span/length-change event pairs and a
+  marker for single-event statements, with every pure narrative statement
+  shown in a text box instead of an invented geometry. The existing
+  model-context profile (Section 11 presentation fix) now also draws each
+  2018 event's REAL observed span width (~0.2-23 m, never enlarged to stay
+  visible against the 23.5 km route) and fixes a label-crowding bug where
+  events anchored near chainage 0 could stagger into negative offsets and
+  overlap the y-axis itself -- fan-out direction is now chosen per cluster
+  to always point away from whichever route end is nearer. 17 new offline
+  tests were added across `test_resources.py`,
+  `test_freespan_temporal_provenance.py`, `test_freespan_evidence_map.py`,
+  and an extended `test_cli.py` end-to-end check; the full offline suite
+  (862 tests) and repo-wide `ruff format`/`ruff check` pass clean. No
+  susceptibility score, probability, prediction model, or automatic
+  cross-survey event matching was created anywhere in this ticket -- no
+  further ticket has started.

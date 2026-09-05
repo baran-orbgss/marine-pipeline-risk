@@ -250,23 +250,34 @@ def _stagger_offsets_by_proximity(
 def _stagger_label_x_offsets_by_proximity(
     chainages_m: list[float],
     total_length_m: float,
-    step: int = 10,
+    step: int = 12,
     proximity_fraction: float = 0.02,
 ) -> list[int]:
-    """Horizontal analogue of `_stagger_offsets_by_proximity`, alternating +/-
-    so a run of close points fans out left/right instead of stacking."""
+    """Horizontal analogue of `_stagger_offsets_by_proximity` -- a RUN of mutually
+    close points (values assumed pre-sorted) fans out horizontally instead of
+    stacking, always AWAY from whichever route edge the run sits nearer to.
+
+    Fanning in a fixed alternating +/- pattern (as MAR-014A originally did)
+    pushes labels near chainage 0 partly into negative offsets, i.e. past the
+    y-axis -- crowding the axis tick labels instead of the plot area
+    (MAR-014B Section 11). Biasing every run's whole fan away from its
+    nearer edge avoids that regardless of where the run sits.
+    """
 
     threshold_m = total_length_m * proximity_fraction
-    offsets = []
-    run_index = 0
-    for i, chainage in enumerate(chainages_m):
-        if i > 0 and (chainage - chainages_m[i - 1]) <= threshold_m:
-            run_index += 1
-        else:
-            run_index = 0
-        magnitude = (run_index + 1) // 2
-        sign = 1 if run_index % 2 == 1 else -1
-        offsets.append(0 if run_index == 0 else sign * magnitude * step)
+    offsets = [0] * len(chainages_m)
+    run_start = 0
+    for i in range(1, len(chainages_m) + 1):
+        run_broke = i == len(chainages_m) or (chainages_m[i] - chainages_m[i - 1]) > threshold_m
+        if not run_broke:
+            continue
+        run = list(range(run_start, i))
+        if len(run) > 1:
+            run_mean_chainage = sum(chainages_m[j] for j in run) / len(run)
+            direction = 1 if run_mean_chainage < total_length_m / 2.0 else -1
+            for rank, j in enumerate(run):
+                offsets[j] = direction * rank * step
+        run_start = i
     return offsets
 
 
@@ -507,6 +518,7 @@ def render_historical_freespan_evidence_map(
 def render_freespan_model_context_profile(
     *,
     context_df: pd.DataFrame,
+    events_2018_span_df: pd.DataFrame,
     combined_bed_shear_segments_df: pd.DataFrame,
     noncohesive_mobility_segments_df: pd.DataFrame,
     scour_onset_segments_df: pd.DataFrame,
@@ -517,7 +529,14 @@ def render_freespan_model_context_profile(
     """Three independent, separately-scaled panels (never fused into one score)
     juxtaposing MAR-012/013/014's own already-computed route-wide outputs against
     the 8 2018 event chainage positions, honestly showing MAR-014's field even
-    though it is spatially uniform along the whole route (Section 23)."""
+    though it is spatially uniform along the whole route (Section 23).
+
+    `events_2018_span_df` (`event_id`, `canonical_chainage_min_m`,
+    `canonical_chainage_max_m`) additionally draws each event's own REAL
+    observed-span width as a short horizontal marker (MAR-014B Section 11) --
+    true spans are ~0.2-23 m on a 23.5 km route, so this is never widened to
+    stay visible; an honest, near-invisible mark is the correct one.
+    """
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(3, 1, figsize=(12.0, 9.0), sharex=True)
@@ -549,10 +568,29 @@ def render_freespan_model_context_profile(
     ax_scour.set_ylabel("MAR-014 p95 required\nembedment upper (e/D)", fontsize=8)
     ax_scour.set_xlabel("Chainage (km)")
 
+    span_by_event_id = {
+        row["event_id"]: (row["canonical_chainage_min_m"], row["canonical_chainage_max_m"])
+        for _, row in events_2018_span_df.iterrows()
+    }
+
     for ax in axes:
         for _, event in context_df.iterrows():
             chainage_km = event["canonical_mid_chainage_m"] / 1000.0
             ax.axvline(chainage_km, color="tab:red", linestyle="--", linewidth=1.0, alpha=0.8)
+
+            span = span_by_event_id.get(event["event_id"])
+            if span is not None:
+                y0 = ax.get_ylim()[0]
+                ax.plot(
+                    [span[0] / 1000.0, span[1] / 1000.0],
+                    [y0, y0],
+                    color="tab:red",
+                    linewidth=4,
+                    solid_capstyle="butt",
+                    alpha=0.9,
+                    zorder=6,
+                    clip_on=False,
+                )
         ax.grid(True, alpha=0.3)
         ax.set_xlim(0, total_length_m / 1000.0)
 
@@ -580,9 +618,11 @@ def render_freespan_model_context_profile(
         fontweight="bold",
     )
     ax_shear.set_title(
-        "Vertical dashed lines: 8 official 2018 freespan event positions (Table B.1)",
+        "Dashed lines: 8 official 2018 freespan event positions. Solid base marks: "
+        "REAL observed span width.",
         fontsize=9,
         style="italic",
+        pad=32,
     )
 
     footer_lines = [
@@ -591,12 +631,183 @@ def render_freespan_model_context_profile(
         "shown for side-by-side human review only -- values are never fused, differenced, "
         "or scored against event presence, and event presence is not a validated outcome "
         "this model was fitted against.",
+        "Observed-span marks use each event's true length (~0.2-23 m) at true scale on this "
+        "23.5 km route -- never widened to stay visible.",
     ]
     fig.text(
         0.0, -0.02, "\n".join(footer_lines), ha="left", va="top", fontsize=8, color="0.2", wrap=True
     )
 
     fig.tight_layout()
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+# --- Map 4: source-stated freespan evolution evidence (MAR-014B Section 10) ------------
+
+
+def render_freespan_temporal_evolution_figure(
+    *,
+    temporal_evidence_df: pd.DataFrame,
+    route: LineString,
+    output_path: Path,
+    background_raster_path: Path | None = None,
+    title: str = "PL854/PL855 Corridor — Source-Stated Freespan Evolution Evidence",
+    dpi: int = 150,
+) -> Path:
+    """Draws a link ONLY where the source states a relationship AND both event
+    IDs are unambiguous (Section 10) -- never an inferred/nearest-neighbour
+    connection, and never using canonical chainage to invent a pairing the
+    source itself does not state. A single-event statement (e.g. "not
+    surveyed in 2014") gets a marker at that one event's own position. A
+    pure group/narrative statement (both event IDs null) is never given a
+    fabricated geometry -- it is listed in a text box instead.
+    """
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = _setup_route_axes(route, background_raster_path)
+
+    ax.plot(*route.xy, color="0.75", linewidth=1.5, zorder=1)
+    _add_kp_labels(ax, route)
+    _add_endpoint_labels(ax, route)
+    _add_scale_bar(ax)
+    _add_north_arrow(ax)
+
+    has_a = temporal_evidence_df["event_id_a"].notna()
+    has_b = temporal_evidence_df["event_id_b"].notna()
+    paired_df = temporal_evidence_df[has_a & has_b]
+    single_df = temporal_evidence_df[has_a & ~has_b]
+    narrative_df = temporal_evidence_df[~has_a & ~has_b]
+
+    # Collect every annotation task first (never rendered yet) so its ANCHOR
+    # chainage can be sorted and vertically staggered as one combined set --
+    # events from different relationship pairs can sit within a few hundred
+    # metres of each other on this 23.5 km route (Section 11's crowding fix
+    # applies here too, not just the model-context profile).
+    annotation_tasks = []
+
+    for (event_id_a, event_id_b), group in paired_df.groupby(["event_id_a", "event_id_b"]):
+        first = group.iloc[0]
+        point_a = route.interpolate(first["canonical_mid_chainage_a_m"])
+        point_b = route.interpolate(first["canonical_mid_chainage_b_m"])
+        ax.plot(
+            [point_a.x, point_b.x],
+            [point_a.y, point_b.y],
+            color="tab:purple",
+            linewidth=2.0,
+            zorder=3,
+            alpha=0.85,
+        )
+        for point in (point_a, point_b):
+            ax.plot(point.x, point.y, marker="o", markersize=7, color="tab:purple", zorder=4)
+        statements = "; ".join(group["source_statement"].tolist())
+        annotation_tasks.append(
+            {
+                "chainage_m": (
+                    first["canonical_mid_chainage_a_m"] + first["canonical_mid_chainage_b_m"]
+                )
+                / 2.0,
+                "anchor_x": (point_a.x + point_b.x) / 2.0,
+                "anchor_y": (point_a.y + point_b.y) / 2.0,
+                "text": f"{event_id_a} <-> {event_id_b}\n{statements}",
+                "facecolor": "lavender",
+            }
+        )
+
+    for event_id_a, group in single_df.groupby("event_id_a"):
+        first = group.iloc[0]
+        point = route.interpolate(first["canonical_mid_chainage_a_m"])
+        ax.plot(point.x, point.y, marker="^", markersize=8, color="tab:blue", zorder=4)
+        statements = "; ".join(group["source_statement"].tolist())
+        annotation_tasks.append(
+            {
+                "chainage_m": first["canonical_mid_chainage_a_m"],
+                "anchor_x": point.x,
+                "anchor_y": point.y,
+                "text": f"{event_id_a}\n{statements}",
+                "facecolor": "lightyellow",
+            }
+        )
+
+    annotation_tasks.sort(key=lambda t: t["chainage_m"])
+    y_offsets = _stagger_offsets_by_proximity(
+        [t["chainage_m"] for t in annotation_tasks], route.length, base=16, step=42
+    )
+    for task, y_offset in zip(annotation_tasks, y_offsets, strict=True):
+        ax.annotate(
+            task["text"],
+            (task["anchor_x"], task["anchor_y"]),
+            textcoords="offset points",
+            xytext=(0, y_offset),
+            fontsize=6,
+            ha="center",
+            bbox={"boxstyle": "round,pad=0.2", "fc": task["facecolor"], "ec": "0.5", "alpha": 0.9},
+        )
+
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            color="tab:purple",
+            linewidth=2,
+            marker="o",
+            label="Source-stated same-span / length-change relationship",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="^",
+            color="w",
+            markerfacecolor="tab:blue",
+            markersize=8,
+            label="Single-event source statement",
+        ),
+    ]
+    ax.legend(handles=legend_handles, loc="upper left", fontsize=7, framealpha=0.9)
+
+    fig.suptitle(title, fontsize=13, fontweight="bold", y=0.98)
+    ax.set_title(
+        "Links drawn ONLY where the source states a relationship AND both events are "
+        "unambiguous; group/narrative-only statements are listed below, never as geometry.",
+        fontsize=9,
+        style="italic",
+        pad=14,
+    )
+
+    if not narrative_df.empty:
+        narrative_lines = ["Group/narrative source statements (no specific event geometry):"]
+        for _, row in narrative_df.iterrows():
+            narrative_lines.append(f"- {row['source_statement']}")
+        ax.text(
+            0.99,
+            0.99,
+            "\n".join(narrative_lines),
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=6,
+            wrap=True,
+            bbox={"boxstyle": "round,pad=0.4", "fc": "white", "ec": "0.4", "alpha": 0.92},
+        )
+
+    footer_lines = [
+        CORRIDOR_SCOPE_STATEMENT,
+        "NO CROSS-SURVEY RELATIONSHIP WAS CREATED BY SPATIAL PROXIMITY ALONE.",
+        NO_SCORE_STATEMENT,
+    ]
+    ax.text(
+        0.0,
+        -0.14,
+        "\n".join(footer_lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+        color="0.2",
+        wrap=True,
+    )
+
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return output_path

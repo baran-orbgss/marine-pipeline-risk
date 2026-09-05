@@ -163,6 +163,20 @@ def test_U_model_context_profile_renderer_produces_a_nonempty_png(tmp_path: Path
             {"event_id": "2018-02", "canonical_mid_chainage_m": 5006.0},
         ]
     )
+    events_2018_span_df = pd.DataFrame.from_records(
+        [
+            {
+                "event_id": "2018-01",
+                "canonical_chainage_min_m": 1000.0,
+                "canonical_chainage_max_m": 1014.0,
+            },
+            {
+                "event_id": "2018-02",
+                "canonical_chainage_min_m": 5000.0,
+                "canonical_chainage_max_m": 5012.0,
+            },
+        ]
+    )
     segments_df = pd.DataFrame.from_records(
         [
             {
@@ -180,6 +194,7 @@ def test_U_model_context_profile_renderer_produces_a_nonempty_png(tmp_path: Path
     output_path = tmp_path / "profile.png"
     result_path = fem.render_freespan_model_context_profile(
         context_df=context_df,
+        events_2018_span_df=events_2018_span_df,
         combined_bed_shear_segments_df=segments_df,
         noncohesive_mobility_segments_df=segments_df,
         scour_onset_segments_df=segments_df,
@@ -190,6 +205,20 @@ def test_U_model_context_profile_renderer_produces_a_nonempty_png(tmp_path: Path
     assert result_path == output_path
     assert output_path.exists()
     assert output_path.stat().st_size > 0
+
+
+def test_span_markers_use_the_real_observed_width_never_enlarged():
+    """MAR-014B Section 11: true spans are ~0.2-23 m on a 23.5 km route --
+    the profile must never widen a span's marker to stay visible."""
+
+    import inspect
+
+    source = inspect.getsource(fem.render_freespan_model_context_profile)
+    assert "events_2018_span_df" in source
+    assert "canonical_chainage_min_m" in source and "canonical_chainage_max_m" in source
+    # never a fabricated minimum-visible-width constant
+    assert "MIN_VISIBLE_WIDTH" not in source
+    assert "min_width" not in source.lower()
 
 
 # --- V: historical map includes an explicit 2014 partial-coverage warning --------------
@@ -212,3 +241,59 @@ def test_V_no_score_statement_present_on_every_route_map():
     ):
         source = inspect.getsource(renderer)
         assert "NO_SCORE_STATEMENT" in source
+
+
+# --- J: optional temporal evolution figure renders non-empty (MAR-014B) ----------------
+
+
+def _temporal_evidence_df() -> pd.DataFrame:
+    return pd.DataFrame.from_records(
+        [
+            {
+                "relationship_id": "REL-01",
+                "event_id_a": "2018-01",
+                "canonical_mid_chainage_a_m": None,
+                "event_id_b": None,
+                "canonical_mid_chainage_b_m": None,
+                "source_statement": "Span identified from 2018 survey in area not surveyed "
+                "in 2014.",
+            },
+            {
+                "relationship_id": "REL-04",
+                "event_id_a": "2014-05",
+                "canonical_mid_chainage_a_m": 1000.0,
+                "event_id_b": "2018-06",
+                "canonical_mid_chainage_b_m": 1005.0,
+                "source_statement": "Same span 2014 and 2018.",
+            },
+            {
+                "relationship_id": "REL-09",
+                "event_id_a": None,
+                "canonical_mid_chainage_a_m": None,
+                "event_id_b": None,
+                "canonical_mid_chainage_b_m": None,
+                "source_statement": "Freespans changed over time in length, height, and location.",
+            },
+        ]
+    )
+
+
+def test_J_temporal_evolution_figure_renders_non_empty(tmp_path: Path):
+    # REL-01's single-event marker needs its own (non-null) chainage.
+    df = _temporal_evidence_df()
+    df.loc[df["relationship_id"] == "REL-01", "canonical_mid_chainage_a_m"] = 5000.0
+
+    output_path = tmp_path / "evolution.png"
+    result_path = fem.render_freespan_temporal_evolution_figure(
+        temporal_evidence_df=df, route=SYNTHETIC_ROUTE, output_path=output_path
+    )
+
+    assert result_path == output_path
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0
+
+
+def test_J_narrative_only_rows_never_get_a_fabricated_geometry():
+    source = inspect.getsource(fem.render_freespan_temporal_evolution_figure)
+    assert "narrative_df" in source
+    assert "never" in source.lower() or "fabricated" in source.lower()

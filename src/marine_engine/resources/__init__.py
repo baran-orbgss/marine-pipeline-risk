@@ -94,3 +94,84 @@ def load_anglia_table_b1_freespans() -> pd.DataFrame:
                 )
 
     return df[list(ANGLIA_TABLE_B1_COLUMNS)]
+
+
+# --- Source-stated temporal/lineage relationships (MAR-014B) --------------------------
+#
+# A SEPARATE tracked resource from the freespan geometries above: only
+# relationships the source document states directly (a Table B.1 comment or
+# other document narrative), never a relationship this codebase infers from
+# spatial proximity or chainage/KP nearness (Sections 5-6).
+
+ANGLIA_TABLE_B1_FREESPAN_RELATIONSHIPS_CSV = (
+    RESOURCES_DIR / "anglia_table_b1_freespan_relationships.csv"
+)
+
+ANGLIA_TABLE_B1_RELATIONSHIPS_COLUMNS = (
+    "relationship_id",
+    "survey_year_a",
+    "event_id_a",
+    "survey_year_b",
+    "event_id_b",
+    "relationship_type",
+    "source_statement",
+    "source_page",
+    "source_table",
+    "attribution_method",
+)
+
+# Every relationship must be one the source states directly -- never a code-side
+# inference. `event_id_b` (and, for pure document-narrative statements,
+# `event_id_a` too) may be null: Section 6 requires a null/group-level record
+# over a fabricated pair whenever Table B.1's own layout does not uniquely
+# resolve both sides.
+ALLOWED_RELATIONSHIP_TYPES = (
+    "SOURCE_STATED_SAME_SPAN",
+    "SOURCE_STATED_LENGTH_CHANGE",
+    "SOURCE_STATED_KP_SHIFT",
+    "SOURCE_STATED_AREA_NOT_SURVEYED_PREVIOUSLY",
+    "SOURCE_NARRATIVE_CORRESPONDENCE",
+)
+
+# Only a direct citation of the source is ever acceptable -- values like
+# "SPATIAL_NEAREST_NEIGHBOUR" or "INFERRED_MATCH" are deliberately never in
+# this allow-list, so any such row hard-fails `load_anglia_table_b1_freespan_
+# relationships` rather than silently passing as a real source citation.
+ALLOWED_ATTRIBUTION_METHODS = ("DIRECT_TABLE_COMMENT", "DIRECT_DOCUMENT_NARRATIVE")
+
+
+class AngliaFreespanRelationshipValidationError(Exception):
+    """The tracked relationships resource contains an inferred (never source-stated)
+    relationship type or attribution method."""
+
+
+def load_anglia_table_b1_freespan_relationships() -> pd.DataFrame:
+    """The verified, SOURCE-STATED-ONLY freespan temporal/lineage relationships.
+
+    Hard-fails (`AngliaFreespanRelationshipValidationError`) if any row's
+    `relationship_type` or `attribution_method` is not in the fixed allow-list
+    above -- an inferred/spatial-nearest-neighbour relationship must never
+    silently enter this resource.
+    """
+
+    df = pd.read_csv(ANGLIA_TABLE_B1_FREESPAN_RELATIONSHIPS_CSV)
+    missing_columns = [c for c in ANGLIA_TABLE_B1_RELATIONSHIPS_COLUMNS if c not in df.columns]
+    if missing_columns:
+        raise AngliaFreespanRelationshipValidationError(
+            f"anglia_table_b1_freespan_relationships.csv is missing required "
+            f"column(s): {missing_columns}"
+        )
+
+    bad_types = sorted(set(df["relationship_type"]) - set(ALLOWED_RELATIONSHIP_TYPES))
+    if bad_types:
+        raise AngliaFreespanRelationshipValidationError(
+            f"relationship_type value(s) not in the source-stated allow-list: {bad_types}"
+        )
+
+    bad_methods = sorted(set(df["attribution_method"]) - set(ALLOWED_ATTRIBUTION_METHODS))
+    if bad_methods:
+        raise AngliaFreespanRelationshipValidationError(
+            f"attribution_method value(s) not in the direct-citation allow-list: {bad_methods}"
+        )
+
+    return df[list(ANGLIA_TABLE_B1_RELATIONSHIPS_COLUMNS)]

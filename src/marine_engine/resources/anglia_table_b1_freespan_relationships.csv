@@ -1,0 +1,15 @@
+relationship_id,survey_year_a,event_id_a,survey_year_b,event_id_b,relationship_type,source_statement,source_page,source_table,attribution_method
+REL-01,2018,2018-01,,,SOURCE_STATED_AREA_NOT_SURVEYED_PREVIOUSLY,Span identified from 2018 survey in area not surveyed in 2014.,44,Appendix B Table B.1,DIRECT_TABLE_COMMENT
+REL-02,2018,2018-02,,,SOURCE_STATED_AREA_NOT_SURVEYED_PREVIOUSLY,Span identified from 2018 survey in area not surveyed in 2014.,44,Appendix B Table B.1,DIRECT_TABLE_COMMENT
+REL-03,2018,2018-03,,,SOURCE_STATED_AREA_NOT_SURVEYED_PREVIOUSLY,Span identified from 2018 survey in area not surveyed in 2014.,44,Appendix B Table B.1,DIRECT_TABLE_COMMENT
+REL-04,2014,2014-05,2018,2018-06,SOURCE_STATED_SAME_SPAN,Same span 2014 and 2018.,44,Appendix B Table B.1,DIRECT_TABLE_COMMENT
+REL-05,2014,2014-05,2018,2018-06,SOURCE_STATED_LENGTH_CHANGE,2018 span approximately 8.14 m longer than 2014 (23.16 m vs 15.02 m).,44,Appendix B Table B.1,DIRECT_TABLE_COMMENT
+REL-06,2014,2014-06,2018,2018-07,SOURCE_STATED_SAME_SPAN,Same span.,44,Appendix B Table B.1,DIRECT_TABLE_COMMENT
+REL-07,2014,2014-06,2018,2018-07,SOURCE_STATED_LENGTH_CHANGE,2018 span approximately 0.8 m longer than 2014 (4.95 m vs 4.15 m).,44,Appendix B Table B.1,DIRECT_TABLE_COMMENT
+REL-08,2012,2012-02,2014,,SOURCE_STATED_SAME_SPAN,Same span 2012 and 2014 (specific 2014 event correspondence not uniquely determinable from this transcription).,44,Appendix B Table B.1,DIRECT_TABLE_COMMENT
+REL-09,,,,,SOURCE_NARRATIVE_CORRESPONDENCE,"The two 2012 PL854/PL855 freespan locations also had freespans identified in 2018 (specific event-to-event correspondence not stated in Table B.1).",,,DIRECT_DOCUMENT_NARRATIVE
+REL-10,,,,,SOURCE_NARRATIVE_CORRESPONDENCE,"Three 2014 freespan locations within the Anglia A NUI 500 m safety zone were also identified in 2018 (specific event-to-event correspondence not stated).",,,DIRECT_DOCUMENT_NARRATIVE
+REL-11,,,,,SOURCE_NARRATIVE_CORRESPONDENCE,"One freespan location was identified in all three surveys (2012, 2014, and 2018) and changed in length, height, and from one span to two spans over time (specific event correspondence not stated).",,,DIRECT_DOCUMENT_NARRATIVE
+REL-12,,,,,SOURCE_NARRATIVE_CORRESPONDENCE,"Three 2014 freespans did not correspond to locations identified in the 2018 survey (specific events not identified in the source).",,,DIRECT_DOCUMENT_NARRATIVE
+REL-13,,,,,SOURCE_STATED_AREA_NOT_SURVEYED_PREVIOUSLY,"The 2014 survey mapped only the Anglia West, Anglia A NUI, and LOGGS areas and did not cover the full pipeline routes.",,,DIRECT_DOCUMENT_NARRATIVE
+REL-14,,,,,SOURCE_NARRATIVE_CORRESPONDENCE,"Freespans changed over time in length, height, and to some degree location.",,,DIRECT_DOCUMENT_NARRATIVE
