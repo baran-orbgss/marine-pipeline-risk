@@ -24,7 +24,12 @@ def test_benchmark_records_exact_required_fields():
     assert benchmark["longest_exposed_section_m"] == 87
     assert benchmark["survey_year"] == 2018
     assert benchmark["evidence_role"] == "HISTORICAL_AGGREGATE_CONDITION_BENCHMARK"
-    assert benchmark["spatial_kp_locations_available_as_machine_readable_data"] is False
+    assert benchmark["environmental_appraisal_exposure_section_locations_available"] is False
+    assert benchmark["comparative_assessment_freespan_locations_tabulated"] is True
+    assert benchmark["comparative_assessment_freespan_table"] == "Appendix B Table B.1"
+    assert benchmark["2018_freespan_spatial_evidence_available"] is True
+    assert benchmark["2018_exposed_section_spatial_evidence_available"] is False
+    assert benchmark["individual_PL854_vs_PL855_freespan_attribution_available"] is False
     assert benchmark["benchmark_scope"] == "PL854/PL855 export / methanol line"
 
 
@@ -72,7 +77,8 @@ def test_AD_benchmark_carries_no_spatial_or_kp_fields():
     for token in forbidden_key_tokens:
         assert not any(token in key for key in keys_lower), token
 
-    assert benchmark["spatial_kp_locations_available_as_machine_readable_data"] is False
+    assert benchmark["environmental_appraisal_exposure_section_locations_available"] is False
+    assert benchmark["2018_exposed_section_spatial_evidence_available"] is False
     assert benchmark["historical_condition_used_for_spatial_calibration"] is False
 
 
@@ -88,6 +94,36 @@ def test_interpretation_statement_present():
         == pipeline_condition.BENCHMARK_INTERPRETATION_STATEMENT
     )
     assert "NOT A MODEL OF THE DEEPLY BURIED MAJORITY" in benchmark["interpretation"]["statement"]
+
+
+# --- MAR-014A Section 20: refined spatial-evidence flags, aggregate numbers preserved ---
+
+
+def test_mar014a_flags_never_delete_aggregate_benchmark_numbers():
+    """The Section 20 flag refinement must never touch the underlying aggregate
+    2018 corridor numbers -- only the one boolean flag they replace."""
+
+    benchmark = pipeline_condition.build_2018_condition_benchmark()
+
+    assert benchmark["free_span_count"] == 8
+    assert benchmark["total_free_span_length_m"] == 97
+    assert benchmark["max_free_span_height_m"] == 0.4
+    assert benchmark["max_free_span_length_m"] == 23.2
+    assert benchmark["exposed_section_count"] == 19
+    assert benchmark["total_exposed_length_m"] == 519
+    assert benchmark["longest_exposed_section_m"] == 87
+    assert "spatial_kp_locations_available_as_machine_readable_data" not in benchmark
+
+
+def test_mar014a_interpretation_distinguishes_freespan_from_exposed_section_evidence():
+    benchmark = pipeline_condition.build_2018_condition_benchmark()
+    interpretation = benchmark["interpretation"]
+
+    assert any("Table B.1" in statement for statement in interpretation["usable_statements"])
+    not_usable_text = " ".join(interpretation["not_usable_as"])
+    assert "now available" in not_usable_text
+    assert "NOT used as" in not_usable_text
+    assert "Exposed-section" in not_usable_text
 
 
 def test_write_2018_condition_benchmark_produces_valid_json(tmp_path: Path):

@@ -887,7 +887,8 @@ otherwise, never an interactive credential prompt.
   (10 m narrative vs. 23.2 m tabled) preserved verbatim rather than
   silently "corrected" -- and is never spatially distributed to PL854
   segments (`spatial_kp_locations_available_as_machine_readable_data =
-  false`).
+  false` -- later refined by MAR-014A once official 2018 free-span KP
+  positions were separately recovered; see below).
 
   Real execution against PL854 (no network) hand-verified every threshold
   term and reproduced the expected physical behaviour: at zero embedment,
@@ -907,3 +908,78 @@ otherwise, never an interactive credential prompt.
   equilibrium scour depth, scour propagation, sediment transport rate,
   exposure prediction, free-span prediction, fatigue, or risk scoring is
   computed anywhere in this ticket -- no further ticket has started.
+
+- `MAR-014A`: recovers EXPLICIT spatially-resolved free-span survey evidence
+  (`scour/freespan_evidence.py`, `scour/freespan_evidence_map.py`,
+  `validation/freespan_model_context.py`) from a second official source --
+  Ithaca Energy (UK) Limited's "Pipelines and Umbilical Comparative
+  Assessment" (April 2020), Appendix B Table B.1 -- which tabulates KP/
+  Easting/Northing/length/height for 2012, 2014, and 2018, correcting
+  MAR-014's prior assumption that free-span locations aren't
+  machine-readable. Table B.1's own scope is the PIGGYBACKED PL854/PL855
+  corridor, never PL854 alone: every one of the 17 recovered events (2012:
+  2/23.20 m, 2014: 7/68.23 m, 2018: 8/97.42 m -- all three sums verified
+  exactly against the source's own rounded totals) carries
+  `asset_scope=PL854_PL855_PIGGYBACK_CORRIDOR` and
+  `individual_line_attribution=UNRESOLVED`, and is stored as a small
+  TRACKED CSV resource (`src/marine_engine/resources/
+  anglia_table_b1_freespans.csv`), never scraped at runtime, guarded by its
+  own checksum verification against the source's rounded per-year
+  statements.
+
+  The source CRS is NOT stated, so it was inferred empirically rather than
+  assumed: two candidates (EPSG:23031 ED50/UTM31N vs. EPSG:32631
+  WGS84/UTM31N) were transformed onto the TRUE canonical PL854 route and
+  scored against a formal five-criterion acceptance guard (median/max
+  point-to-route distance, materially-smaller-than-alternative, a coherent
+  KP-vs-chainage linear fit, consistent orientation) that hard-fails
+  (`CRSReconciliationError`) rather than silently choosing a CRS. Real
+  execution decisively accepted EPSG:23031 (median distance 1.03 m vs.
+  172.81 m for the naive EPSG:32631 alternative, R²=0.999994) and confirmed
+  the survey KP direction is REVERSED relative to canonical chainage --
+  derived from the fit's own sign, never hard-coded in advance. Every event
+  is projected independently onto the real route (never inheriting the
+  source's own Start as the canonical route start), with canonical
+  chainage min/max derived per event and event geometry built as a true
+  `shapely.ops.substring` of the curved route, never a straight chord. Two
+  2014 events (near source KP 0) landed exactly at the canonical route's
+  own terminus -- a genuine, disclosed edge case where the physical survey
+  extends slightly beyond the digitized PL854 geometry -- surfaced via the
+  same `endpoint_*_route_distance_m` fields rather than hidden.
+
+  A data-derived (never hard-coded) 2014-partial-coverage check found that
+  Table B.1 lists no 2014 event near two zones (~KP 11.85-11.91 and ~KP
+  22.89-22.90) where 2012 and/or 2018 both report one -- surfaced as an
+  explicit warning on the historical map and in the reconciliation
+  metadata, always phrased as a coverage observation, never as proof a
+  free span was absent; no automatic cross-survey event matching
+  (persistent/migrated/disappeared/newly-formed) is ever performed. The
+  8-event 2018 subset is joined (Section 17, `validation/
+  freespan_model_context.py`, matching that package's own pre-existing
+  "validation of model outputs against observed data" docstring) against
+  MAR-012/013/014's own already-computed segment outputs (bed-shear
+  sensitivity, largest passing D50, required embedment class -- the latter
+  honestly shown as spatially uniform, 0.03D route-wide) purely for
+  side-by-side human review -- explicitly NO score, probability, rank, or
+  accuracy metric anywhere in that output. Segment-level 2018 event counts
+  use genuine chainage-interval overlap (never midpoint-only): 3 of PL854's
+  14 hydro-pair sections contain at least one 2018 event. MAR-014's 2018
+  condition benchmark metadata was refreshed in place (aggregate numbers
+  never touched) to replace the blanket
+  `spatial_kp_locations_available_as_machine_readable_data=false` with six
+  precise flags distinguishing "free-span positions now tabulated" from
+  "exposed-section positions still unavailable" and "individual PL854-vs-
+  PL855 attribution still unresolved".
+
+  Three new maps render self-contained (never importing MAR-012/013/014's
+  own map modules): the 8-event 2018 evidence map, a 17-event historical
+  map (2012/2014/2018, colour-by-year, with the 2014-coverage-gap warning
+  in its footer), and a three-panel model-context profile showing
+  MAR-012/013/014's outputs honestly juxtaposed against the 8 event
+  positions. 44 new offline tests were added across `test_resources.py`,
+  `test_freespan_evidence.py`, `test_freespan_evidence_map.py`,
+  `test_freespan_model_context.py`, `test_cli.py`, and
+  `test_pipeline_condition.py`; the full offline suite (845 tests) and
+  repo-wide `ruff format`/`ruff check` pass clean. No exposure probability,
+  free-span probability, scour depth, VIV, fatigue, or arbitrary risk score
+  is computed anywhere in this ticket -- no further ticket has started.

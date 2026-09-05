@@ -5,9 +5,11 @@ from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
+import pyproj
 import pytest
 from shapely.geometry import LineString, Point
 
+from marine_engine import resources
 from marine_engine.cli import main
 
 
@@ -2237,7 +2239,7 @@ def test_build_scour_onset_screening_command_end_to_end(
 
     benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
     assert benchmark["max_free_span_length_m"] == 23.2
-    assert benchmark["spatial_kp_locations_available_as_machine_readable_data"] is False
+    assert benchmark["environmental_appraisal_exposure_section_locations_available"] is False
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["scientific_role"] == "PIPELINE_SCOUR_ONSET_EMBEDMENT_SCREENING"
@@ -2257,6 +2259,317 @@ def test_build_scour_onset_screening_command_is_idempotent_offline(tmp_path: Pat
 
     first_exit_code = main(["build-scour-onset-screening", str(config_path)])
     second_exit_code = main(["build-scour-onset-screening", str(config_path)])
+
+    assert first_exit_code == 0
+    assert second_exit_code == 0
+
+
+# --- build-freespan-spatial-evidence (MAR-014A) ---------------------------------------
+
+_FREESPAN_TEST_WORKING_CRS = "EPSG:32631"
+_FREESPAN_TEST_SOURCE_CRS = "EPSG:23031"
+
+
+def test_build_freespan_spatial_evidence_command_requires_pipeline_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "no_pipeline.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-freespan-spatial-evidence", str(config_path)])
+
+    assert exit_code == 1
+    assert "pipeline.pipeline_id" in capsys.readouterr().err
+
+
+def test_build_freespan_spatial_evidence_command_requires_prior_outputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-freespan-spatial-evidence", str(config_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "build-combined-bed-shear" in err
+    assert "build-noncohesive-mobility" in err
+    assert "build-scour-onset-screening" in err
+
+
+def _write_synthetic_table_b1_csv(route: LineString, output_path: Path) -> None:
+    """A synthetic Table B.1-shaped CSV whose events sit exactly on `route` once
+    reconciled under EPSG:23031, but which satisfies `resources`'s own
+    real-world checksum guard (identical per-year counts/sums/max to the real
+    tracked source) -- entirely synthetic coordinates, real checksums."""
+
+    transformer = pyproj.Transformer.from_crs(
+        _FREESPAN_TEST_WORKING_CRS, _FREESPAN_TEST_SOURCE_CRS, always_xy=True
+    )
+    total_length = route.length
+
+    def _event(
+        event_id: str, year: int, chainage_a: float, length_m: float, height_m: float
+    ) -> dict:
+        chainage_b = chainage_a + length_m
+        point_a = route.interpolate(chainage_a)
+        point_b = route.interpolate(chainage_b)
+        easting_a, northing_a = transformer.transform(point_a.x, point_a.y)
+        easting_b, northing_b = transformer.transform(point_b.x, point_b.y)
+        return {
+            "survey_year": year,
+            "event_id": event_id,
+            "source_survey_kp_start_km": (total_length - chainage_a) / 1000.0,
+            "source_survey_kp_end_km": (total_length - chainage_b) / 1000.0,
+            "source_easting_start_m": easting_a,
+            "source_northing_start_m": northing_a,
+            "source_easting_end_m": easting_b,
+            "source_northing_end_m": northing_b,
+            "source_length_m": length_m,
+            "source_height_m": height_m,
+            "source_comment": "",
+            "asset_scope": "PL854_PL855_PIGGYBACK_CORRIDOR",
+            "evidence_role": "HISTORICAL_SPATIAL_FREESPAN_CORRIDOR_EVIDENCE",
+            "source_page": "",
+            "source_table": "Appendix B Table B.1",
+        }
+
+    records = []
+    records.append(_event("2012-01", 2012, 1000.0, 10.00, 0.20))  # 2012: 2 events / 23.20 m
+    records.append(_event("2012-02", 2012, 3000.0, 13.20, 0.20))
+    for i, length_m in enumerate(
+        (5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 23.23)
+    ):  # 2014: 7 events / 68.23 m
+        records.append(_event(f"2014-0{i + 1}", 2014, 5000.0 + i * 500.0, length_m, 0.2))
+    lengths_2018 = (
+        23.16,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        14.26,
+    )  # 2018: 8 / 97.42 m, max 23.16 m
+    heights_2018 = (0.41, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2)  # max height 0.41 m
+    for i, (length_m, height_m) in enumerate(zip(lengths_2018, heights_2018, strict=True)):
+        records.append(_event(f"2018-0{i + 1}", 2018, 9000.0 + i * 500.0, length_m, height_m))
+
+    pd.DataFrame.from_records(records).to_csv(output_path, index=False)
+
+
+def _write_freespan_spatial_evidence_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """A minimal on-disk study with real MAR-012/013/014-shaped segment outputs
+    already present, plus a synthetic (checksum-valid) Table B.1 CSV monkeypatched
+    in place of the real tracked resource so CRS reconciliation has a route to
+    align against."""
+
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    study_dir = processed_dir / "pl854"
+    metocean_dir = study_dir / "metocean"
+    sediment_dir = study_dir / "sediment"
+    scour_dir = study_dir / "scour"
+    for d in (study_dir, metocean_dir, sediment_dir, scour_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    route = LineString([(500000.0, 5900000.0), (505000.0, 5910000.0), (500000.0, 5920000.0)])
+    pipeline_gdf = gpd.GeoDataFrame(
+        [{"pipeline_id": "PL854", "source": "test", "status": "ACTIVE"}],
+        geometry=[route],
+        crs=_FREESPAN_TEST_WORKING_CRS,
+    )
+    pipeline_gdf.to_file(study_dir / "pipeline.gpkg", driver="GPKG", layer="pipeline")
+
+    from shapely.ops import substring
+
+    bounds = (
+        {"hydro_pair_id": "pair_A", "start_chainage_m": 0.0, "end_chainage_m": route.length / 2.0},
+        {
+            "hydro_pair_id": "pair_B",
+            "start_chainage_m": route.length / 2.0,
+            "end_chainage_m": route.length,
+        },
+    )
+    segment_geometries = [
+        substring(route, b["start_chainage_m"], b["end_chainage_m"], normalized=False)
+        for b in bounds
+    ]
+
+    bed_shear_gdf = gpd.GeoDataFrame(
+        [
+            {
+                **b,
+                "tau_max_p95_sensitivity_min_pa": 0.3,
+                "tau_max_p95_sensitivity_max_pa": 0.9,
+                "tau_max_p95_sensitivity_width_pa": 0.6,
+            }
+            for b in bounds
+        ],
+        geometry=segment_geometries,
+        crs=_FREESPAN_TEST_WORKING_CRS,
+    )
+    bed_shear_gdf.to_file(
+        metocean_dir / "combined_bed_shear_segments.gpkg",
+        driver="GPKG",
+        layer="combined_bed_shear_segments",
+    )
+
+    mobility_gdf = gpd.GeoDataFrame(
+        [
+            {
+                **b,
+                "largest_tested_d50_with_p95_mobility_ratio_ge_1_mm": 1.0,
+                "largest_tested_d50_with_any_exceedance_mm": 2.0,
+                "mapped_250k_folk_class": "SAND",
+                "nearest_valid_psa_d50_mm": 0.3,
+            }
+            for b in bounds
+        ],
+        geometry=segment_geometries,
+        crs=_FREESPAN_TEST_WORKING_CRS,
+    )
+    mobility_gdf.to_file(
+        sediment_dir / "noncohesive_mobility_capacity_segments.gpkg",
+        driver="GPKG",
+        layer="noncohesive_mobility_capacity_segments",
+    )
+
+    scour_gdf = gpd.GeoDataFrame(
+        [
+            {
+                **b,
+                "p95_required_embedment_lower_class": "0",
+                "p95_required_embedment_upper_class": "0.03",
+                "p95_required_embedment_upper_ratio": 0.03,
+                "pipe_diameter_source_envelope_status": (
+                    "PIPE_DIAMETER_OUTSIDE_SOURCE_EXPERIMENT_ENVELOPE"
+                ),
+                "slope_500m_median_deg": 1.0,
+                "tpi_1000m_median_m": 0.1,
+                "local_relief_1000m_median_m": 0.5,
+            }
+            for b in bounds
+        ],
+        geometry=segment_geometries,
+        crs=_FREESPAN_TEST_WORKING_CRS,
+    )
+    scour_gdf.to_file(
+        scour_dir / "scour_onset_embedment_segments.gpkg",
+        driver="GPKG",
+        layer="scour_onset_embedment_segments",
+    )
+
+    synthetic_csv_path = tmp_path / "synthetic_table_b1.csv"
+    _write_synthetic_table_b1_csv(route, synthetic_csv_path)
+    monkeypatch.setattr(resources, "ANGLIA_TABLE_B1_FREESPANS_CSV", synthetic_csv_path)
+
+    return config_path
+
+
+def test_build_freespan_spatial_evidence_command_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_freespan_spatial_evidence_fixture(tmp_path, monkeypatch)
+
+    exit_code = main(["build-freespan-spatial-evidence", str(config_path)])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "NO SCORE, PROBABILITY, RANK, OR ACCURACY METRIC HAS BEEN COMPUTED" in output
+    assert "PIGGYBACKED PL854/PL855 corridor" in output
+    assert "individual line attribution UNRESOLVED" in output
+
+    processed_dir = tmp_path / "processed" / "pl854"
+    evidence_parquet_path = (
+        processed_dir / "freespan_evidence" / "anglia_freespan_spatial_evidence.parquet"
+    )
+    evidence_gpkg_path = (
+        processed_dir / "freespan_evidence" / "anglia_freespan_spatial_evidence.gpkg"
+    )
+    evidence_2018_path = (
+        processed_dir / "freespan_evidence" / "anglia_2018_freespan_spatial_evidence.parquet"
+    )
+    segment_counts_path = (
+        processed_dir / "freespan_evidence" / "freespan_segment_event_counts_2018.parquet"
+    )
+    model_context_path = processed_dir / "validation" / "2018_freespan_model_context.parquet"
+    benchmark_path = processed_dir / "pipeline_condition" / "anglia_2018_condition_benchmark.json"
+    reconciliation_path = (
+        processed_dir / "freespan_evidence" / "anglia_freespan_spatial_reconciliation_metadata.json"
+    )
+    map_2018_path = processed_dir / "maps" / "pl854_observed_freespans_2018.png"
+    map_historical_path = processed_dir / "maps" / "pl854_historical_freespans_2012_2018.png"
+    profile_path = processed_dir / "maps" / "pl854_2018_freespan_model_context_profile.png"
+
+    for path in (
+        evidence_parquet_path,
+        evidence_gpkg_path,
+        evidence_2018_path,
+        segment_counts_path,
+        model_context_path,
+        benchmark_path,
+        reconciliation_path,
+        map_2018_path,
+        map_historical_path,
+        profile_path,
+    ):
+        assert path.exists(), path
+        assert path.stat().st_size > 0
+
+    evidence_df = pd.read_parquet(evidence_parquet_path)
+    assert len(evidence_df) == 17
+    assert set(evidence_df["individual_line_attribution"]) == {"UNRESOLVED"}
+    assert set(evidence_df["asset_scope"]) == {"PL854_PL855_PIGGYBACK_CORRIDOR"}
+
+    evidence_2018_df = pd.read_parquet(evidence_2018_path)
+    assert len(evidence_2018_df) == 8
+
+    context_df = pd.read_parquet(model_context_path)
+    assert len(context_df) == 8
+    forbidden = ("score", "probability", "rank", "accuracy")
+    assert not any(token in c.lower() for c in context_df.columns for token in forbidden)
+
+    reconciliation = json.loads(reconciliation_path.read_text(encoding="utf-8"))
+    assert reconciliation["accepted_crs_epsg"] == 23031
+    assert (
+        reconciliation["source_crs_status"]
+        == "CRS_INFERRED_FROM_SPATIAL_CONSISTENCY_NOT_SOURCE_STATED"
+    )
+
+    benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    assert benchmark["2018_freespan_spatial_evidence_available"] is True
+
+
+def test_build_freespan_spatial_evidence_command_is_idempotent_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No network dependency -- running twice against the same fixture succeeds."""
+
+    config_path = _write_freespan_spatial_evidence_fixture(tmp_path, monkeypatch)
+
+    first_exit_code = main(["build-freespan-spatial-evidence", str(config_path)])
+    second_exit_code = main(["build-freespan-spatial-evidence", str(config_path)])
 
     assert first_exit_code == 0
     assert second_exit_code == 0

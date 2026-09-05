@@ -50,8 +50,16 @@ from marine_engine.providers.nsta import (
     print_ingestion_report,
 )
 from marine_engine.providers.sediment import bgs as sediment_bgs
-from marine_engine.scour import pipeline_condition, scour_onset, scour_onset_map
+from marine_engine.resources import AngliaTableB1ChecksumError, load_anglia_table_b1_freespans
+from marine_engine.scour import (
+    freespan_evidence,
+    freespan_evidence_map,
+    pipeline_condition,
+    scour_onset,
+    scour_onset_map,
+)
 from marine_engine.sediment import evidence, noncohesive_mobility, noncohesive_mobility_map
+from marine_engine.validation import freespan_model_context
 
 
 def _cmd_version(_args: argparse.Namespace) -> int:
@@ -3394,6 +3402,330 @@ def _cmd_build_scour_onset_screening(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_freespan_spatial_evidence(args: argparse.Namespace) -> int:
+    """MAR-014A: official freespan spatial evidence recovery + canonical route reconciliation.
+
+    Requires the MAR-012 combined-bed-shear, MAR-013 noncohesive-mobility, and
+    MAR-014 scour-onset segment outputs to already exist on disk; performs NO
+    network request. Reads the tracked Table B.1 CSV resource directly
+    (never scraped at runtime) and empirically reconciles its (undocumented)
+    source CRS against the TRUE canonical route before projecting events onto it.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pipeline_gpkg_path, _aoi_gpkg_path, _chainage_gpkg_path, _interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    combined_bed_shear_segments_path = study_dir / "metocean" / "combined_bed_shear_segments.gpkg"
+    noncohesive_mobility_segments_path = (
+        study_dir / "sediment" / "noncohesive_mobility_capacity_segments.gpkg"
+    )
+    scour_onset_segments_path = study_dir / "scour" / "scour_onset_embedment_segments.gpkg"
+
+    required_paths = (
+        pipeline_gpkg_path,
+        combined_bed_shear_segments_path,
+        noncohesive_mobility_segments_path,
+        scour_onset_segments_path,
+    )
+    missing = [str(p) for p in required_paths if not p.exists()]
+    if missing:
+        print(
+            "error: missing required canonical output(s) -- run build-combined-bed-shear, "
+            "build-noncohesive-mobility, and build-scour-onset-screening first: "
+            f"{missing}",
+            file=sys.stderr,
+        )
+        return 1
+
+    working_crs = config.crs.horizontal
+    try:
+        route, _attributes, source_crs = load_pipeline_route(pipeline_gpkg_path, pipeline_id)
+    except InvalidPipelineRouteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if source_crs != working_crs:
+        print(
+            f"error: pipeline CRS {source_crs} does not match configured working CRS {working_crs}",
+            file=sys.stderr,
+        )
+        return 1
+
+    combined_bed_shear_segments_df = gpd.read_file(combined_bed_shear_segments_path)
+    noncohesive_mobility_segments_df = gpd.read_file(noncohesive_mobility_segments_path)
+    scour_onset_segments_df = gpd.read_file(scour_onset_segments_path)
+
+    try:
+        events_df = load_anglia_table_b1_freespans()
+    except AngliaTableB1ChecksumError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    # --- CRS candidate evaluation + acceptance guard (Sections 7-9) ------------
+    diagnostics_by_epsg = {
+        epsg: freespan_evidence.evaluate_crs_candidate(events_df, route, working_crs, epsg)
+        for epsg in freespan_evidence.CANDIDATE_CRS_EPSG_CODES
+    }
+    try:
+        accepted_epsg, crs_checks = freespan_evidence.select_working_crs(diagnostics_by_epsg)
+    except freespan_evidence.CRSReconciliationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    survey_direction = freespan_evidence.classify_survey_direction(
+        diagnostics_by_epsg[accepted_epsg].fit_slope
+    )
+
+    # --- canonical projection (Sections 11-14) ---------------------------------
+    try:
+        events_projected_df = freespan_evidence.project_events_to_canonical_route(
+            events_df, route, working_crs, accepted_epsg
+        )
+    except freespan_evidence.AngliaFreespanValidationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    events_2018_df = events_projected_df[events_projected_df["survey_year"] == 2018].reset_index(
+        drop=True
+    )
+
+    geometries_all = freespan_evidence.build_event_geometries(events_projected_df, route)
+    events_all_gdf = gpd.GeoDataFrame(events_projected_df, geometry=geometries_all, crs=working_crs)
+
+    geometries_2018 = freespan_evidence.build_event_geometries(events_2018_df, route)
+    events_2018_gdf = gpd.GeoDataFrame(events_2018_df, geometry=geometries_2018, crs=working_crs)
+
+    # --- segment event counts (Section 18) --------------------------------------
+    segment_bounds = scour_onset_segments_df[
+        ["hydro_pair_id", "start_chainage_m", "end_chainage_m"]
+    ].to_dict("records")
+    segment_counts_df = freespan_evidence.compute_segment_freespan_counts(
+        events_2018_df, segment_bounds
+    )
+
+    # --- model-context join (Section 17, no score/probability/rank) ------------
+    context_df = freespan_model_context.attach_model_context_to_events(
+        events_2018_df,
+        combined_bed_shear_segments_df=combined_bed_shear_segments_df,
+        noncohesive_mobility_segments_df=noncohesive_mobility_segments_df,
+        scour_onset_segments_df=scour_onset_segments_df,
+    )
+
+    # --- write canonical outputs -------------------------------------------------
+    freespan_dir = study_dir / "freespan_evidence"
+    validation_dir = study_dir / "validation"
+    pipeline_condition_dir = study_dir / "pipeline_condition"
+    maps_dir = study_dir / "maps"
+
+    evidence_parquet_path = metocean_evidence.write_parquet(
+        events_all_gdf.drop(columns="geometry"),
+        freespan_dir / "anglia_freespan_spatial_evidence.parquet",
+    )
+    evidence_gpkg_path = freespan_dir / "anglia_freespan_spatial_evidence.gpkg"
+    evidence_gpkg_path.parent.mkdir(parents=True, exist_ok=True)
+    events_all_gdf.to_file(evidence_gpkg_path, driver="GPKG", layer="historical_freespans")
+
+    evidence_2018_path = metocean_evidence.write_parquet(
+        events_2018_df, freespan_dir / "anglia_2018_freespan_spatial_evidence.parquet"
+    )
+    segment_counts_path = metocean_evidence.write_parquet(
+        segment_counts_df, freespan_dir / "freespan_segment_event_counts_2018.parquet"
+    )
+    model_context_path = metocean_evidence.write_parquet(
+        context_df, validation_dir / "2018_freespan_model_context.parquet"
+    )
+
+    # --- Section 20: refresh the 2018 condition benchmark with corrected flags --
+    benchmark_path = pipeline_condition.write_2018_condition_benchmark(
+        pipeline_condition_dir / "anglia_2018_condition_benchmark.json"
+    )
+
+    # --- maps --------------------------------------------------------------------
+    background_raster_path = study_dir / "bathymetry" / "emodnet_baseline_lat_100m.tif"
+    background_raster_path = background_raster_path if background_raster_path.exists() else None
+
+    map_2018_path = freespan_evidence_map.render_2018_freespan_evidence_map(
+        events_2018_gdf=events_2018_gdf,
+        route=route,
+        output_path=maps_dir / "pl854_observed_freespans_2018.png",
+        background_raster_path=background_raster_path,
+    )
+    map_2018_dimensions = freespan_evidence_map.read_png_dimensions(map_2018_path)
+
+    map_historical_path = freespan_evidence_map.render_historical_freespan_evidence_map(
+        events_all_gdf=events_all_gdf,
+        route=route,
+        output_path=maps_dir / "pl854_historical_freespans_2012_2018.png",
+        background_raster_path=background_raster_path,
+    )
+    map_historical_dimensions = freespan_evidence_map.read_png_dimensions(map_historical_path)
+
+    profile_path = freespan_evidence_map.render_freespan_model_context_profile(
+        context_df=context_df,
+        combined_bed_shear_segments_df=combined_bed_shear_segments_df,
+        noncohesive_mobility_segments_df=noncohesive_mobility_segments_df,
+        scour_onset_segments_df=scour_onset_segments_df,
+        total_length_m=route.length,
+        output_path=maps_dir / "pl854_2018_freespan_model_context_profile.png",
+    )
+    profile_dimensions = freespan_evidence_map.read_png_dimensions(profile_path)
+
+    # --- CRS/route reconciliation metadata (Section 24) -------------------------
+    gaps_2014 = freespan_evidence_map.compute_2014_coverage_gap_zones(events_all_gdf)
+    zones_by_year = freespan_evidence_map.compute_zone_coverage_by_year(events_all_gdf)
+    per_year_counts = {
+        str(int(year)): {
+            "count": int(len(group)),
+            "sum_source_length_m": float(group["source_length_m"].sum()),
+        }
+        for year, group in events_all_gdf.groupby("survey_year")
+    }
+
+    def _diag_to_dict(diag: freespan_evidence.CrsCandidateDiagnostics) -> dict[str, Any]:
+        return {
+            "candidate_epsg": diag.candidate_epsg,
+            "endpoint_count": diag.endpoint_count,
+            "distance_min_m": diag.distance_min_m,
+            "distance_median_m": diag.distance_median_m,
+            "distance_p95_m": diag.distance_p95_m,
+            "distance_max_m": diag.distance_max_m,
+            "fit_slope": diag.fit_slope,
+            "fit_intercept_m": diag.fit_intercept_m,
+            "fit_r_squared": diag.fit_r_squared,
+            "residual_median_m": diag.residual_median_m,
+            "residual_p95_m": diag.residual_p95_m,
+            "residual_max_m": diag.residual_max_m,
+            "orientation_consistent": diag.orientation_consistent,
+        }
+
+    reconciliation_metadata = {
+        "scientific_role": freespan_evidence.SCIENTIFIC_ROLE,
+        "asset_scope": freespan_evidence.ASSET_SCOPE,
+        "individual_line_attribution": freespan_evidence.INDIVIDUAL_LINE_ATTRIBUTION,
+        "source": {
+            "publisher": "Ithaca Energy (UK) Limited",
+            "title": "Pipelines and Umbilical Comparative Assessment",
+            "date": "April 2020",
+            "table": "Appendix B, Table B.1",
+        },
+        "source_crs_status": freespan_evidence.SOURCE_CRS_STATUS,
+        "candidate_crs_epsg_codes": list(freespan_evidence.CANDIDATE_CRS_EPSG_CODES),
+        "candidate_diagnostics": {
+            str(epsg): _diag_to_dict(diag) for epsg, diag in diagnostics_by_epsg.items()
+        },
+        "acceptance_checks": crs_checks,
+        "accepted_crs_epsg": accepted_epsg,
+        "canonical_working_crs": working_crs,
+        "canonical_route_source": str(pipeline_gpkg_path),
+        "canonical_route_length_m": route.length,
+        "survey_kp_direction_relative_to_canonical": survey_direction,
+        "per_year_counts": per_year_counts,
+        "2014_coverage_gap_zones": gaps_2014,
+        "zone_coverage_by_year": {
+            str(year): [{"start_chainage_m": lo, "end_chainage_m": hi} for lo, hi in zones]
+            for year, zones in zones_by_year.items()
+        },
+        "endpoint_route_distance_stats_m": {
+            "max": float(
+                max(
+                    events_all_gdf["endpoint_a_route_distance_m"].max(),
+                    events_all_gdf["endpoint_b_route_distance_m"].max(),
+                )
+            ),
+            "median": float(
+                pd.concat(
+                    [
+                        events_all_gdf["endpoint_a_route_distance_m"],
+                        events_all_gdf["endpoint_b_route_distance_m"],
+                    ]
+                ).median()
+            ),
+        },
+        "source_length_reconciliation": {
+            "max_absolute_length_difference_m": float(
+                events_all_gdf["absolute_length_difference_m"].max()
+            ),
+            "gross_mismatch_absolute_threshold_m": (
+                freespan_evidence.GROSS_LENGTH_MISMATCH_ABSOLUTE_M
+            ),
+            "gross_mismatch_relative_threshold_pct": (
+                freespan_evidence.GROSS_LENGTH_MISMATCH_RELATIVE_PCT
+            ),
+        },
+        "limitations": [
+            "Source CRS was never stated by either source document; EPSG:23031 was inferred "
+            "empirically and must not be read as a source-confirmed fact.",
+            "2014-01 and 2014-02 (near source KP 0) project to the exact canonical route "
+            "terminus, indicating the physical corridor survey extends slightly beyond the "
+            "digitized canonical PL854 route's own extent at that end; their projected "
+            "interval lengths collapse towards 0 m even though source lengths are 10.02 m "
+            "and 7.98 m respectively.",
+            "2014 Table B.1 events report no coverage in one zone where both 2012 and 2018 "
+            "report events (see 2014_coverage_gap_zones) -- this may reflect incomplete 2014 "
+            "survey coverage rather than absence of a freespan.",
+            "Table B.1's own scope is the piggybacked PL854/PL855 corridor; individual line "
+            "attribution is UNRESOLVED for every event.",
+            "No score, probability, rank, or accuracy metric has been computed anywhere in "
+            "this output.",
+        ],
+        "outputs": {
+            "anglia_freespan_spatial_evidence_parquet": str(evidence_parquet_path),
+            "anglia_freespan_spatial_evidence_gpkg": str(evidence_gpkg_path),
+            "anglia_2018_freespan_spatial_evidence_parquet": str(evidence_2018_path),
+            "freespan_segment_event_counts_2018_parquet": str(segment_counts_path),
+            "2018_freespan_model_context_parquet": str(model_context_path),
+            "anglia_2018_condition_benchmark_json": str(benchmark_path),
+            "map_2018_png": str(map_2018_path),
+            "map_historical_png": str(map_historical_path),
+            "model_context_profile_png": str(profile_path),
+        },
+    }
+    metadata_path = freespan_dir / "anglia_freespan_spatial_reconciliation_metadata.json"
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(
+        json.dumps(reconciliation_metadata, indent=2, default=str), encoding="utf-8"
+    )
+
+    print(f"Freespan spatial evidence: {len(events_all_gdf)} event(s) -> {evidence_parquet_path}")
+    print(f"  GPKG: {evidence_gpkg_path}")
+    print(
+        f"2018 freespan spatial evidence: {len(events_2018_gdf)} event(s) -> {evidence_2018_path}"
+    )
+    print(f"Segment event counts: {len(segment_counts_df)} segment(s) -> {segment_counts_path}")
+    print(f"2018 model context: {len(context_df)} event(s) -> {model_context_path}")
+    print(f"2018 condition benchmark (refreshed): {benchmark_path}")
+    print(f"Reconciliation metadata: {metadata_path}")
+    print(f"Map (2018): {map_2018_path}")
+    print(f"Map (historical): {map_historical_path}")
+    print(f"Model-context profile: {profile_path}")
+    print()
+    freespan_evidence_map.print_freespan_evidence_report(
+        events_all_df=events_all_gdf,
+        events_2018_df=events_2018_gdf,
+        accepted_epsg=accepted_epsg,
+        crs_checks=crs_checks,
+        survey_direction=survey_direction,
+        segment_counts_df=segment_counts_df,
+        evidence_path=evidence_parquet_path,
+        evidence_2018_path=evidence_2018_path,
+        model_context_path=model_context_path,
+        reconciliation_metadata_path=metadata_path,
+        map_2018_path=map_2018_path,
+        map_2018_dimensions=map_2018_dimensions,
+        map_historical_path=map_historical_path,
+        map_historical_dimensions=map_historical_dimensions,
+        profile_path=profile_path,
+        profile_dimensions=profile_dimensions,
+    )
+    return 0
+
+
 def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> datetime:
     """The live dataset's own start timestamp, or `fallback_now` if it could not be discovered."""
 
@@ -3586,6 +3918,20 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_scour_onset_screening_parser.set_defaults(func=_cmd_build_scour_onset_screening)
+
+    build_freespan_spatial_evidence_parser = subparsers.add_parser(
+        "build-freespan-spatial-evidence",
+        help=(
+            "Build the official freespan spatial evidence base (MAR-014A, Ithaca Energy "
+            "Comparative Assessment Appendix B Table B.1) and reconcile it onto the "
+            "canonical route -- no network, requires build-combined-bed-shear, "
+            "build-noncohesive-mobility, and build-scour-onset-screening to have already run."
+        ),
+    )
+    build_freespan_spatial_evidence_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_freespan_spatial_evidence_parser.set_defaults(func=_cmd_build_freespan_spatial_evidence)
 
     return parser
 

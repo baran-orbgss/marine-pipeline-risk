@@ -22,13 +22,29 @@ structured benchmark field.
 
 No spatial distribution (Section 30)
 ------------------------------------------
-`spatial_kp_locations_available_as_machine_readable_data = False` --
-free-span/exposure KP positions are not available in canonical
-machine-readable form, so this benchmark is never used as spatial
-validation for any MAR-014 segment-level result. It may only support the
-qualitative statements that (a) exposure/free spans existed historically
-on the corridor, (b) most of the corridor was reported buried >=0.6 m, and
-(c) local exceptions existed.
+Originally (MAR-014) neither free-span nor exposed-section KP positions
+were available in canonical machine-readable form, so this benchmark was
+never used as spatial validation for any MAR-014 segment-level result.
+
+MAR-014A update -- freespan positions recovered, exposed sections still not
+-------------------------------------------------------------------------------
+A separate, later official source (Ithaca Energy "Pipelines and Umbilical
+Comparative Assessment", April 2020, Appendix B Table B.1) tabulates
+explicit 2018 free-span KP/Easting/Northing positions for the PL854/PL855
+corridor -- see MAR-014A's `anglia_freespan_spatial_evidence` outputs.
+`comparative_assessment_freespan_locations_tabulated` /
+`2018_freespan_spatial_evidence_available` record this. This is still
+NEVER used as a validation/accuracy metric for MAR-014 segment-level
+results (MAR-014A Section 17 attaches model context purely for side-by-side
+human review -- no score, probability, or rank). Exposed-section KP
+positions remain unavailable in canonical machine-readable form
+(`environmental_appraisal_exposure_section_locations_available = False`,
+`2018_exposed_section_spatial_evidence_available = False`), and individual
+PL854-vs-PL855 freespan attribution remains unresolved
+(`individual_PL854_vs_PL855_freespan_attribution_available = False`). This
+benchmark may still only support the qualitative statements that (a)
+exposure/free spans existed historically on the corridor, (b) most of the
+corridor was reported buried >=0.6 m, and (c) local exceptions existed.
 """
 
 import json
@@ -83,7 +99,12 @@ def build_2018_condition_benchmark() -> dict[str, Any]:
         "exposed_section_count": 19,
         "total_exposed_length_m": 519,
         "longest_exposed_section_m": 87,
-        "spatial_kp_locations_available_as_machine_readable_data": False,
+        "environmental_appraisal_exposure_section_locations_available": False,
+        "comparative_assessment_freespan_locations_tabulated": True,
+        "comparative_assessment_freespan_table": "Appendix B Table B.1",
+        "2018_freespan_spatial_evidence_available": True,
+        "2018_exposed_section_spatial_evidence_available": False,
+        "individual_PL854_vs_PL855_freespan_attribution_available": False,
         "source_internal_consistency_warning": True,
         "source_internal_consistency_note": SOURCE_INTERNAL_CONSISTENCY_NOTE,
         "interpretation": {
@@ -91,10 +112,17 @@ def build_2018_condition_benchmark() -> dict[str, Any]:
                 "Actual exposure/free spans existed historically on the corridor.",
                 "Most of the corridor was reported buried >= 0.6 m.",
                 "Local exceptions to majority burial existed.",
+                "As of MAR-014A, 2018 free-span KP/Easting/Northing positions are "
+                "available (Ithaca Energy Comparative Assessment, April 2020, Appendix B "
+                "Table B.1) -- see the anglia_freespan_spatial_evidence outputs.",
             ],
             "not_usable_as": [
-                "Spatial validation of any MAR-014 segment-level result "
-                "(KP positions are not available in canonical machine-readable form).",
+                "Spatial validation of any MAR-014 segment-level result: free-span "
+                "positions are now available (MAR-014A) but are deliberately NOT used as "
+                "a validation/accuracy metric (MAR-014A Section 17 attaches model context "
+                "for side-by-side human review only -- no score, probability, or rank). "
+                "Exposed-section KP positions remain unavailable in canonical "
+                "machine-readable form.",
                 "Training or calibration data for MAR-014 segment-level results.",
             ],
             "mar014_0_15d_mm": MAR014_0_15D_MM,
