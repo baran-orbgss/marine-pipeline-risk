@@ -39,6 +39,7 @@ from marine_engine.preprocessing.chainage import (
     load_pipeline_route,
     print_chainage_report,
 )
+from marine_engine.providers import nsta_freespan
 from marine_engine.providers.bathymetry import acquisition, bgs, emodnet, inventory, ukho
 from marine_engine.providers.metocean import acquisition as metocean_acquisition
 from marine_engine.providers.metocean import copernicus
@@ -61,6 +62,8 @@ from marine_engine.scour import (
     freespan_evidence,
     freespan_evidence_map,
     freespan_temporal_provenance,
+    nsta_freespan_reconciliation,
+    nsta_freespan_reconciliation_map,
     pipeline_condition,
     scour_onset,
     scour_onset_map,
@@ -3791,6 +3794,251 @@ def _cmd_build_freespan_spatial_evidence(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ingest_nsta_freespan_registry(args: argparse.Namespace) -> int:
+    """MAR-014C: the ONE live network request this ticket performs -- acquires the
+    NSTA Pipeline Freespans registry (current + removed layers) for PL854/PL855
+    and caches the raw response. `build-freespan-registry-reconciliation` reads
+    only this cached snapshot and performs no network request of its own.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    cache_dir = config.paths.raw_dir / "nsta" / "freespans"
+    manifest_path = (
+        config.paths.interim_dir
+        / pipeline_id.lower()
+        / "nsta_freespan"
+        / "acquisition_manifest.json"
+    )
+
+    try:
+        report = nsta_freespan.ingest_freespan_registry(
+            cache_dir=cache_dir, manifest_path=manifest_path
+        )
+    except nsta_freespan.NstaFreespanServiceError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    nsta_freespan.print_ingestion_report(report)
+    return 0
+
+
+def _cmd_build_freespan_registry_reconciliation(args: argparse.Namespace) -> int:
+    """MAR-014C: offline reconciliation of the cached NSTA freespan registry
+    snapshot against Table B.1 (MAR-014A/B). Performs NO network request --
+    requires `ingest-nsta-freespan-registry` and `build-freespan-spatial-evidence`
+    to have already run.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pipeline_gpkg_path, _aoi_gpkg_path, _chainage_gpkg_path, _interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    cache_dir = config.paths.raw_dir / "nsta" / "freespans"
+    manifest_path = (
+        config.paths.interim_dir
+        / pipeline_id.lower()
+        / "nsta_freespan"
+        / "acquisition_manifest.json"
+    )
+    raw_current_path = cache_dir / f"{nsta_freespan.CURRENT_REGISTRY_LAYER.lower()}.geojson"
+    raw_removed_path = cache_dir / f"{nsta_freespan.REMOVED_REGISTRY_LAYER.lower()}.geojson"
+    spatial_evidence_path = (
+        study_dir / "freespan_evidence" / "anglia_freespan_spatial_evidence.parquet"
+    )
+    reconciliation_metadata_path = (
+        study_dir / "freespan_evidence" / "anglia_freespan_spatial_reconciliation_metadata.json"
+    )
+
+    required_paths = (
+        pipeline_gpkg_path,
+        raw_current_path,
+        raw_removed_path,
+        spatial_evidence_path,
+        reconciliation_metadata_path,
+    )
+    missing = [str(p) for p in required_paths if not p.exists()]
+    if missing:
+        print(
+            "error: missing required input(s) -- run ingest-nsta-freespan-registry and "
+            f"build-freespan-spatial-evidence first: {missing}",
+            file=sys.stderr,
+        )
+        return 1
+
+    working_crs = config.crs.horizontal
+    try:
+        route, _attributes, source_crs = load_pipeline_route(pipeline_gpkg_path, pipeline_id)
+    except InvalidPipelineRouteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if source_crs != working_crs:
+        print(
+            f"error: pipeline CRS {source_crs} does not match configured working CRS {working_crs}",
+            file=sys.stderr,
+        )
+        return 1
+
+    current_payload = json.loads(raw_current_path.read_text(encoding="utf-8"))
+    removed_payload = json.loads(raw_removed_path.read_text(encoding="utf-8"))
+    current_records = nsta_freespan_reconciliation.parse_raw_freespan_features(
+        current_payload, nsta_freespan.CURRENT_REGISTRY_LAYER
+    )
+    removed_records = nsta_freespan_reconciliation.parse_raw_freespan_features(
+        removed_payload, nsta_freespan.REMOVED_REGISTRY_LAYER
+    )
+    nsta_registry_gdf = nsta_freespan_reconciliation.build_nsta_freespan_registry_gdf(
+        current_records + removed_records, route, working_crs
+    )
+
+    table_b1_df = pd.read_parquet(spatial_evidence_path)
+    table_b1_2018_df = table_b1_df[table_b1_df["survey_year"] == 2018].reset_index(drop=True)
+
+    match_diagnostics_df = nsta_freespan_reconciliation.match_table_b1_events_to_nsta(
+        table_b1_df, nsta_registry_gdf
+    )
+    piggyback_df = nsta_freespan_reconciliation.detect_piggyback_coincident_records(
+        nsta_registry_gdf
+    )
+    attribution_evidence_df = nsta_freespan_reconciliation.build_2018_attribution_evidence(
+        table_b1_2018_df, match_diagnostics_df, piggyback_df
+    )
+    temporal_context = nsta_freespan_reconciliation.summarize_registry_temporal_context(
+        nsta_registry_gdf
+    )
+    totals_comparison = nsta_freespan_reconciliation.compare_registry_totals(
+        nsta_registry_gdf, table_b1_df
+    )
+
+    pipeline_condition_dir = study_dir / "pipeline_condition"
+    maps_dir = study_dir / "maps"
+
+    registry_parquet_path = pipeline_condition_dir / "nsta_pl854_pl855_freespan_registry.parquet"
+    registry_gpkg_path = pipeline_condition_dir / "nsta_pl854_pl855_freespan_registry.gpkg"
+    nsta_freespan_reconciliation.write_nsta_freespan_registry(
+        nsta_registry_gdf, registry_parquet_path, registry_gpkg_path
+    )
+
+    crosswalk_path = pipeline_condition_dir / "nsta_table_b1_freespan_crosswalk.parquet"
+    crosswalk_path.parent.mkdir(parents=True, exist_ok=True)
+    match_diagnostics_df.to_parquet(crosswalk_path, index=False)
+
+    attribution_evidence_path = (
+        pipeline_condition_dir / "anglia_2018_freespan_attribution_evidence.parquet"
+    )
+    attribution_evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    attribution_evidence_df.to_parquet(attribution_evidence_path, index=False)
+
+    background_raster_path = study_dir / "bathymetry" / "emodnet_baseline_lat_100m.tif"
+    background_raster_path = background_raster_path if background_raster_path.exists() else None
+
+    geometries_2018 = freespan_evidence.build_event_geometries(table_b1_2018_df, route)
+    events_2018_gdf = gpd.GeoDataFrame(table_b1_2018_df, geometry=geometries_2018, crs=working_crs)
+
+    reconciliation_map_path = (
+        nsta_freespan_reconciliation_map.render_nsta_table_b1_reconciliation_map(
+            events_2018_gdf=events_2018_gdf,
+            nsta_registry_gdf=nsta_registry_gdf,
+            piggyback_df=piggyback_df,
+            route=route,
+            output_path=maps_dir / "pl854_nsta_table_b1_freespan_reconciliation.png",
+            background_raster_path=background_raster_path,
+        )
+    )
+    reconciliation_map_dimensions = nsta_freespan_reconciliation_map.read_png_dimensions(
+        reconciliation_map_path
+    )
+
+    crosswalk_figure_path = (
+        nsta_freespan_reconciliation_map.render_2018_attribution_crosswalk_figure(
+            attribution_evidence_df=attribution_evidence_df,
+            match_diagnostics_df=match_diagnostics_df,
+            output_path=maps_dir / "pl854_2018_freespan_attribution_crosswalk.png",
+        )
+    )
+    crosswalk_figure_dimensions = nsta_freespan_reconciliation_map.read_png_dimensions(
+        crosswalk_figure_path
+    )
+
+    # --- Section 19: update MAR-014A/B metadata (never delete previous uncertainty) --
+    reconciliation_metadata = json.loads(reconciliation_metadata_path.read_text(encoding="utf-8"))
+    individual_line_attribution_refined = bool(
+        (
+            attribution_evidence_df["attribution_evidence_status"]
+            != nsta_freespan_reconciliation.NO_NSTA_CROSS_SOURCE_MATCH
+        ).any()
+    )
+    reconciliation_metadata["nsta_pipeline_freespan_registry_checked"] = True
+    reconciliation_metadata["nsta_current_layer_checked"] = True
+    reconciliation_metadata["nsta_removed_layer_checked"] = True
+    reconciliation_metadata["nsta_line_specific_attribution_fields_available"] = True
+    reconciliation_metadata["individual_line_attribution_refined_by_nsta"] = (
+        individual_line_attribution_refined
+    )
+    reconciliation_metadata["nsta_freespan_registry_totals_comparison"] = totals_comparison
+    reconciliation_metadata_path.write_text(
+        json.dumps(reconciliation_metadata, indent=2, default=str), encoding="utf-8"
+    )
+
+    print(f"NSTA freespan registry: {len(nsta_registry_gdf)} feature(s) -> {registry_parquet_path}")
+    print(f"  GPKG: {registry_gpkg_path}")
+    print(
+        f"Table B.1/NSTA crosswalk: {len(match_diagnostics_df)} candidate row(s) -> "
+        f"{crosswalk_path}"
+    )
+    print(
+        f"2018 attribution evidence: {len(attribution_evidence_df)} event(s) -> "
+        f"{attribution_evidence_path}"
+    )
+    print(f"Reconciliation map: {reconciliation_map_path}")
+    print(f"Attribution crosswalk figure: {crosswalk_figure_path}")
+    print(f"Reconciliation metadata (updated): {reconciliation_metadata_path}")
+    print()
+
+    if manifest_path.exists():
+        manifest_entries = json.loads(manifest_path.read_text(encoding="utf-8"))
+        print("## NSTA acquisition (from manifest)")
+        for entry in manifest_entries:
+            print(
+                f"  {entry['registry_layer']}: {entry['returned_feature_count']} feature(s), "
+                f"retrieved {entry['retrieved_at_utc']}, sha256={entry['sha256'][:16]}..."
+            )
+        print()
+
+    nsta_freespan_reconciliation.print_reconciliation_report(
+        nsta_registry_gdf=nsta_registry_gdf,
+        temporal_context=temporal_context,
+        attribution_evidence_df=attribution_evidence_df,
+        totals_comparison=totals_comparison,
+        piggyback_df=piggyback_df,
+        outputs={
+            "nsta_pl854_pl855_freespan_registry_parquet": registry_parquet_path,
+            "nsta_pl854_pl855_freespan_registry_gpkg": registry_gpkg_path,
+            "nsta_table_b1_freespan_crosswalk_parquet": crosswalk_path,
+            "anglia_2018_freespan_attribution_evidence_parquet": attribution_evidence_path,
+            "reconciliation_map_png": (
+                f"{reconciliation_map_path} "
+                f"({reconciliation_map_dimensions[0]}x{reconciliation_map_dimensions[1]} px)"
+            ),
+            "attribution_crosswalk_png": (
+                f"{crosswalk_figure_path} "
+                f"({crosswalk_figure_dimensions[0]}x{crosswalk_figure_dimensions[1]} px)"
+            ),
+        },
+    )
+    return 0
+
+
 def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> datetime:
     """The live dataset's own start timestamp, or `fallback_now` if it could not be discovered."""
 
@@ -3997,6 +4245,35 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_freespan_spatial_evidence_parser.set_defaults(func=_cmd_build_freespan_spatial_evidence)
+
+    ingest_nsta_freespan_registry_parser = subparsers.add_parser(
+        "ingest-nsta-freespan-registry",
+        help=(
+            "Live NSTA acquisition (MAR-014C): query the NSTA Pipeline Freespans "
+            "registry (current + removed layers) for PL854/PL855 and cache the raw "
+            "response. The ONE network request this ticket performs."
+        ),
+    )
+    ingest_nsta_freespan_registry_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    ingest_nsta_freespan_registry_parser.set_defaults(func=_cmd_ingest_nsta_freespan_registry)
+
+    build_freespan_registry_reconciliation_parser = subparsers.add_parser(
+        "build-freespan-registry-reconciliation",
+        help=(
+            "Offline reconciliation (MAR-014C) of the cached NSTA freespan registry "
+            "snapshot against Table B.1 -- no network, requires "
+            "ingest-nsta-freespan-registry and build-freespan-spatial-evidence to "
+            "have already run."
+        ),
+    )
+    build_freespan_registry_reconciliation_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_freespan_registry_reconciliation_parser.set_defaults(
+        func=_cmd_build_freespan_registry_reconciliation
+    )
 
     return parser
 

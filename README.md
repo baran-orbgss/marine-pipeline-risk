@@ -1042,3 +1042,65 @@ otherwise, never an interactive credential prompt.
   susceptibility score, probability, prediction model, or automatic
   cross-survey event matching was created anywhere in this ticket -- no
   further ticket has started.
+
+- `MAR-014C`: reconciles PL854/PL855 against a THIRD official source -- NSTA's
+  own Pipeline Freespans registry (`providers/nsta_freespan.py`,
+  `scour/nsta_freespan_reconciliation{,_map}.py`) -- and repairs one small
+  MAR-014B gap (the six `DIRECT_DOCUMENT_NARRATIVE` relationship records,
+  `REL-09`..`REL-14`, now correctly cite page 15/"Section 3 summary
+  description", never Table B.1's own page 44). The ticket's own supplied
+  URL (`data.nstauthority.co.uk`) does not resolve -- confirmed genuine
+  NXDOMAIN against a public resolver, not a sandbox restriction, since
+  `services-eu1.arcgis.com` (the domain `nsta.py` already uses) and the
+  bare `nstauthority.co.uk` both resolve fine. The real services were found
+  the same way `nsta.py`'s own were: the public ArcGIS Online item-search
+  API (`owner:NSTA_GIS`), landing on "UKCS offshore infrastructure pipeline
+  freespans (WGS84)" and its "removed" counterpart, both at layer id 1
+  (matching `nsta.py`'s own convention -- never the ticket-assumed
+  `FeatureServer/3`/`9`, which belonged to the non-existent host).
+
+  The one live acquisition this ticket performs (`ingest-nsta-freespan-
+  registry`, `NSTAPIPNO IN ('PL854','PL855')` against both layers,
+  `outFields=*`) returned **zero features in both the current and removed
+  layers** (953 + 25 = 978 total freespan records; 222 distinct NSTAPIPNO
+  values across both). Per the ticket's own explicit instruction, this was
+  investigated rather than silently broadened to fuzzy `PIPE_NAME`
+  matching: every distinct `NSTAPIPNO` value, plus the older `LEGACY_ID`/
+  `LEG_P_ID` identifier fields (still formal fields, never fuzzy text), was
+  checked for "854"/"855" and found none; a diagnostic (never
+  match-affecting) `PIPE_NAME` search for "ANGLIA"/"LOGGS" found only
+  unrelated pipelines sharing the LOGGS terminal (PL2643, PL454). PL854/
+  PL855 are therefore, as of this real acquisition, genuinely absent from
+  NSTA's line-specific freespan registry -- a real, reportable outcome
+  preserved as-is, never fabricated or routed around.
+
+  `build-freespan-registry-reconciliation` runs fully offline from that
+  cached snapshot: it never snaps an NSTA feature onto the route before
+  measuring its real separation, reconciles chainage the same coordinate-
+  projection way as MAR-014A, and would classify any future PL854/PL855
+  NSTA record via multiple independent diagnostics (interval overlap,
+  midpoint separation, length/height/survey agreement) -- a
+  `STRONG_CROSS_SOURCE_MATCH` always requires clear spatial correspondence
+  AND at least one independent attribute agreement, never spatial
+  proximity alone; multiple equally-plausible candidates resolve to
+  `AMBIGUOUS_MULTIPLE_NSTA_CANDIDATES`, never an arbitrary winner; a
+  coincident PL854/PL855 pair is labelled
+  `PIGGYBACK_COINCIDENT_FREESPAN_RECORDS` rather than silently keeping one
+  copy. With the real (empty) snapshot, all 8 2018 Table B.1 events
+  resolve to `NO_NSTA_CROSS_SOURCE_MATCH`, and `individual_line_attribution`
+  stays `UNRESOLVED` exactly as MAR-014A left it -- the original Ithaca
+  corridor evidence is never mutated, only ever supplemented in a separate
+  derived file. Two new maps
+  (`pl854_nsta_table_b1_freespan_reconciliation.png`,
+  `pl854_2018_freespan_attribution_crosswalk.png`) render correctly even
+  with zero NSTA records, honestly showing the real outcome rather than an
+  empty/broken plot. Per the ticket's own explicit scope limit, no model
+  accuracy, ROC/AUC, susceptibility score, or probability is computed
+  anywhere -- the current hydrodynamic model (2024-2026 forcing) is not
+  contemporaneous with the 2018 survey. 29 new offline tests were added
+  across `test_nsta_freespan_provider.py`, `test_nsta_freespan_reconciliation.py`,
+  `test_nsta_freespan_reconciliation_map.py`, and an extended `test_cli.py`,
+  plus 3 new `live`-marked tests (`test_nsta_freespan_live.py`, excluded by
+  default, documenting the real zero-result acquisition -- 32 new tests in
+  total); the full offline suite (893 tests) and repo-wide `ruff format`/
+  `ruff check` pass clean. No further ticket has started.

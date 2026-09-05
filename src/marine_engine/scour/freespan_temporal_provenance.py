@@ -82,6 +82,7 @@ TEMPORAL_EVIDENCE_COLUMNS = (
     "source_statement",
     "source_page",
     "source_table",
+    "source_location",
     "attribution_method",
     "scientific_role",
 )
@@ -138,6 +139,7 @@ def build_freespan_temporal_relationship_evidence(
                 "source_statement": row["source_statement"],
                 "source_page": row["source_page"],
                 "source_table": row["source_table"],
+                "source_location": row.get("source_location"),
                 "attribution_method": row["attribution_method"],
                 "scientific_role": SCIENTIFIC_ROLE,
             }

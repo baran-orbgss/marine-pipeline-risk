@@ -117,6 +117,7 @@ ANGLIA_TABLE_B1_RELATIONSHIPS_COLUMNS = (
     "source_statement",
     "source_page",
     "source_table",
+    "source_location",
     "attribution_method",
 )
 

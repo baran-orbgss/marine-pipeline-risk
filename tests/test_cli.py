@@ -2609,3 +2609,185 @@ def test_build_freespan_spatial_evidence_command_is_idempotent_offline(
 
     assert first_exit_code == 0
     assert second_exit_code == 0
+
+
+# --- ingest-nsta-freespan-registry / build-freespan-registry-reconciliation (MAR-014C) --
+
+
+def test_ingest_nsta_freespan_registry_command_requires_pipeline_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "no_pipeline.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["ingest-nsta-freespan-registry", str(config_path)])
+
+    assert exit_code == 1
+    assert "pipeline.pipeline_id" in capsys.readouterr().err
+
+
+def test_build_freespan_registry_reconciliation_command_requires_pipeline_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "no_pipeline.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-freespan-registry-reconciliation", str(config_path)])
+
+    assert exit_code == 1
+    assert "pipeline.pipeline_id" in capsys.readouterr().err
+
+
+def test_build_freespan_registry_reconciliation_command_requires_prior_outputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  raw_dir: {tmp_path / 'raw'}\n  processed_dir: {processed_dir}\n"
+        f"  interim_dir: {interim_dir}\npipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-freespan-registry-reconciliation", str(config_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "ingest-nsta-freespan-registry" in err
+    assert "build-freespan-spatial-evidence" in err
+
+
+def _write_freespan_registry_reconciliation_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    nsta_current_features=None,
+    nsta_removed_features=None,
+) -> Path:
+    """Reuses the MAR-014A/B freespan-spatial-evidence fixture (real
+    `build-freespan-spatial-evidence` run against synthetic data) and adds a
+    synthetic, isolated `raw_dir` plus pre-populated raw NSTA freespan cache
+    files -- so `build-freespan-registry-reconciliation` never touches the
+    real project's own `data/raw` directory.
+    """
+
+    config_path = _write_freespan_spatial_evidence_fixture(tmp_path, monkeypatch)
+    raw_dir = tmp_path / "raw"
+    config_text = config_path.read_text(encoding="utf-8")
+    config_text = config_text.replace(
+        "paths:\n  processed_dir:", f"paths:\n  raw_dir: {raw_dir}\n  processed_dir:"
+    )
+    config_path.write_text(config_text, encoding="utf-8")
+
+    assert main(["build-freespan-spatial-evidence", str(config_path)]) == 0
+
+    from marine_engine.providers import nsta_freespan
+
+    cache_dir = raw_dir / "nsta" / "freespans"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "current_pipeline_freespans.geojson").write_text(
+        json.dumps({"type": "FeatureCollection", "features": nsta_current_features or []}),
+        encoding="utf-8",
+    )
+    (cache_dir / "removed_pipeline_freespans.geojson").write_text(
+        json.dumps({"type": "FeatureCollection", "features": nsta_removed_features or []}),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "interim" / "pl854" / "nsta_freespan" / "acquisition_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            [
+                {
+                    "registry_layer": nsta_freespan.CURRENT_REGISTRY_LAYER,
+                    "returned_feature_count": len(nsta_current_features or []),
+                    "retrieved_at_utc": "2026-01-01T00:00:00+00:00",
+                    "sha256": "0" * 64,
+                },
+                {
+                    "registry_layer": nsta_freespan.REMOVED_REGISTRY_LAYER,
+                    "returned_feature_count": len(nsta_removed_features or []),
+                    "retrieved_at_utc": "2026-01-01T00:00:00+00:00",
+                    "sha256": "0" * 64,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def test_build_freespan_registry_reconciliation_command_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_freespan_registry_reconciliation_fixture(tmp_path, monkeypatch)
+
+    exit_code = main(["build-freespan-registry-reconciliation", str(config_path)])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "NSTA LINE-SPECIFIC ATTRIBUTION EVIDENCE IS PRESERVED AS A SECOND SOURCE" in output
+    assert "NO MODEL VALIDATION OR FREESPAN SUSCEPTIBILITY SCORE HAS BEEN CREATED" in output
+
+    processed_dir = tmp_path / "processed" / "pl854"
+    pipeline_condition_dir = processed_dir / "pipeline_condition"
+    registry_parquet_path = pipeline_condition_dir / "nsta_pl854_pl855_freespan_registry.parquet"
+    registry_gpkg_path = pipeline_condition_dir / "nsta_pl854_pl855_freespan_registry.gpkg"
+    crosswalk_path = pipeline_condition_dir / "nsta_table_b1_freespan_crosswalk.parquet"
+    attribution_path = pipeline_condition_dir / "anglia_2018_freespan_attribution_evidence.parquet"
+    reconciliation_map_path = (
+        processed_dir / "maps" / "pl854_nsta_table_b1_freespan_reconciliation.png"
+    )
+    crosswalk_figure_path = processed_dir / "maps" / "pl854_2018_freespan_attribution_crosswalk.png"
+
+    for path in (
+        registry_parquet_path,
+        registry_gpkg_path,
+        crosswalk_path,
+        attribution_path,
+        reconciliation_map_path,
+        crosswalk_figure_path,
+    ):
+        assert path.exists(), path
+        assert path.stat().st_size > 0
+
+    registry_df = pd.read_parquet(registry_parquet_path)
+    assert len(registry_df) == 0  # no PL854/PL855 records in the synthetic empty snapshot
+
+    attribution_df = pd.read_parquet(attribution_path)
+    assert len(attribution_df) == 8
+    assert (attribution_df["original_individual_line_attribution"] == "UNRESOLVED").all()
+    assert (attribution_df["attribution_evidence_status"] == "NO_NSTA_CROSS_SOURCE_MATCH").all()
+
+    reconciliation_metadata_path = (
+        processed_dir / "freespan_evidence" / "anglia_freespan_spatial_reconciliation_metadata.json"
+    )
+    reconciliation_metadata = json.loads(reconciliation_metadata_path.read_text(encoding="utf-8"))
+    assert reconciliation_metadata["nsta_pipeline_freespan_registry_checked"] is True
+    assert reconciliation_metadata["nsta_current_layer_checked"] is True
+    assert reconciliation_metadata["nsta_removed_layer_checked"] is True
+    assert reconciliation_metadata["individual_line_attribution_refined_by_nsta"] is False
+    # never deletes previous MAR-014A/B uncertainty
+    assert reconciliation_metadata["source_crs_status"] == (
+        "CRS_INFERRED_FROM_SPATIAL_CONSISTENCY_NOT_SOURCE_STATED"
+    )
+
+
+def test_build_freespan_registry_reconciliation_command_is_idempotent_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _write_freespan_registry_reconciliation_fixture(tmp_path, monkeypatch)
+
+    first_exit_code = main(["build-freespan-registry-reconciliation", str(config_path)])
+    second_exit_code = main(["build-freespan-registry-reconciliation", str(config_path)])
+
+    assert first_exit_code == 0
+    assert second_exit_code == 0

@@ -177,3 +177,26 @@ def test_F_2012_to_2014_same_span_statement_preserved_with_ambiguous_side_null()
     # Section 6 requires a null event_id_b here, never a fabricated pair.
     assert pd.isna(pair.iloc[0]["event_id_b"])
     assert "2012" in pair.iloc[0]["source_statement"] and "2014" in pair.iloc[0]["source_statement"]
+
+
+# --- Q (MAR-014C): narrative relationship records REL-09..14 have source_page=15 -------
+
+
+def test_Q_narrative_relationships_cite_page_15_not_table_b1():
+    rel = resources.load_anglia_table_b1_freespan_relationships()
+    narrative_ids = [f"REL-{i:02d}" for i in range(9, 15)]
+    narrative_rows = rel[rel["relationship_id"].isin(narrative_ids)]
+    assert len(narrative_rows) == 6
+    assert (narrative_rows["source_page"] == 15).all()
+    # Narrative statements are never attributed to Table B.1 itself.
+    assert narrative_rows["source_table"].isna().all()
+    assert (narrative_rows["source_location"] == "Section 3 summary description, page 15").all()
+
+
+def test_Q_table_b1_event_level_relationships_still_cite_page_44():
+    rel = resources.load_anglia_table_b1_freespan_relationships()
+    event_level_ids = [f"REL-{i:02d}" for i in range(1, 9)]
+    event_rows = rel[rel["relationship_id"].isin(event_level_ids)]
+    assert len(event_rows) == 8
+    assert (event_rows["source_page"] == 44).all()
+    assert (event_rows["source_table"] == "Appendix B Table B.1").all()
