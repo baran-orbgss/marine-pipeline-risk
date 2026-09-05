@@ -819,3 +819,91 @@ otherwise, never an interactive credential prompt.
   Shields threshold above this, transport rate, erosion, deposition, scour,
   free-span, fatigue, or pipeline risk is computed anywhere in this ticket
   -- no further ticket has started.
+- `MAR-014`: pipeline-specific scour-ONSET screening (`scour/
+  {scour_onset,scour_onset_map,pipeline_condition}.py`) using Marini et
+  al. (2024)'s combined wave-current generalisation of the Sumer et al.
+  (2001) tunnel-scour-onset criterion -- never predicted scour depth,
+  erosion depth, burial, exposure, free-span geometry, failure
+  probability, or pipeline risk. PL854's real diameter (0.3048 m, 12 inch,
+  a fixed constant -- never inferred from geometry/imagery) is OUTSIDE the
+  source experimental envelope (D=0.05-0.10 m); every output states
+  `PIPE_DIAMETER_OUTSIDE_SOURCE_EXPERIMENT_ENVELOPE` and
+  `RESEARCH_SCREENING_EXTRAPOLATION_NOT_CALIBRATED_PL854_PREDICTION` --
+  this is never presented as a validated field prediction. Three fixed D50
+  screening scenarios (0.160/0.250/0.480 mm -- the Marini/Zang COMBINED-flow
+  calibration envelope only, never all nine MAR-013 scenarios), three
+  porosity scenarios (0.35/0.40/0.45), and five tested embedment ratios
+  (e/D = 0/0.03/0.06/0.10/0.15) are FIXED sensitivity dimensions; the
+  published onset equation is evaluated ONLY at these five explicit
+  embedment scenarios -- never solved for an unconstrained continuous
+  critical embedment, and a persisting onset at e/D=0.15 is flagged
+  `ONSET_PERSISTS_AT_MAX_TESTED_EMBEDMENT` rather than extrapolated.
+
+  Since the Marini/Zang laboratory experiments are effectively
+  2D/codirectional, PL854's oblique current/wave directions are handled by
+  an explicit, disclosed `PIPELINE_NORMAL_2D_SCREENING_PROJECTION` --
+  current and wave orbital amplitude are projected onto the LOCAL route
+  tangent (a numerical tangent from the true curved geometry at each
+  hydro-pair section's own chainage midpoint, never a whole-route chord),
+  reusing MAR-012's angle-folding function directly since a pipe tangent,
+  like the wave axis, is an undirected line with 180-degree symmetry.
+  `oblique_flow_extension_directly_validated_by_source_experiments = false`
+  throughout. Current is reconstructed at each tested embedment's own
+  pipe-top height (`z_top = D*(1-e/D)`) using MAR-013's `z0_skin = d50/12`
+  roughness convention and MAR-012's log-profile inversion, generalised to
+  an arbitrary target height rather than MAR-010's fixed 1 m. The Marini
+  wave Shields parameter, KC (Eq. 30, with explicit `COMBINED`/`WAVE_ONLY`/
+  `CURRENT_ONLY`/`CALM` branches -- current-only uses the original Sumer et
+  al. constants a=0.025/b=0.5 directly rather than forcing the generalised
+  equations through a genuine `theta=0`/`KC=infinity` indeterminate form),
+  and the combined-velocity alpha/beta polynomial are all computed
+  independently of MAR-012/013's own stress/mobility definitions, per the
+  ticket's explicit "use the model's own formulation" instruction. A real
+  edge case caught in review: the pipeline-normal projection's `magnitude *
+  sin(angle)` silently produced `NaN` (not the physically-correct `0`) for
+  a genuinely zero-magnitude flow whose direction is null by the same
+  zero-speed convention MAR-012/013 established -- fixed with an explicit
+  zero-magnitude branch, mirroring this project's now-familiar `0 * NaN !=
+  0` discipline; a second, related edge case (`Omega_forcing/Omega_threshold`
+  giving `NaN` for the CALM branch, since `a`/`b` are deliberately never
+  computed there) is guarded the same way.
+
+  The compact 3-hourly output stores one row per `hydro_pair_id x time_utc
+  x tested_d50_mm x porosity_scenario` (never a 5x embedment row fan-out)
+  with five `onset_margin_eD_*` columns; embedment monotonicity
+  (`Omega_forcing/Omega_threshold` must never increase with embedment) is
+  verified empirically per row and hard-fails the run on any genuine
+  violation beyond floating-point tolerance. Route sections reuse
+  MAR-012/013's hydro-pair segmentation exactly; the required map colours
+  each section by `p95_required_embedment_upper_class` using a DISCRETE
+  six-class scale (0/0.03D/0.06D/0.10D/0.15D/>0.15D, with PL854 mm
+  equivalents in the legend) plus a compact, clearly-separated 2018
+  official-survey context box -- MAR-007's regional morphology
+  (1991-1992 acquisition) is attached as `LEGACY_REGIONAL_CONTEXT_ONLY`
+  and never enters the onset equation. The required official 2018
+  PL854/PL855 condition benchmark (Ithaca Energy Anglia Decommissioning
+  Environmental Appraisal, page 29, Tables 3.4-3.5) is recorded exactly,
+  including its own internal prose-vs-table free-span-length inconsistency
+  (10 m narrative vs. 23.2 m tabled) preserved verbatim rather than
+  silently "corrected" -- and is never spatially distributed to PL854
+  segments (`spatial_kp_locations_available_as_machine_readable_data =
+  false`).
+
+  Real execution against PL854 (no network) hand-verified every threshold
+  term and reproduced the expected physical behaviour: at zero embedment,
+  33.2-41.0% of real combined current-wave states (across the 9 D50 x
+  porosity scenarios) already reach the onset criterion; this collapses to
+  0.0-0.3% at just e/D=0.03 and to ~0% by e/D=0.06 -- so ALL 14 real hydro
+  pairs, across all 9 sensitivity scenarios, resolve to the SAME p95
+  required embedment class (0.03D, 9.1 mm) with zero monotonicity
+  violations across 655,074 real combined rows. PL854's real diameter
+  falls outside the source envelope as expected, but projected real
+  current states fall inside the source Uc range 71.8% of the time and
+  inside the source KC range 21.1% of the time (Uw only 10.3% -- an honest
+  applicability finding, never used to discard results). 77 new offline
+  tests were added across `test_scour_onset.py`, `test_scour_onset_map.py`,
+  `test_pipeline_condition.py`, and `test_cli.py`; the full offline suite
+  (801 tests) and repo-wide `ruff format`/`ruff check` pass clean. No
+  equilibrium scour depth, scour propagation, sediment transport rate,
+  exposure prediction, free-span prediction, fatigue, or risk scoring is
+  computed anywhere in this ticket -- no further ticket has started.

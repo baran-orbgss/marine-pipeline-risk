@@ -50,6 +50,7 @@ from marine_engine.providers.nsta import (
     print_ingestion_report,
 )
 from marine_engine.providers.sediment import bgs as sediment_bgs
+from marine_engine.scour import pipeline_condition, scour_onset, scour_onset_map
 from marine_engine.sediment import evidence, noncohesive_mobility, noncohesive_mobility_map
 
 
@@ -3030,6 +3031,369 @@ def _cmd_build_noncohesive_mobility(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_scour_onset_screening(args: argparse.Namespace) -> int:
+    """MAR-014: pipeline scour-onset embedment screening + 2018 condition benchmark.
+
+    Requires the MAR-009B current, MAR-011A wave orbital, and MAR-007
+    morphology outputs to already exist on disk; performs NO network
+    request -- everything it reads was already computed. Reuses MAR-012's
+    verified hydro-node spatial reconciliation directly.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pipeline_gpkg_path, _aoi_gpkg_path, _chainage_gpkg_path, interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    metocean_interim_dir = interim_dir / "metocean"
+    metocean_processed_dir = study_dir / "metocean"
+    morphology_processed_dir = study_dir / "morphology"
+    scour_interim_dir = interim_dir / "scour"
+    scour_processed_dir = study_dir / "scour"
+    pipeline_condition_dir = study_dir / "pipeline_condition"
+    maps_dir = study_dir / "maps"
+
+    current_hourly_path = metocean_interim_dir / "current_primary_hourly.parquet"
+    current_nodes_path = metocean_interim_dir / "current_primary_support_nodes.parquet"
+    wave_hourly_path = metocean_interim_dir / "wave_orbital_velocity_3hourly.parquet"
+    wave_nodes_path = metocean_interim_dir / "wave_support_nodes.parquet"
+    chainage_metocean_path = metocean_processed_dir / "chainage_metocean_evidence.parquet"
+    chainage_morphology_path = morphology_processed_dir / "chainage_regional_morphology.parquet"
+    required_paths = (
+        pipeline_gpkg_path,
+        current_hourly_path,
+        current_nodes_path,
+        wave_hourly_path,
+        wave_nodes_path,
+        chainage_metocean_path,
+        chainage_morphology_path,
+    )
+    missing = [str(p) for p in required_paths if not p.exists()]
+    if missing:
+        print(
+            "error: missing required canonical output(s) -- run build-metocean-evidence, "
+            "build-wave-orbital-forcing, and build-regional-morphology first: "
+            f"{missing}",
+            file=sys.stderr,
+        )
+        return 1
+
+    working_crs = config.crs.horizontal
+    try:
+        route, _attributes, source_crs = load_pipeline_route(pipeline_gpkg_path, pipeline_id)
+    except InvalidPipelineRouteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if source_crs != working_crs:
+        print(
+            f"error: pipeline CRS {source_crs} does not match configured working CRS {working_crs}",
+            file=sys.stderr,
+        )
+        return 1
+
+    current_hourly_df = pd.read_parquet(current_hourly_path)
+    current_nodes_df = pd.read_parquet(current_nodes_path)
+    wave_hourly_df = pd.read_parquet(wave_hourly_path)
+    wave_nodes_df = pd.read_parquet(wave_nodes_path)
+    chainage_metocean_df = pd.read_parquet(chainage_metocean_path)
+    chainage_morphology_df = pd.read_parquet(chainage_morphology_path)
+
+    # --- MAR-012's verified spatial reconciliation, reused directly ---------
+    try:
+        hydro_pairs_df = combined_bed_shear.build_hydro_pairs(
+            current_nodes_df, wave_nodes_df, working_crs=working_crs
+        )
+    except combined_bed_shear.UnreconciledHydroNodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    # --- route sections + local tangent bearings (Section 12) --------------
+    chainage_hydro_df = chainage_metocean_df[
+        ["station_index", "chainage_m", "current_node_id", "wave_node_id"]
+    ].merge(
+        hydro_pairs_df[["current_node_id", "wave_node_id", "hydro_pair_id"]],
+        on=["current_node_id", "wave_node_id"],
+        how="left",
+    )
+    sections = scour_onset_map.build_route_sections(route, chainage_hydro_df)
+    tangent_bearing_by_pair_id = scour_onset_map.build_tangent_bearing_by_pair_id(sections)
+
+    # --- MAR-014 core: Marini et al. (2024) scour-onset screening -----------
+    mobility_df, reference_diagnostics = scour_onset.build_scour_onset_embedment_3hourly(
+        current_hourly_df, wave_hourly_df, hydro_pairs_df, tangent_bearing_by_pair_id
+    )
+
+    try:
+        monotonicity_violation_count = scour_onset.raise_if_embedment_monotonicity_violated(
+            mobility_df
+        )
+    except scour_onset.EmbedmentMonotonicityViolationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        stats_df = scour_onset.compute_scour_onset_embedment_stats(mobility_df)
+    except scour_onset.ScourOnsetCompletenessError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    applicability = scour_onset.compute_applicability_diagnostics(
+        reference_diagnostics, mobility_df
+    )
+    projection_qa = scour_onset.compute_pipeline_normal_projection_qa(reference_diagnostics)
+    envelope_df = scour_onset.compute_sensitivity_envelope(stats_df)
+
+    envelope_by_pair_id = {row["hydro_pair_id"]: row.to_dict() for _, row in envelope_df.iterrows()}
+
+    # --- morphology context (Section 27, LEGACY CONTEXT ONLY) --------------
+    morphology_join = chainage_hydro_df.merge(
+        chainage_morphology_df[
+            [
+                "station_index",
+                "slope_500m_deg",
+                "slope_1000m_deg",
+                "tpi_1000m_m",
+                "local_relief_1000m_m",
+                "terrain_std_1000m_m",
+            ]
+        ],
+        on="station_index",
+        how="left",
+    )
+    morphology_by_pair_id: dict[str, dict[str, Any]] = {}
+    morphology_summary: dict[str, Any] = {}
+    if not morphology_join.empty:
+        for pair_id, group in morphology_join.groupby("hydro_pair_id"):
+            morphology_by_pair_id[pair_id] = {
+                "slope_500m_median_deg": _none_if_nan(group["slope_500m_deg"].median()),
+                "slope_500m_p95_deg": _none_if_nan(group["slope_500m_deg"].quantile(0.95)),
+                "slope_1000m_median_deg": _none_if_nan(group["slope_1000m_deg"].median()),
+                "tpi_1000m_median_m": _none_if_nan(group["tpi_1000m_m"].median()),
+                "local_relief_1000m_median_m": _none_if_nan(group["local_relief_1000m_m"].median()),
+                "terrain_std_1000m_median_m": _none_if_nan(group["terrain_std_1000m_m"].median()),
+            }
+        morphology_summary = {
+            "slope_500m_deg_route_median": _none_if_nan(morphology_join["slope_500m_deg"].median()),
+            "slope_1000m_deg_route_median": _none_if_nan(
+                morphology_join["slope_1000m_deg"].median()
+            ),
+            "tpi_1000m_m_route_median": _none_if_nan(morphology_join["tpi_1000m_m"].median()),
+            "local_relief_1000m_m_route_median": _none_if_nan(
+                morphology_join["local_relief_1000m_m"].median()
+            ),
+            "terrain_std_1000m_m_route_median": _none_if_nan(
+                morphology_join["terrain_std_1000m_m"].median()
+            ),
+        }
+
+    # --- final enriched segments ---------------------------------------------
+    segments_gdf = scour_onset_map.build_scour_onset_embedment_segments(
+        pipeline_id=pipeline_id,
+        route=route,
+        sections=sections,
+        envelope_by_pair_id=envelope_by_pair_id,
+        applicability=applicability,
+        morphology_by_pair_id=morphology_by_pair_id,
+        diameter_m=scour_onset.PIPELINE_DIAMETER_M,
+        working_crs=working_crs,
+    )
+
+    # --- write parquet/gpkg/json outputs --------------------------------------
+    mobility_output_path = metocean_evidence.write_parquet(
+        mobility_df, scour_interim_dir / "scour_onset_embedment_screen_3hourly.parquet"
+    )
+    stats_path = metocean_evidence.write_parquet(
+        stats_df, scour_processed_dir / "scour_onset_embedment_stats.parquet"
+    )
+    segments_path = scour_onset_map.write_scour_onset_embedment_segments_gpkg(
+        segments_gdf, scour_processed_dir / "scour_onset_embedment_segments.gpkg"
+    )
+    benchmark_path = pipeline_condition.write_2018_condition_benchmark(
+        pipeline_condition_dir / "anglia_2018_condition_benchmark.json"
+    )
+    benchmark = pipeline_condition.build_2018_condition_benchmark()
+
+    background_raster_path = study_dir / "bathymetry" / "emodnet_baseline_lat_100m.tif"
+    png_path = scour_onset_map.render_scour_onset_embedment_map(
+        segments_gdf=segments_gdf,
+        route=route,
+        working_crs=working_crs,
+        output_path=maps_dir / "pl854_scour_onset_embedment_screening.png",
+        diameter_m=scour_onset.PIPELINE_DIAMETER_M,
+        background_raster_path=(
+            background_raster_path if background_raster_path.exists() else None
+        ),
+    )
+    png_dimensions = scour_onset_map.read_png_dimensions(png_path)
+
+    profile_path = scour_onset_map.render_scour_onset_embedment_profile(
+        segments_gdf=segments_gdf,
+        diameter_m=scour_onset.PIPELINE_DIAMETER_M,
+        output_path=maps_dir / "pl854_scour_onset_embedment_profile.png",
+    )
+    profile_dimensions = scour_onset_map.read_png_dimensions(profile_path)
+
+    # --- metadata --------------------------------------------------------------
+    metadata_path = scour_processed_dir / "scour_onset_embedment_metadata.json"
+    metadata = {
+        "scientific_role": scour_onset.SCIENTIFIC_ROLE,
+        "source_model": scour_onset.SOURCE_MODEL_CITATION,
+        "source_doi": scour_onset.SOURCE_MODEL_DOI,
+        "equations": {
+            "current_friction_velocity": ("u_star_c = kappa*U_ref / ln((z_ref+z0_skin)/z0_skin)"),
+            "current_at_pipe_top": (
+                "Uc_top = u_star_c/kappa * ln((z_top+z0_skin)/z0_skin); z_top = D*(1-e/D)"
+            ),
+            "pipeline_normal_projection": (
+                "Uc_perp = abs(Uc_top*sin(delta_current)); "
+                "Uw_perp = abs(Uw*sin(delta_wave)); delta folded via the minimal 0..180 "
+                "angular difference around 90 (180-deg axis symmetry)"
+            ),
+            "marini_wave_shields": (
+                "a_x = Uw_perp*T/(2*pi); f_w = 0.04*(a_x/(2.5*d50))^-0.25; "
+                "u_star_w = sqrt(f_w/2)*Uw_perp; tau_w = rho_water*u_star_w^2; "
+                "theta_w = tau_w / [rho_water*g*(s-1)*d50]"
+            ),
+            "marini_kc_eq30": (
+                "wave-only: KC = Uw_perp*T/D; combined: KC = (Uw_perp*T/D) * "
+                "[-0.25 + 1.25*exp((Uc_perp/Uw_perp)^0.87)]"
+            ),
+            "alpha": "alpha = Uc_perp / (Uc_perp+Uw_perp)",
+            "beta": "beta = 6*alpha^3 - 16*alpha^2 + 10*alpha + 1",
+            "marini_a": "a = 0.025*[1-exp(-14*X)]; X = KC^0.69 * theta_w^0.70",
+            "marini_b": "b = 0.5 + exp(-2.9*X)",
+            "omega_forcing": "Omega_forcing = u_equivalent^2 / [g*D*(s-1)*(1-n)]",
+            "omega_threshold": "Omega_threshold = a*exp(9*(e/D)^b)",
+            "onset_condition": "Omega_forcing >= Omega_threshold",
+        },
+        "pipeline_diameter_m": scour_onset.PIPELINE_DIAMETER_M,
+        "pipeline_diameter_source": scour_onset.PIPELINE_DIAMETER_SOURCE,
+        "source_experimental_envelopes": {
+            "diameter_m": list(scour_onset.SOURCE_DIAMETER_RANGE_M),
+            "current_only_d50_mm": list(scour_onset.SOURCE_CURRENT_ONLY_D50_RANGE_MM),
+            "wave_only_d50_mm": list(scour_onset.SOURCE_WAVE_ONLY_D50_RANGE_MM),
+            "combined_d50_mm": list(scour_onset.SOURCE_COMBINED_D50_RANGE_MM),
+            "uc_m_s": list(scour_onset.SOURCE_UC_RANGE_M_S),
+            "uw_m_s": list(scour_onset.SOURCE_UW_RANGE_M_S),
+            "kc": list(scour_onset.SOURCE_KC_RANGE),
+            "embedment_overall": list(scour_onset.SOURCE_EMBEDMENT_RANGE_OVERALL),
+            "embedment_combined": list(scour_onset.SOURCE_EMBEDMENT_RANGE_COMBINED),
+        },
+        "tested_d50_scenarios_mm": list(scour_onset.TESTED_D50_SCENARIOS_MM),
+        "d50_scenario_semantics": scour_onset.D50_SCENARIO_SEMANTICS,
+        "tested_porosity_scenarios": list(scour_onset.TESTED_POROSITY_SCENARIOS),
+        "porosity_scenario_semantics": scour_onset.POROSITY_SCENARIO_SEMANTICS,
+        "tested_embedment_ratios": list(scour_onset.TESTED_EMBEDMENT_RATIOS),
+        "embedment_scenario_semantics": scour_onset.EMBEDMENT_SCENARIO_SEMANTICS,
+        "current_only_branch_applied": True,
+        "wave_only_branch_applied": True,
+        "calm_branch_applied": True,
+        "continuous_critical_embedment_extrapolated": False,
+        "actual_pipeline_embedment_assigned": False,
+        "pipeline_normal_projection_applied": True,
+        "oblique_flow_extension_directly_validated": False,
+        "source_combined_flow_was_codirectional": True,
+        "pipe_diameter_within_source_envelope": applicability[
+            "within_source_pipe_diameter_envelope"
+        ],
+        "pipe_diameter_outside_source_envelope_flag": (
+            scour_onset.PIPE_DIAMETER_OUTSIDE_SOURCE_ENVELOPE
+        ),
+        "research_screening_extrapolation_flag": scour_onset.RESEARCH_SCREENING_EXTRAPOLATION,
+        "bgs_folk_to_numeric_d50_mapping_applied": False,
+        "psa_d50_interpolation_applied": False,
+        "bgs_predictive_sediment_used": False,
+        "morphology_used_in_onset_physics": False,
+        "morphology_role": scour_onset.MORPHOLOGY_ROLE,
+        "morphology_source_route_acquisition_years": (
+            scour_onset.MORPHOLOGY_SOURCE_ACQUISITION_YEARS
+        ),
+        "condition_benchmark_2018_path": str(benchmark_path),
+        "historical_condition_used_for_spatial_calibration": False,
+        "equilibrium_scour_depth_computed": False,
+        "scour_propagation_computed": False,
+        "exposure_prediction_computed": False,
+        "free_span_prediction_computed": False,
+        "risk_computed": False,
+        "embedment_monotonicity_violation_count": monotonicity_violation_count,
+        "applicability_diagnostics": applicability,
+        "applicability_diagnostics_semantics": "APPLICABILITY_DIAGNOSTIC_NOT_CONFIDENCE_SCORE",
+        "pipeline_normal_projection_qa": projection_qa,
+        "references": [
+            {
+                "citation": scour_onset.SOURCE_MODEL_CITATION,
+                "doi": scour_onset.SOURCE_MODEL_DOI,
+            },
+            {
+                "citation": (
+                    "Sumer, B.M., Truelsen, C., Sichmann, T., & Fredsoe, J. (2001). "
+                    "Onset of scour below pipelines and self-burial. Coastal "
+                    "Engineering, 42, 313-335."
+                ),
+                "doi": "10.1016/S0378-3839(00)00066-1",
+            },
+            {
+                "citation": (
+                    "Zang, Z., Cheng, L., & Zhao, M. (2010). Onset of scour below "
+                    "pipeline under combined waves and current. OMAE2010-20719."
+                ),
+                "doi": "10.1115/OMAE2010-20719",
+            },
+            {
+                "citation": (
+                    "Ithaca Energy (UK) Limited (2020). Anglia Decommissioning "
+                    "Environmental Appraisal. Official UK Government publication. "
+                    "Page 29, Tables 3.4-3.5."
+                ),
+            },
+        ],
+        "outputs": {
+            "scour_onset_embedment_screen_3hourly": str(mobility_output_path),
+            "scour_onset_embedment_stats": str(stats_path),
+            "scour_onset_embedment_segments": str(segments_path),
+            "anglia_2018_condition_benchmark": str(benchmark_path),
+            "scour_onset_embedment_map_png": str(png_path),
+            "scour_onset_embedment_profile_png": str(profile_path),
+        },
+    }
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+
+    print(
+        f"Scour onset embedment screen (3-hourly): {len(mobility_df)} row(s) -> "
+        f"{mobility_output_path}"
+    )
+    print(f"Scour onset embedment stats: {len(stats_df)} row(s) -> {stats_path}")
+    print(f"Scour onset embedment segments: {len(segments_gdf)} section(s) -> {segments_path}")
+    print(f"2018 condition benchmark: {benchmark_path}")
+    print(f"Scour onset embedment map: {png_path}")
+    print(f"Scour onset embedment profile: {profile_path}")
+    print(f"Metadata: {metadata_path}")
+    print()
+    scour_onset_map.print_scour_onset_report(
+        diameter_m=scour_onset.PIPELINE_DIAMETER_M,
+        applicability=applicability,
+        projection_qa=projection_qa,
+        stats_df=stats_df,
+        envelope_df=envelope_df,
+        monotonicity_violation_count=monotonicity_violation_count,
+        morphology_summary=morphology_summary,
+        benchmark=benchmark,
+        segments_gdf=segments_gdf,
+        segments_path=segments_path,
+        png_path=png_path,
+        png_dimensions=png_dimensions,
+        profile_path=profile_path,
+        profile_dimensions=profile_dimensions,
+    )
+    return 0
+
+
 def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> datetime:
     """The live dataset's own start timestamp, or `fallback_now` if it could not be discovered."""
 
@@ -3208,6 +3572,20 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_noncohesive_mobility_parser.set_defaults(func=_cmd_build_noncohesive_mobility)
+
+    build_scour_onset_screening_parser = subparsers.add_parser(
+        "build-scour-onset-screening",
+        help=(
+            "Build the pipeline scour-onset embedment screening (MAR-014, Marini et al. "
+            "2024) and the 2018 condition benchmark -- no network, requires "
+            "build-metocean-evidence, build-wave-orbital-forcing, and "
+            "build-regional-morphology to have already run."
+        ),
+    )
+    build_scour_onset_screening_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_scour_onset_screening_parser.set_defaults(func=_cmd_build_scour_onset_screening)
 
     return parser
 

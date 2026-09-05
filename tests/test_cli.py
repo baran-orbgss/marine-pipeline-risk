@@ -2006,3 +2006,257 @@ def test_build_noncohesive_mobility_command_is_idempotent_offline(tmp_path: Path
 
     assert first_exit_code == 0
     assert second_exit_code == 0
+
+
+# --- build-scour-onset-screening (MAR-014) -------------------------------------------
+
+
+def test_build_scour_onset_screening_command_requires_pipeline_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "no_pipeline.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-scour-onset-screening", str(config_path)])
+
+    assert exit_code == 1
+    assert "pipeline.pipeline_id" in capsys.readouterr().err
+
+
+def test_build_scour_onset_screening_command_requires_prior_outputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-scour-onset-screening", str(config_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "build-metocean-evidence" in err
+    assert "build-wave-orbital-forcing" in err
+    assert "build-regional-morphology" in err
+
+
+def _write_scour_onset_screening_fixture(tmp_path: Path) -> Path:
+    """A minimal on-disk study with real MAR-009B/MAR-011A/MAR-007-shaped canonical
+    outputs already present -- current and wave nodes share IDENTICAL coordinates,
+    mirroring real PL854's own verified AMM15 grid alignment."""
+
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    study_dir = processed_dir / "pl854"
+    metocean_interim_dir = interim_dir / "pl854" / "metocean"
+    metocean_processed_dir = study_dir / "metocean"
+    morphology_processed_dir = study_dir / "morphology"
+    for d in (study_dir, metocean_interim_dir, metocean_processed_dir, morphology_processed_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    route = LineString([(500000.0, 5900000.0), (500500.0, 5900000.0), (501000.0, 5900300.0)])
+    pipeline_gdf = gpd.GeoDataFrame(
+        [{"pipeline_id": "PL854", "source": "test", "status": "ACTIVE"}],
+        geometry=[route],
+        crs="EPSG:32631",
+    )
+    pipeline_gdf.to_file(study_dir / "pipeline.gpkg", driver="GPKG", layer="pipeline")
+
+    current_nodes_df = pd.DataFrame(
+        [
+            {
+                "node_id": "current_A",
+                "longitude": 1.666667,
+                "latitude": 53.364861,
+                "model_bathymetry_m": 26.0,
+            },
+            {
+                "node_id": "current_B",
+                "longitude": 1.696970,
+                "latitude": 53.364861,
+                "model_bathymetry_m": 29.0,
+            },
+        ]
+    )
+    current_nodes_df.to_parquet(metocean_interim_dir / "current_primary_support_nodes.parquet")
+
+    wave_nodes_df = pd.DataFrame(
+        [
+            {
+                "node_id": "wave_A",
+                "longitude": 1.666667,
+                "latitude": 53.364861,
+                "model_bathymetry_m": 26.0,
+            },
+            {
+                "node_id": "wave_B",
+                "longitude": 1.696970,
+                "latitude": 53.364861,
+                "model_bathymetry_m": 29.0,
+            },
+        ]
+    )
+    wave_nodes_df.to_parquet(metocean_interim_dir / "wave_support_nodes.parquet")
+
+    current_times = pd.date_range("2025-01-01", periods=9, freq="h", tz="UTC")
+    current_rows = []
+    for node_id in ("current_A", "current_B"):
+        for t in current_times:
+            current_rows.append(
+                {
+                    "current_node_id": node_id,
+                    "time_utc": t,
+                    "uo_m_s": 0.4,
+                    "vo_m_s": 0.1,
+                    "current_speed_m_s": float((0.4**2 + 0.1**2) ** 0.5),
+                    "current_direction_to_deg": 75.96,
+                    "current_sample_depth_m": 24.0,
+                    "model_bathymetry_m": 27.0,
+                    "height_above_model_bed_m": 3.0,
+                    "height_above_model_bed_valid": True,
+                    "source_dataset": "TEST_DATASET",
+                    "temporal_role": "PRIMARY_CURRENT",
+                }
+            )
+    pd.DataFrame(current_rows).to_parquet(metocean_interim_dir / "current_primary_hourly.parquet")
+
+    wave_times = pd.date_range("2025-01-01", periods=3, freq="3h", tz="UTC")
+    wave_rows = []
+    for node_id in ("wave_A", "wave_B"):
+        for t in wave_times:
+            wave_rows.append(
+                {
+                    "wave_node_id": node_id,
+                    "time_utc": t,
+                    "wave_orbital_velocity_rms_near_bed_m_s": 0.2,
+                    "wave_orbital_velocity_equivalent_amplitude_m_s": float(2.0**0.5 * 0.2),
+                    "equivalent_peak_period_from_tz_s": 1.28 * 6.0,
+                    "tp_s": 8.0,
+                    "wave_mean_direction_to_deg": 200.0,
+                }
+            )
+    pd.DataFrame(wave_rows).to_parquet(
+        metocean_interim_dir / "wave_orbital_velocity_3hourly.parquet"
+    )
+
+    chainage_metocean_df = pd.DataFrame(
+        {
+            "station_index": [0, 1, 2, 3],
+            "chainage_m": [0.0, 500.0, 1000.0, 1500.0],
+            "current_node_id": ["current_A", "current_A", "current_B", "current_B"],
+            "current_node_distance_m": [50.0, 60.0, 70.0, 80.0],
+            "wave_node_id": ["wave_A", "wave_A", "wave_B", "wave_B"],
+            "wave_node_distance_m": [55.0, 65.0, 75.0, 85.0],
+        }
+    )
+    chainage_metocean_df.to_parquet(metocean_processed_dir / "chainage_metocean_evidence.parquet")
+
+    chainage_morphology_df = pd.DataFrame(
+        {
+            "station_index": [0, 1, 2, 3],
+            "chainage_m": [0.0, 500.0, 1000.0, 1500.0],
+            "slope_500m_deg": [0.1, 0.12, 0.09, 0.11],
+            "slope_1000m_deg": [0.15, 0.14, 0.13, 0.16],
+            "tpi_1000m_m": [0.01, 0.02, -0.01, 0.03],
+            "local_relief_1000m_m": [0.8, 0.9, 0.7, 1.0],
+            "terrain_std_1000m_m": [0.5, 0.6, 0.4, 0.7],
+        }
+    )
+    chainage_morphology_df.to_parquet(
+        morphology_processed_dir / "chainage_regional_morphology.parquet"
+    )
+
+    return config_path
+
+
+def test_build_scour_onset_screening_command_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_scour_onset_screening_fixture(tmp_path)
+
+    exit_code = main(["build-scour-onset-screening", str(config_path)])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "PL854 PIPE DIAMETER IS OUTSIDE THE SOURCE EXPERIMENTAL ENVELOPE" in output
+    assert "THIS IS NOT AN OBSERVED BURIAL MAP" in output
+    assert "MORPHOLOGY IS LEGACY REGIONAL CONTEXT ONLY" in output
+    assert "THE 2018 CONDITION BENCHMARK IS AGGREGATE CORRIDOR EVIDENCE" in output
+
+    processed_dir = tmp_path / "processed" / "pl854"
+    interim_dir = tmp_path / "interim" / "pl854"
+    screen_path = interim_dir / "scour" / "scour_onset_embedment_screen_3hourly.parquet"
+    stats_path = processed_dir / "scour" / "scour_onset_embedment_stats.parquet"
+    segments_path = processed_dir / "scour" / "scour_onset_embedment_segments.gpkg"
+    benchmark_path = processed_dir / "pipeline_condition" / "anglia_2018_condition_benchmark.json"
+    png_path = processed_dir / "maps" / "pl854_scour_onset_embedment_screening.png"
+    profile_path = processed_dir / "maps" / "pl854_scour_onset_embedment_profile.png"
+    metadata_path = processed_dir / "scour" / "scour_onset_embedment_metadata.json"
+
+    for path in (
+        screen_path,
+        stats_path,
+        segments_path,
+        benchmark_path,
+        png_path,
+        profile_path,
+        metadata_path,
+    ):
+        assert path.exists(), path
+
+    screen_df = pd.read_parquet(screen_path)
+    # 3 shared 3-hourly timestamps x 2 hydro pairs x 3 D50 x 3 porosity.
+    assert len(screen_df) == 3 * 2 * 3 * 3
+    assert set(screen_df["tested_d50_mm"].unique()) == {0.160, 0.250, 0.480}
+    assert set(screen_df["porosity_scenario"].unique()) == {0.35, 0.40, 0.45}
+    assert not any("folk" in c.lower() for c in screen_df.columns)
+    assert not any("predictive" in c.lower() for c in screen_df.columns)
+
+    stats_df = pd.read_parquet(stats_path)
+    assert set(stats_df["hydro_pair_id"].unique()) == {"current_A__wave_A", "current_B__wave_B"}
+
+    segments_gdf = gpd.read_file(segments_path, layer="scour_onset_embedment_segments")
+    assert len(segments_gdf) == 2  # one contiguous section per hydro pair
+    assert segments_gdf["pipeline_diameter_m"].to_numpy() == pytest.approx(0.3048)
+
+    benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    assert benchmark["max_free_span_length_m"] == 23.2
+    assert benchmark["spatial_kp_locations_available_as_machine_readable_data"] is False
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["scientific_role"] == "PIPELINE_SCOUR_ONSET_EMBEDMENT_SCREENING"
+    assert metadata["pipe_diameter_within_source_envelope"] is False
+    assert metadata["continuous_critical_embedment_extrapolated"] is False
+    assert metadata["morphology_used_in_onset_physics"] is False
+    assert metadata["bgs_folk_to_numeric_d50_mapping_applied"] is False
+    assert metadata["embedment_monotonicity_violation_count"] == 0
+    assert png_path.stat().st_size > 0
+    assert profile_path.stat().st_size > 0
+
+
+def test_build_scour_onset_screening_command_is_idempotent_offline(tmp_path: Path) -> None:
+    """No network/Copernicus dependency -- running twice against the same fixture succeeds."""
+
+    config_path = _write_scour_onset_screening_fixture(tmp_path)
+
+    first_exit_code = main(["build-scour-onset-screening", str(config_path)])
+    second_exit_code = main(["build-scour-onset-screening", str(config_path)])
+
+    assert first_exit_code == 0
+    assert second_exit_code == 0
