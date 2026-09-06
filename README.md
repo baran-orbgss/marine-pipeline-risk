@@ -1103,4 +1103,56 @@ otherwise, never an interactive credential prompt.
   plus 3 new `live`-marked tests (`test_nsta_freespan_live.py`, excluded by
   default, documenting the real zero-result acquisition -- 32 new tests in
   total); the full offline suite (893 tests) and repo-wide `ruff format`/
-  `ruff check` pass clean. No further ticket has started.
+  `ruff check` pass clean.
+
+- `MAR-015`: a positive-only evidence AUDIT, not model validation --
+  (`validation/freespan_context_audit{,_map}.py`) asks whether
+  MAR-007/008/010/011A/012/013/014's independently-built context variables
+  show any obvious spatial distinction at the 8 official 2018 corridor
+  freespan events, and what evidence/resolution gaps block a defensible
+  predictive model. The 8 events stay `CORRIDOR_LEVEL_OBSERVED_FREESPAN_
+  EVENTS` (never rewritten to a PL854-only label), and a route section with
+  no tabulated event is `NO_TABULATED_2018_EVENT_IN_THIS_SUPPORT_SECTION`
+  (never NEGATIVE/SAFE/STABLE) -- no formal negative-label dataset is ever
+  created. Confirmed on the real PL854 route: the 8 events occupy only
+  **3 of the 14** independent hydrodynamic support sections (5/2/1 events
+  each), so every descriptive comparison here has an effective sample size
+  of 3, not 8 -- reported honestly rather than inflated. Every feature is
+  audited independently (never fused into a combined index): count/min/
+  median/max and a raw range-overlap flag only, no p-value, odds ratio, or
+  effect size anywhere. The real result is a genuinely mixed, honestly
+  reported one -- current/wave/combined-shear p95 and MAR-013 mobility
+  capacity show **no** spatial discrimination (event sections' ranges fully
+  overlap the route background, e.g. current p95 event range 0.43-0.67 m/s
+  vs. background 0.38-0.70 m/s), and MAR-014's embedment class is
+  `SPATIALLY_UNIFORM_AT_CURRENT_SUPPORT` (1 route-wide value, 0.03D, so it
+  cannot discriminate anything by construction) -- but MAR-007's local
+  relief and slope (a legacy, 1991-1992-sourced, 100 m-grid morphology
+  feature that PREDATES the 2018 survey by ~26 years) show events confined
+  to the 77-92 percentile (top quartile) of both. This is reported as a
+  literal, descriptive observation, explicitly NOT causal validation: the
+  one variable with an apparent spatial coincidence is also the one
+  variable that is temporally mismatched and coarsest relative to the
+  ~0.2-23 m observed span scale, while every 2024-2026 hydrodynamic-forcing
+  feature (the temporally closest to present, still 6+ years post-survey)
+  shows nothing. `compute_resolution_gap_statements` spells out the honest
+  reading per event (e.g. a ~1500 m current/wave model cell is 150x larger
+  than a 10 m observed span -- forcing CONTEXT at that location, never
+  10 m hydrodynamic resolution). Five outputs are written under
+  `validation/` and `maps/` (per-event and per-section audit parquets, an
+  evidence-readiness JSON, a metadata JSON carrying explicit
+  `negative_labels_created=false`/`model_validation_performed=false`/
+  `classifier_fitted=false`/`score_created=false` flags, and three PNGs --
+  a route map with true-length freespan intervals and an explicit
+  scale-comparison box, a 4-panel small-multiple with no fitted trend, and
+  a neutral feature-evidence table with no traffic-light colouring) via
+  `uv run marine-engine audit-freespan-context configs/pl854.yaml` (fully
+  offline). 24 new tests across `test_freespan_context_audit{,_map}.py`
+  cover the positive-only/no-negative-label discipline, event-independence
+  counting, temporal/support-resolution honesty, the dual-mode (continuous
+  + categorical) audit of MAR-013's empirically 2-valued mobility feature,
+  range-overlap correctness, source-stated-only temporal matching, true-
+  width rendering, and the absence of any score/probability/accuracy term
+  anywhere in the output schemas; the full offline suite (917 tests) and
+  repo-wide `ruff format`/`ruff check` pass clean. No further ticket has
+  started.

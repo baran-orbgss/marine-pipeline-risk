@@ -69,7 +69,11 @@ from marine_engine.scour import (
     scour_onset_map,
 )
 from marine_engine.sediment import evidence, noncohesive_mobility, noncohesive_mobility_map
-from marine_engine.validation import freespan_model_context
+from marine_engine.validation import (
+    freespan_context_audit,
+    freespan_context_audit_map,
+    freespan_model_context,
+)
 
 
 def _cmd_version(_args: argparse.Namespace) -> int:
@@ -4039,6 +4043,227 @@ def _cmd_build_freespan_registry_reconciliation(args: argparse.Namespace) -> int
     return 0
 
 
+def _cmd_audit_freespan_context(args: argparse.Namespace) -> int:
+    """MAR-015: positive-only freespan context audit + evidence-resolution
+    diagnosis. Performs NO network request -- requires build-current-
+    normalization, build-wave-orbital-forcing, build-combined-bed-shear,
+    build-noncohesive-mobility, build-scour-onset-screening, and
+    build-freespan-spatial-evidence to have already run. This is an
+    ANALYTICAL EVIDENCE AUDIT, never model validation: it never computes a
+    susceptibility score, probability, classifier, or accuracy metric.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pipeline_gpkg_path, _aoi_gpkg_path, _chainage_gpkg_path, _interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+
+    current_segments_path = study_dir / "metocean" / "current_reference_segments.gpkg"
+    wave_segments_path = study_dir / "metocean" / "wave_orbital_reference_segments.gpkg"
+    combined_segments_path = study_dir / "metocean" / "combined_bed_shear_segments.gpkg"
+    mobility_segments_path = study_dir / "sediment" / "noncohesive_mobility_capacity_segments.gpkg"
+    scour_segments_path = study_dir / "scour" / "scour_onset_embedment_segments.gpkg"
+    segment_event_counts_path = (
+        study_dir / "freespan_evidence" / "freespan_segment_event_counts_2018.parquet"
+    )
+    events_2018_path = (
+        study_dir / "freespan_evidence" / "anglia_2018_freespan_spatial_evidence.parquet"
+    )
+    all_events_path = study_dir / "freespan_evidence" / "anglia_freespan_spatial_evidence.parquet"
+    temporal_relationship_path = (
+        study_dir / "pipeline_condition" / "anglia_freespan_temporal_relationship_evidence.parquet"
+    )
+
+    required_paths = (
+        pipeline_gpkg_path,
+        current_segments_path,
+        wave_segments_path,
+        combined_segments_path,
+        mobility_segments_path,
+        scour_segments_path,
+        segment_event_counts_path,
+        events_2018_path,
+        all_events_path,
+        temporal_relationship_path,
+    )
+    missing = [str(p) for p in required_paths if not p.exists()]
+    if missing:
+        print(
+            "error: missing required canonical output(s) -- run build-current-normalization, "
+            "build-wave-orbital-forcing, build-combined-bed-shear, build-noncohesive-mobility, "
+            f"build-scour-onset-screening, and build-freespan-spatial-evidence first: {missing}",
+            file=sys.stderr,
+        )
+        return 1
+
+    working_crs = config.crs.horizontal
+    try:
+        route, _attributes, source_crs = load_pipeline_route(pipeline_gpkg_path, pipeline_id)
+    except InvalidPipelineRouteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if source_crs != working_crs:
+        print(
+            f"error: pipeline CRS {source_crs} does not match configured working CRS {working_crs}",
+            file=sys.stderr,
+        )
+        return 1
+
+    current_segments_gdf = gpd.read_file(current_segments_path)
+    wave_segments_gdf = gpd.read_file(wave_segments_path)
+    combined_segments_gdf = gpd.read_file(combined_segments_path)
+    mobility_segments_gdf = gpd.read_file(mobility_segments_path)
+    scour_segments_gdf = gpd.read_file(scour_segments_path)
+    segment_event_counts_df = pd.read_parquet(segment_event_counts_path)
+    events_2018_df = pd.read_parquet(events_2018_path)
+    all_events_df = pd.read_parquet(all_events_path)
+    temporal_relationship_df = pd.read_parquet(temporal_relationship_path)
+
+    merged_segments_df = freespan_context_audit.merge_all_segment_tables(
+        current_segments_gdf=current_segments_gdf,
+        wave_segments_gdf=wave_segments_gdf,
+        combined_segments_gdf=combined_segments_gdf,
+        mobility_segments_gdf=mobility_segments_gdf,
+        scour_segments_gdf=scour_segments_gdf,
+    )
+    section_df = freespan_context_audit.build_section_level_context_table(
+        merged_segments_df, segment_event_counts_df
+    )
+    event_df = freespan_context_audit.build_event_level_context_table(
+        events_2018_df, section_df, temporal_relationship_df, all_events_df
+    )
+    event_independence = freespan_context_audit.compute_event_independence_summary(section_df)
+
+    numeric_keys = [
+        key
+        for key in freespan_context_audit.AUDIT_TABLE_FEATURE_KEYS
+        if not freespan_context_audit.FEATURE_BY_KEY[key].is_categorical
+    ]
+    categorical_keys = [
+        key
+        for key in freespan_context_audit.AUDIT_TABLE_FEATURE_KEYS
+        if freespan_context_audit.FEATURE_BY_KEY[key].is_categorical or key == "mobility_capacity"
+    ]
+    contrasts = [
+        freespan_context_audit.compute_descriptive_contrast(section_df, key) for key in numeric_keys
+    ]
+    categorical_audits = [
+        freespan_context_audit.compute_categorical_audit(section_df, key)
+        for key in categorical_keys
+    ]
+    contrasts_by_key = {c["feature_key"]: c for c in contrasts}
+    categorical_audits_by_key = {a["feature_key"]: a for a in categorical_audits}
+
+    interpretation_answers = freespan_context_audit.answer_all_interpretation_questions(section_df)
+    demonstrated_gaps = freespan_context_audit.compute_demonstrated_data_gaps(
+        event_independence=event_independence, categorical_audits=categorical_audits
+    )
+    readiness = freespan_context_audit.build_evidence_readiness(categorical_audits_by_key)
+    metadata = freespan_context_audit.build_audit_metadata(
+        event_independence=event_independence,
+        demonstrated_gaps=demonstrated_gaps,
+        interpretation_answers=interpretation_answers,
+    )
+    resolution_gap_statements = freespan_context_audit.compute_resolution_gap_statements(
+        events_2018_df
+    )
+    metadata["resolution_gap_statements"] = resolution_gap_statements
+
+    validation_dir = study_dir / "validation"
+    maps_dir = study_dir / "maps"
+
+    event_context_path = validation_dir / "2018_freespan_positive_only_context_audit.parquet"
+    event_context_path.parent.mkdir(parents=True, exist_ok=True)
+    event_df.to_parquet(event_context_path, index=False)
+
+    section_context_path = validation_dir / "freespan_section_context_audit.parquet"
+    section_context_path.parent.mkdir(parents=True, exist_ok=True)
+    section_df.to_parquet(section_context_path, index=False)
+
+    readiness_path = validation_dir / "freespan_evidence_readiness.json"
+    readiness_path.parent.mkdir(parents=True, exist_ok=True)
+    readiness_path.write_text(json.dumps(readiness, indent=2, default=str), encoding="utf-8")
+
+    metadata_path = validation_dir / "freespan_context_audit_metadata.json"
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+
+    background_raster_path = study_dir / "bathymetry" / "emodnet_baseline_lat_100m.tif"
+    background_raster_path = background_raster_path if background_raster_path.exists() else None
+
+    geometries_2018 = freespan_evidence.build_event_geometries(events_2018_df, route)
+    events_2018_gdf = gpd.GeoDataFrame(events_2018_df, geometry=geometries_2018, crs=working_crs)
+
+    primary_map_path = freespan_context_audit_map.render_freespan_evidence_resolution_audit_map(
+        events_2018_gdf=events_2018_gdf,
+        section_df=section_df,
+        route=route,
+        independent_section_count=event_independence[
+            "independent_hydrodynamic_support_section_count"
+        ],
+        output_path=maps_dir / "pl854_freespan_evidence_resolution_audit.png",
+        background_raster_path=background_raster_path,
+    )
+    primary_map_dimensions = freespan_context_audit_map.read_png_dimensions(primary_map_path)
+
+    small_multiple_path = freespan_context_audit_map.render_feature_context_small_multiple(
+        section_df=section_df,
+        events_2018_df=events_2018_df,
+        total_length_m=route.length,
+        output_path=maps_dir / "pl854_freespan_feature_context_audit.png",
+    )
+    small_multiple_dimensions = freespan_context_audit_map.read_png_dimensions(small_multiple_path)
+
+    audit_table_path = freespan_context_audit_map.render_feature_audit_table(
+        contrasts_by_key=contrasts_by_key,
+        categorical_audits_by_key=categorical_audits_by_key,
+        readiness=readiness,
+        feature_keys=freespan_context_audit.AUDIT_TABLE_FEATURE_KEYS,
+        output_path=maps_dir / "pl854_freespan_feature_audit_table.png",
+    )
+    audit_table_dimensions = freespan_context_audit_map.read_png_dimensions(audit_table_path)
+
+    print(f"Event-level context audit: {len(event_df)} event(s) -> {event_context_path}")
+    print(f"Section-level context audit: {len(section_df)} section(s) -> {section_context_path}")
+    print(f"Evidence readiness: {readiness_path}")
+    print(f"Metadata: {metadata_path}")
+    print(f"Primary resolution-audit map: {primary_map_path}")
+    print(f"Feature context small-multiple: {small_multiple_path}")
+    print(f"Feature audit table: {audit_table_path}")
+    print()
+    freespan_context_audit.print_audit_report(
+        event_independence=event_independence,
+        contrasts=contrasts,
+        categorical_audits=categorical_audits,
+        interpretation_answers=interpretation_answers,
+        readiness=readiness,
+        demonstrated_gaps=demonstrated_gaps,
+        outputs={
+            "2018_freespan_positive_only_context_audit_parquet": event_context_path,
+            "freespan_section_context_audit_parquet": section_context_path,
+            "freespan_evidence_readiness_json": readiness_path,
+            "freespan_context_audit_metadata_json": metadata_path,
+            "primary_map_png": (
+                f"{primary_map_path} ({primary_map_dimensions[0]}x{primary_map_dimensions[1]} px)"
+            ),
+            "small_multiple_png": (
+                f"{small_multiple_path} "
+                f"({small_multiple_dimensions[0]}x{small_multiple_dimensions[1]} px)"
+            ),
+            "audit_table_png": (
+                f"{audit_table_path} ({audit_table_dimensions[0]}x{audit_table_dimensions[1]} px)"
+            ),
+        },
+    )
+    return 0
+
+
 def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> datetime:
     """The live dataset's own start timestamp, or `fallback_now` if it could not be discovered."""
 
@@ -4274,6 +4499,22 @@ def build_parser() -> argparse.ArgumentParser:
     build_freespan_registry_reconciliation_parser.set_defaults(
         func=_cmd_build_freespan_registry_reconciliation
     )
+
+    audit_freespan_context_parser = subparsers.add_parser(
+        "audit-freespan-context",
+        help=(
+            "Positive-only freespan context audit (MAR-015): descriptive evidence audit of "
+            "MAR-007/008/010/011A/012/013/014 against the 8 official 2018 events -- no "
+            "network, requires build-current-normalization, build-wave-orbital-forcing, "
+            "build-combined-bed-shear, build-noncohesive-mobility, "
+            "build-scour-onset-screening, and build-freespan-spatial-evidence to have "
+            "already run."
+        ),
+    )
+    audit_freespan_context_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    audit_freespan_context_parser.set_defaults(func=_cmd_audit_freespan_context)
 
     return parser
 
