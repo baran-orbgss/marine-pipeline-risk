@@ -1397,3 +1397,97 @@ otherwise, never an interactive credential prompt.
   forbidden risk/score term anywhere); the full offline suite (1010
   tests, 25 live/network tests correctly deselected) and repo-wide `ruff
   format`/`ruff check` pass clean. No further ticket has started.
+
+- `MAR-017C`: the FINAL open-analog canonical real-data validation
+  attempt for the sand-wave morphometry engine, against The Crown
+  Estate's Marine Data Exchange record `TCE-439` -- "2014, ADUS
+  DeepOcean, Greater Gabbard, Bathymetry Survey" (confirmed live, and
+  deliberately distinguished from a fabricated `TCE-999999` id returning
+  HTTP 404). Real acquisition mechanics turned out very different from
+  the ticket's own estimate: the site's only download button bundles
+  everything into ONE Azure-blob-hosted ZIP, confirmed via HEAD request
+  at 8,474,296,318 bytes (~8.47 GB) -- not the ~770 MB two-file estimate.
+  Rather than a full download, this module reads ONLY the remote ZIP's
+  central directory via HTTP range requests (a few KB) to enumerate
+  every real entry, then extracts ONLY the specific entries actually
+  needed via one targeted range request per entry -- confirmed working
+  by extracting the exact 501,963,720-byte `GEOTIFF.zip` entry this way.
+  That extraction then revealed Section 2's own escape hatch was needed
+  for real: `GEOTIFF.zip`'s 1,192 entries are 3-band uint8 RGB colour
+  renders (verified via `rasterio` `ColorInterp`), not analytical
+  elevation data -- a uint8 image cannot carry metre-scale depth at any
+  useful precision. The ASCII package is used instead, and specifically
+  its TWO properly-gridded sub-products -- `Foundations/GRIDDED
+  0.25x0.25` (144 per-turbine-foundation grids) and `Corridors/GRIDDED
+  0.5x0.5` (152 inter-array-cable-corridor grids), both in a non-standard
+  header-less "easting northing depth" text format requiring a custom
+  parser -- extracted via the same range-request technique: 328 real
+  entries (144 + 152 + 32 `Concrete mattressing` rock-protection files),
+  9,695,822,453 bytes. The corridor sub-product was itself a real, honest
+  correction mid-ticket: this module's OWN first archive-inspection pass
+  missed it entirely (assumed corridors were only ever the irregular
+  point-cloud `ALL ASCII` variant), caught only when the initial 144-
+  candidate preflight's per-format counts didn't reconcile against the
+  full inventory -- "never assume" turned out to apply to this module's
+  own reconnaissance, not only to the archive. Real result, computed
+  across every one of the FULL 296 candidates (never sampled or
+  assumed): the 144 foundation grids are individually too small in at
+  least one dimension to even attempt a 1000 m tile (largest: `IGSUB` at
+  777 m x 509 m), while several of the 152 corridor grids -- the long
+  export-cable routes to the substation, e.g. `IGB04-IGSUB` at 5036 m x
+  2283 m -- ARE large enough in both dimensions to attempt one, but their
+  real valid-data density is still far short of 90% (best achieved across
+  all 296: 53.7% at 1000 m, by `IGSUB-IGH07`) -- a corridor survey
+  follows a narrow cable route, not a full-width swath, so most of its
+  own bounding rectangle is genuinely unsurveyed (`INSUFFICIENT_
+  CONTINUOUS_SPATIAL_SUPPORT`, the hard early-stop firing correctly
+  before any spectral processing). A genuinely new problem for this
+  analog (an operating wind farm, not an open-seabed survey): an
+  infrastructure-context inventory (144 turbine/substation foundation
+  positions -- the two real substations, `GASUB`/`IGSUB`, detected
+  generically via a "SUB" substring check, never hard-coded -- plus 32
+  rock/concrete-protection footprints) was derived entirely from the
+  bathymetry package's own file structure, and 148 of 152 named
+  inter-array cable corridors were resolved to real line segments between
+  their two named foundations' centroids -- all without any second
+  GIS-package download. A natural-seabed eligibility gate
+  (`assess_natural_seabed_eligibility`) and an extended A-G validation
+  waterfall (adding the natural-seabed criterion between spectral
+  eligibility and transect success) exist and are fully synthetically
+  tested even though this real, confirmed-empty canonical tile set never
+  reaches them. Also fixed in passing: three shared figure-rendering
+  functions (`render_method_figure`, `render_bedform_distribution_
+  figure`, `render_canonical_support_audit_map`) had a latent bug --
+  their footer disclaimer hard-coded "HHW CEND 11/11" regardless of which
+  analog actually called them, dead code only because MAR-017B's own run
+  never reached a figure-rendering branch; now a required `dataset_label`
+  parameter, with all three prior call sites updated. A second, real
+  layout bug found via visual inspection of the actual rendered support-
+  audit figure: without an explicit view limit, matplotlib auto-scaled
+  the axes to fit every far-flung turbine marker across the whole wind
+  farm, shrinking the one background candidate's own real coverage down
+  to an imperceptible sliver -- fixed by fixing the view to the
+  background's own extent (confirmed by re-rendering: the real corridor
+  survey's narrow, branching swath pattern is now clearly, unmistakably
+  visible). The cross-analog summary
+  (`sandwave_morphometry_analog_validation_summary.parquet`) now carries
+  all three analogs plus a new `natural_seabed_eligible_count` column --
+  ranked by how close each came to passing, real coverage is IDRBNR
+  (70.2% at 1000 m) > HHW (55.9%) > Greater Gabbard (53.7%), all still
+  well short of 90% -- and a new
+  `sandwave_morphometry_engine_validation_status.json` records the final
+  MAR-017-family decision: `NO_FURTHER_OPEN_ANALOG_SEARCH_PLANNED` --
+  three independent official open analogs all failed the canonical
+  support/eligibility protocol for three structurally different,
+  honestly-documented reasons; analog hunting is closed for good, and the
+  reusable engine remains implemented and synthetically verified but NOT
+  canonically real-data validated. 25 new tests in
+  `test_greater_gabbard_2014_analog.py` cover the required list
+  (preflight-before-processing, no sub-1000 m fallback, both candidate
+  classes covered, anthropogenic-tile rejection, eligibility independent
+  of spectral ranking, missing-infrastructure honesty, strict wavelength
+  eligibility, the 30 m gate, the natural-seabed validation floor, the
+  bedform-count floor, analog-only flags, cross-analog schema purity,
+  and the final closed-search decision); the full offline suite (1035
+  tests, 25 live/network tests correctly deselected) and repo-wide `ruff
+  format`/`ruff check` pass clean. No further ticket has started.

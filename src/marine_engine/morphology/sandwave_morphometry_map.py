@@ -121,6 +121,7 @@ def render_method_figure(
     profile_filtered: np.ndarray,
     bedforms: list[dict[str, Any]],
     output_path: Path,
+    dataset_label: str,
     title: str = "HHW CEND 11/11 -- Sand-Wave Morphometry Method",
     subtitle: str | None = None,
     dpi: int = 150,
@@ -132,7 +133,12 @@ def render_method_figure(
     (MAR-017A Section 12) makes exploratory/below-canonical-floor results
     visually unmistakable -- pass e.g. "Exploratory 250 m support -- below
     canonical >=1000 m validation floor" whenever this figure is NOT
-    canonical validation."""
+    canonical validation. `dataset_label` names the analog in the footer
+    disclaimer -- MUST be passed explicitly by every caller (MAR-017C: this
+    function is shared across three analogs, and the footer previously
+    hard-coded "HHW CEND 11/11" even when called for a different one --
+    dead code in MAR-017B only because that run never reached a
+    figure-rendering branch, never a guarantee for a future caller)."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(2, 2, figsize=(14.0, 12.0))
@@ -230,7 +236,7 @@ def render_method_figure(
     fig.text(
         0.01,
         0.01,
-        "HHW CEND 11/11 IS A METHOD-DEVELOPMENT ANALOG ONLY AND DOES NOT ENTER PL854 "
+        f"{dataset_label} IS A METHOD-DEVELOPMENT ANALOG ONLY AND DOES NOT ENTER PL854 "
         "SCIENTIFIC EVIDENCE.",
         ha="left",
         va="bottom",
@@ -250,6 +256,7 @@ def render_bedform_distribution_figure(
     *,
     bedforms_df: pd.DataFrame,
     output_path: Path,
+    dataset_label: str,
     title: str = "HHW CEND 11/11 -- Detected Bedform Distributions",
     subtitle: str | None = None,
     dpi: int = 150,
@@ -259,7 +266,9 @@ def render_bedform_distribution_figure(
     distribution is ever fitted. `subtitle` (MAR-017A Section 12) must
     say EXPLORATORY whenever `bedforms_df` did not come from canonical
     (>=1000 m, >=90%-valid) tiles -- an exploratory n must never be
-    presented as an accepted site bedform distribution."""
+    presented as an accepted site bedform distribution. `dataset_label`
+    names the analog in the footer disclaimer -- MUST be passed explicitly
+    by every caller (MAR-017C: shared across three analogs now)."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.5))
@@ -292,7 +301,7 @@ def render_bedform_distribution_figure(
     fig.text(
         0.01,
         0.01,
-        "HHW CEND 11/11 IS A METHOD-DEVELOPMENT ANALOG ONLY AND DOES NOT ENTER PL854 "
+        f"{dataset_label} IS A METHOD-DEVELOPMENT ANALOG ONLY AND DOES NOT ENTER PL854 "
         "SCIENTIFIC EVIDENCE. No predictive distribution has been fitted.",
         ha="left",
         va="bottom",
@@ -460,7 +469,10 @@ def render_canonical_support_audit_map(
     qualifying_1000m_tiles: list[tuple[float, float, float]],
     no_qualifying_tile_message: str | None,
     output_path: Path,
+    dataset_label: str,
     title: str = "Canonical Support Audit",
+    turbine_positions: list[tuple[float, float, str]] | None = None,
+    rock_protection_footprints: list[tuple[float, float, float, float]] | None = None,
     dpi: int = 150,
 ) -> Path:
     """MAR-017B Section 21: the raw source footprint/coverage (nodata
@@ -469,13 +481,30 @@ def render_canonical_support_audit_map(
     overlaid as `(center_x_m, center_y_m, tile_size_m)` triples. When
     NEITHER list has any entries, `no_qualifying_tile_message` must be
     set and is displayed prominently -- the figure itself must make a
-    negative support result unmistakable, never merely blank."""
+    negative support result unmistakable, never merely blank.
+    `dataset_label` names the analog in the footer disclaimer -- MUST be
+    passed explicitly by every caller (MAR-017C: shared across three
+    analogs now). `turbine_positions` (`(x, y, id)` triples) and
+    `rock_protection_footprints` (`(min_x, min_y, max_x, max_y)` boxes)
+    are optional (MAR-017C Section 17: "if available, show infrastructure
+    locations/context") -- points/boxes outside the background's own
+    extent are simply clipped by the axes, never re-zoomed to fit them."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(11.0, 9.0))
 
     masked_bg = _safe_masked_array(background_elevation, background_valid)
     ax.imshow(masked_bg, cmap="gray", extent=background_extent_m, origin="upper", alpha=0.7)
+    # Matplotlib's default autoscale would otherwise expand the axes to fit every plotted
+    # artist (turbine/rock-protection markers can span a whole wind farm, many km beyond one
+    # background candidate's own small extent), shrinking the actual bathymetry coverage this
+    # figure exists to show down to an imperceptible sliver. Fixing the view to the background's
+    # own extent (with a little padding) keeps it visibly dominant; other artists are simply
+    # clipped outside it, matching this function's own documented behaviour.
+    left, right, bottom, top = background_extent_m
+    pad_x, pad_y = (right - left) * 0.08, (top - bottom) * 0.08
+    ax.set_xlim(left - pad_x, right + pad_x)
+    ax.set_ylim(bottom - pad_y, top + pad_y)
 
     for center_x, center_y, size_m in qualifying_2000m_tiles:
         half = size_m / 2.0
@@ -505,7 +534,39 @@ def render_canonical_support_audit_map(
                 label="Qualifying 1000 m tile",
             )
         )
-    if qualifying_2000m_tiles or qualifying_1000m_tiles:
+    for min_x, min_y, max_x, max_y in rock_protection_footprints or []:
+        ax.add_patch(
+            plt.Rectangle(
+                (min_x, min_y),
+                max_x - min_x,
+                max_y - min_y,
+                fill=True,
+                facecolor="tab:purple",
+                alpha=0.35,
+                edgecolor="tab:purple",
+                linewidth=1,
+                zorder=2,
+                label="Rock/concrete protection",
+            )
+        )
+    for turbine_x, turbine_y, _turbine_id in turbine_positions or []:
+        ax.plot(
+            turbine_x,
+            turbine_y,
+            marker="x",
+            color="yellow",
+            markeredgewidth=2,
+            markersize=9,
+            zorder=6,
+            label="Turbine/substation foundation",
+        )
+
+    if (
+        qualifying_2000m_tiles
+        or qualifying_1000m_tiles
+        or turbine_positions
+        or rock_protection_footprints
+    ):
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles, strict=False))
         ax.legend(by_label.values(), by_label.keys(), loc="lower right", fontsize=8)
@@ -538,7 +599,7 @@ def render_canonical_support_audit_map(
     fig.text(
         0.01,
         0.01,
-        "IDRBNR CEND 11/11 IS A METHOD-DEVELOPMENT ANALOG ONLY AND DOES NOT ENTER PL854 "
+        f"{dataset_label} IS A METHOD-DEVELOPMENT ANALOG ONLY AND DOES NOT ENTER PL854 "
         "SCIENTIFIC EVIDENCE.",
         ha="left",
         va="bottom",
