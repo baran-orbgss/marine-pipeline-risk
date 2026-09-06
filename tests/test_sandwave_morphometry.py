@@ -351,6 +351,117 @@ def test_mar017a_H_rejected_sub_cutoff_count_is_reported_not_dropped_silently():
     assert rejected_count == 2
 
 
+# --- MAR-017B Section 26's own required test list -- E/F/G land here since they exercise ---
+# --- `select_spatially_independent_eligible_tiles`/`apply_canonical_wavelength_gate`, the ---
+# --- same reusable-engine functions the IDRBNR analog module calls unchanged ----------------
+
+
+def test_mar017b_E_spatially_independent_selection_keeps_the_3_wavelength_rule_strict():
+    pool = [
+        {
+            "tile_id": "ineligible_2.9x",
+            "tile_size_m": 2900.0,
+            "center_x_m": 0.0,
+            "center_y_m": 0.0,
+            "diagnostics": {
+                "dominant_wavelength_m": 1000.0,
+                "directional_concentration": 0.99,
+                "spectral_peak_to_median_power_ratio": 50.0,
+            },
+        }
+    ]
+    selected = swm.select_spatially_independent_eligible_tiles(pool, max_tiles=5)
+    assert selected == []  # ranked #1 by every descriptive metric, still excluded
+
+
+def test_mar017b_F_zero_eligible_tile_does_not_trigger_a_fallback_selection():
+    pool = [
+        {
+            "tile_id": "t1",
+            "tile_size_m": 2000.0,
+            "center_x_m": 0.0,
+            "center_y_m": 0.0,
+            "diagnostics": {
+                "dominant_wavelength_m": 900.0,  # 2000/900 = 2.22x -- ineligible
+                "directional_concentration": 0.9,
+                "spectral_peak_to_median_power_ratio": 5.0,
+            },
+        },
+        {
+            "tile_id": "t2",
+            "tile_size_m": 2000.0,
+            "center_x_m": 5000.0,
+            "center_y_m": 5000.0,
+            "diagnostics": {
+                "dominant_wavelength_m": 800.0,  # 2000/800 = 2.5x -- also ineligible
+                "directional_concentration": 0.5,
+                "spectral_peak_to_median_power_ratio": 2.0,
+            },
+        },
+    ]
+    selected = swm.select_spatially_independent_eligible_tiles(pool, max_tiles=5)
+    assert selected == []  # never forces max_tiles from an all-ineligible pool
+
+
+def test_mar017b_E_a_second_overlapping_eligible_tile_is_rejected_for_independence():
+    """Two tiles at the SAME location (a real, direct MAR-017B Section 13
+    scenario -- e.g. a 2000 m candidate and a 1000 m candidate covering
+    the same ground) must never both be selected as independent
+    validation samples."""
+
+    pool = [
+        {
+            "tile_id": "best",
+            "tile_size_m": 2000.0,
+            "center_x_m": 500000.0,
+            "center_y_m": 5900000.0,
+            "diagnostics": {
+                "dominant_wavelength_m": 500.0,  # 2000/500 = 4.0x -- eligible
+                "directional_concentration": 0.99,
+                "spectral_peak_to_median_power_ratio": 50.0,
+            },
+        },
+        {
+            "tile_id": "overlapping_but_worse_ranked",
+            "tile_size_m": 2000.0,
+            "center_x_m": 500500.0,  # 500 m offset -- well within a 2000 m tile's footprint
+            "center_y_m": 5900000.0,
+            "diagnostics": {
+                "dominant_wavelength_m": 500.0,
+                "directional_concentration": 0.5,
+                "spectral_peak_to_median_power_ratio": 2.0,
+            },
+        },
+        {
+            "tile_id": "far_away_independent",
+            "tile_size_m": 2000.0,
+            "center_x_m": 600000.0,  # 100 km away -- genuinely independent
+            "center_y_m": 5900000.0,
+            "diagnostics": {
+                "dominant_wavelength_m": 500.0,
+                "directional_concentration": 0.4,
+                "spectral_peak_to_median_power_ratio": 1.5,
+            },
+        },
+    ]
+    selected_ids = [
+        d["tile_id"] for d in swm.select_spatially_independent_eligible_tiles(pool, max_tiles=5)
+    ]
+    assert selected_ids == ["best", "far_away_independent"]
+
+
+def test_mar017b_G_the_30m_wavelength_gate_remains_active_for_a_second_analog():
+    bedforms = [
+        {"wavelength_m": 18.5, "wave_height_m": 0.2},
+        {"wavelength_m": 29.9, "wave_height_m": 0.4},
+        {"wavelength_m": 30.0, "wave_height_m": 0.5},
+        {"wavelength_m": 85.0, "wave_height_m": 2.0},
+    ]
+    canonical, rejected_count = swm.apply_canonical_wavelength_gate(bedforms)
+    assert [b["wavelength_m"] for b in canonical] == [30.0, 85.0]
+    assert rejected_count == 2
+
+
 # --- Shared: no forbidden downstream-modelling terms in this module's own vocabulary -------
 
 

@@ -1334,3 +1334,66 @@ otherwise, never an interactive credential prompt.
   signatures/behaviour; the full offline suite (975 tests, 25 live/network
   tests correctly deselected) and repo-wide `ruff format`/`ruff check`
   pass clean. No further ticket has started.
+
+- `MAR-017B`: a SECOND OPEN-ANALOG canonical real-data validation attempt
+  for the same reusable sand-wave morphometry engine, run against JNCC/
+  Cefas's real "Processed bathymetry from Inner Dowsing, Race Bank and
+  North Ridge cSAC" (IDRBNR CEND 11/11, same survey programme as HHW --
+  its own internal lineage path confirms 2011-06, RV Cefas Endeavour --
+  but a genuinely different geographic product) -- `IDRBNR-Bathy.zip`,
+  confirmed 218,399,605 bytes, downloaded and checksummed once and cached
+  thereafter. First, a real, useful presentation-layer bug fix: the
+  background-display path's `np.ma.masked_where` left a source's raw
+  float32 nodata sentinel (~-3.4e38) sitting in the masked array's own
+  `.data` buffer, which matplotlib's colour normalization still touched
+  and overflowed on -- fixed by replacing invalid cells with `nan` before
+  masking (`_safe_masked_array`), never by suppressing the warning, with
+  a regression test reproducing the exact scenario. This archive's real
+  layout is genuinely different from HHW's (never assumed): 21 raster
+  candidates -- 18 small ESRI Arc/INFO Binary Grid directories PLUS,
+  unlike HHW, 3 large standalone ESRI ASCII Grid (`.asc`) files -- and a
+  real, previously-undocumented data-integrity finding: two of the 18
+  grids (`asciito_idrb3`/`idrb4`) declare CRS EPSG:4326 (degrees) while
+  their actual coordinate values are obviously UTM-scale metres, an
+  internally inconsistent source CRS declaration detected generically (by
+  the CRS's own `is_geographic` flag, never by hard-coding those two
+  grids' names) and excluded from candidacy with an explicit reason,
+  never silently used. A new canonical-support PREFLIGHT
+  (`run_canonical_support_preflight`) runs every one of the 19 remaining
+  credible candidates through the engine's own 2000 m/1000 m-only tile
+  search BEFORE any morphometry begins -- real result, reported honestly:
+  every candidate fails the required 90% valid-fraction bar (best
+  achieved 49.2% at 2000 m, 70.2% at 1000 m, by the largest standalone
+  `.asc` file) -- closer than HHW's 55.9% at 1000 m, but still a genuine
+  failure, so the ticket's hard early-stop rule correctly fires
+  (`INSUFFICIENT_CONTINUOUS_SPATIAL_SUPPORT`) before any tile is selected
+  or any spectral processing begins, writing only the source inventory,
+  the 21-row preflight table, a support-audit figure (background coverage
+  + a prominent "NO QUALIFYING TILE" banner, real percentages included),
+  and validation metadata with empty (correctly-schema'd) canonical
+  parquets -- exactly the ticket's own definition of a complete,
+  successful negative result. Two new, generically-reusable engine
+  additions exist for the canonical-pass case this real dataset didn't
+  reach: `select_spatially_independent_eligible_tiles` (strict
+  >=3-wavelengths eligibility PLUS a greedy non-overlap check, at most 5
+  tiles, so detailed validation can never report many overlapping tiles
+  as independent samples) and an explicit A-D validation-acceptance
+  waterfall (`derive_canonical_real_validation_status`) requiring >=1
+  canonical tile, >=1 tile meeting the wavelength condition, >=1
+  successful transect, and >=3 retained bedforms -- both fully
+  synthetically tested even though this real run never exercises them. A
+  new cross-analog comparison table
+  (`analogs/sandwave_morphometry_analog_validation_summary.parquet`)
+  places HHW and IDRBNR side by side on method-validation SUPPORT only
+  (never morphology values), built by re-reading HHW's already-persisted
+  MAR-017A canonical (not exploratory) outputs rather than re-running its
+  pipeline. 35 new tests across `test_sandwave_morphometry.py`,
+  `test_sandwave_morphometry_map.py` (new), and
+  `test_idr_bnr_cend1111_analog.py` (new) cover the required list (never
+  below 1000 m, early-stop correctness, strict eligibility with no
+  fallback, the 30 m gate, the nodata fix, the bedform-count floor,
+  status derivation from real criteria, analog-only flags, HHW's
+  exploratory rows never entering this cross-analog summary, and no
+  forbidden risk/score term anywhere); the full offline suite (1010
+  tests, 25 live/network tests correctly deselected) and repo-wide `ruff
+  format`/`ruff check` pass clean. No further ticket has started.

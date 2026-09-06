@@ -25,6 +25,21 @@ def read_png_dimensions(png_path: Path) -> tuple[int, int]:
     return width_px, height_px
 
 
+def _safe_masked_array(elevation: np.ndarray, valid: np.ndarray) -> np.ma.MaskedArray:
+    """MAR-017B Section 6: a source's raw nodata sentinel (e.g. float32's
+    most-negative value, ~-3.4e38) must never reach matplotlib's colour
+    normalization -- `np.ma.masked_where` alone marks a cell invalid but
+    leaves that extreme value sitting in the masked array's own `.data`,
+    which some matplotlib internals (bin-index normalization) still touch
+    and overflow on, even though the final rendered pixel is correctly
+    masked/transparent. Replacing invalid cells with `nan` before masking
+    removes the extreme value from the underlying buffer entirely -- never
+    altering a single valid bathymetry value."""
+
+    safe = np.where(valid, elevation, np.nan).astype(np.float64)
+    return np.ma.masked_invalid(safe)
+
+
 # --- Section 8: first QA map (no morphology interpretation yet) ---------------------------
 
 
@@ -48,7 +63,7 @@ def render_native_bathymetry_overview(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(11.0, 9.0))
 
-    masked = np.ma.masked_where(~valid, elevation)
+    masked = _safe_masked_array(elevation, valid)
     im = ax.imshow(masked, cmap="viridis", extent=extent_m, origin="upper")
     fig.colorbar(im, ax=ax, label="Elevation (m)", fraction=0.04, pad=0.03)
 
@@ -123,12 +138,12 @@ def render_method_figure(
     fig, axes = plt.subplots(2, 2, figsize=(14.0, 12.0))
     ax_a, ax_b, ax_c, ax_d = axes[0, 0], axes[0, 1], axes[1, 0], axes[1, 1]
 
-    masked_native = np.ma.masked_where(~native_valid, native_elevation)
+    masked_native = _safe_masked_array(native_elevation, native_valid)
     im_a = ax_a.imshow(masked_native, cmap="viridis", extent=tile_extent_m, origin="upper")
     ax_a.set_title("A. Native bathymetry (elevation, m)")
     fig.colorbar(im_a, ax=ax_a, fraction=0.046, pad=0.04)
 
-    masked_filtered = np.ma.masked_where(~native_valid, filtered_detrended)
+    masked_filtered = _safe_masked_array(filtered_detrended, native_valid)
     im_b = ax_b.imshow(masked_filtered, cmap="RdBu_r", extent=tile_extent_m, origin="upper")
     ax_b.set_title(f"B. {int(round(30))} m-filtered / detrended sand-wave surface (m)")
     fig.colorbar(im_b, ax=ax_b, fraction=0.046, pad=0.04)
@@ -319,7 +334,7 @@ def render_dominant_bedform_scale_map(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(11.0, 9.0))
 
-    masked_bg = np.ma.masked_where(~background_valid, background_elevation)
+    masked_bg = _safe_masked_array(background_elevation, background_valid)
     ax.imshow(masked_bg, cmap="gray", extent=background_extent_m, origin="upper", alpha=0.5)
 
     if not tile_spectral_df.empty:
@@ -426,6 +441,112 @@ def render_dominant_bedform_scale_map(
     )
     top = 0.88 if message else 0.94
     fig.tight_layout(rect=(0, 0.04, 1, top))
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+# --- MAR-017B Section 21: canonical support QA map (always rendered, regardless of ---------
+# --- whether canonical validation ultimately proceeds) --------------------------------------
+
+
+def render_canonical_support_audit_map(
+    *,
+    background_elevation: np.ndarray,
+    background_valid: np.ndarray,
+    background_extent_m: tuple[float, float, float, float],
+    background_candidate_id: str,
+    qualifying_2000m_tiles: list[tuple[float, float, float]],
+    qualifying_1000m_tiles: list[tuple[float, float, float]],
+    no_qualifying_tile_message: str | None,
+    output_path: Path,
+    title: str = "Canonical Support Audit",
+    dpi: int = 150,
+) -> Path:
+    """MAR-017B Section 21: the raw source footprint/coverage (nodata
+    gaps immediately visible) for `background_candidate_id`, with any
+    real qualifying 2000 m (red) / 1000 m (orange) tile footprints
+    overlaid as `(center_x_m, center_y_m, tile_size_m)` triples. When
+    NEITHER list has any entries, `no_qualifying_tile_message` must be
+    set and is displayed prominently -- the figure itself must make a
+    negative support result unmistakable, never merely blank."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(11.0, 9.0))
+
+    masked_bg = _safe_masked_array(background_elevation, background_valid)
+    ax.imshow(masked_bg, cmap="gray", extent=background_extent_m, origin="upper", alpha=0.7)
+
+    for center_x, center_y, size_m in qualifying_2000m_tiles:
+        half = size_m / 2.0
+        ax.add_patch(
+            plt.Rectangle(
+                (center_x - half, center_y - half),
+                size_m,
+                size_m,
+                fill=False,
+                edgecolor="tab:red",
+                linewidth=2,
+                zorder=5,
+                label="Qualifying 2000 m tile",
+            )
+        )
+    for center_x, center_y, size_m in qualifying_1000m_tiles:
+        half = size_m / 2.0
+        ax.add_patch(
+            plt.Rectangle(
+                (center_x - half, center_y - half),
+                size_m,
+                size_m,
+                fill=False,
+                edgecolor="tab:orange",
+                linewidth=2,
+                zorder=5,
+                label="Qualifying 1000 m tile",
+            )
+        )
+    if qualifying_2000m_tiles or qualifying_1000m_tiles:
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles, strict=False))
+        ax.legend(by_label.values(), by_label.keys(), loc="lower right", fontsize=8)
+
+    ax.set_xlabel("Easting (m)")
+    ax.set_ylabel("Northing (m)")
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    fig.text(
+        0.5,
+        0.93,
+        f"Background candidate shown: {background_candidate_id}",
+        ha="center",
+        va="top",
+        fontsize=9.5,
+        color="0.3",
+        transform=fig.transFigure,
+    )
+    if no_qualifying_tile_message:
+        fig.text(
+            0.5,
+            0.90,
+            no_qualifying_tile_message,
+            ha="center",
+            va="top",
+            fontsize=10.5,
+            color="tab:red",
+            fontweight="bold",
+            transform=fig.transFigure,
+        )
+    fig.text(
+        0.01,
+        0.01,
+        "IDRBNR CEND 11/11 IS A METHOD-DEVELOPMENT ANALOG ONLY AND DOES NOT ENTER PL854 "
+        "SCIENTIFIC EVIDENCE.",
+        ha="left",
+        va="bottom",
+        fontsize=7.5,
+        color="0.2",
+        transform=fig.transFigure,
+    )
+    fig.tight_layout(rect=(0, 0.04, 1, 0.86))
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return output_path

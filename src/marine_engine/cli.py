@@ -15,6 +15,7 @@ from shapely.ops import unary_union
 
 from marine_engine import __version__
 from marine_engine.analogs import hhw_cend1111 as hhw_analog
+from marine_engine.analogs import idr_bnr_cend1111 as idrbnr_analog
 from marine_engine.config import load_study_config
 from marine_engine.metocean import (
     combined_bed_shear,
@@ -26,6 +27,7 @@ from marine_engine.metocean import (
 )
 from marine_engine.metocean import evidence as metocean_evidence
 from marine_engine.morphology import regional
+from marine_engine.morphology import sandwave_morphometry as swm
 from marine_engine.morphology import sandwave_morphometry_map as swmap
 from marine_engine.preprocessing import bathymetry, source_resolution
 from marine_engine.preprocessing.aoi import (
@@ -44,6 +46,7 @@ from marine_engine.preprocessing.chainage import (
 from marine_engine.providers import bgs_offshore_surveys, nsta_freespan
 from marine_engine.providers.bathymetry import acquisition, bgs, emodnet, inventory, ukho
 from marine_engine.providers.bathymetry import hhw_cend1111 as hhw_provider
+from marine_engine.providers.bathymetry import idr_bnr_cend1111 as idrbnr_provider
 from marine_engine.providers.metocean import acquisition as metocean_acquisition
 from marine_engine.providers.metocean import copernicus
 from marine_engine.providers.nsta import (
@@ -4701,6 +4704,438 @@ def _cmd_build_analog_sandwave_morphometry(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_hhw_cross_analog_summary_row(processed_analogs_dir: Path) -> dict[str, Any]:
+    """MAR-017B Section 23: re-reads HHW's ALREADY-PERSISTED MAR-017A
+    outputs (never re-runs its pipeline) to build its row of the cross-
+    analog validation-SUPPORT summary. HHW's own canonical tables are
+    legitimately empty (MAR-017A's accepted, real finding), so most counts
+    here are correctly 0 -- this compares method-validation SUPPORT only,
+    never morphology values (Section 23)."""
+
+    hhw_dir = processed_analogs_dir / "hhw_cend1111"
+    source_inventory = pd.read_parquet(hhw_dir / "source_file_inventory.parquet")
+    validation_gap = json.loads(
+        (hhw_dir / "analog_validation_gap.json").read_text(encoding="utf-8")
+    )
+    tile_spectral = pd.read_parquet(hhw_dir / "tile_spectral_morphometry.parquet")
+    transects = pd.read_parquet(hhw_dir / "transect_morphometry.parquet")
+    bedforms = pd.read_parquet(hhw_dir / "individual_bedforms.parquet")
+
+    native_res_rows = source_inventory[source_inventory["readable_by_rasterio"] == True]  # noqa: E712
+    native_resolution_m = (
+        float(native_res_rows["pixel_size_x_m"].iloc[0]) if not native_res_rows.empty else None
+    )
+    max_valid = validation_gap["max_valid_fraction_by_tile_size_m"]
+    successful_transects = (
+        transects[transects["bedform_count_canonical"].notna()]
+        if not transects.empty
+        else transects
+    )
+    filter_flags = (
+        successful_transects["filter_sensitivity_flags"]
+        if not successful_transects.empty
+        else pd.Series(dtype=object)
+    )
+
+    return {
+        "analog_id": "HHW_CEND1111",
+        "native_resolution_m": native_resolution_m,
+        "2000m_best_valid_fraction": max_valid.get("2000.0"),
+        "1000m_best_valid_fraction": max_valid.get("1000.0"),
+        "canonical_support_tile_count": int(validation_gap["canonical_tile_count"]),
+        "three_wavelength_eligible_tile_count": int(
+            tile_spectral["meets_3_wavelengths_across_tile"].sum() if not tile_spectral.empty else 0
+        ),
+        "successful_canonical_transect_count": int(len(successful_transects)),
+        "canonical_bedform_count": int(len(bedforms)),
+        "filter_stable_transect_count": int((filter_flags.isna() | (filter_flags == "")).sum()),
+        "filter_sensitive_transect_count": int(
+            filter_flags.notna().sum() - (filter_flags.isna() | (filter_flags == "")).sum()
+        ),
+        # MAR-017A's HHW-specific status vocabulary maps directly onto MAR-017B's shared
+        # vocabulary: HHW's canonical tile count is 0, the same real situation MAR-017B's
+        # INSUFFICIENT_CONTINUOUS_SPATIAL_SUPPORT describes -- never a re-interpretation of
+        # what HHW's real result was, just naming it under the shared vocabulary this newer
+        # ticket introduces for cross-analog comparison.
+        "canonical_real_validation_status": idrbnr_analog.INSUFFICIENT_CONTINUOUS_SPATIAL_SUPPORT,
+    }
+
+
+def _build_idrbnr_cross_analog_summary_row(
+    *,
+    native_resolution_m: float | None,
+    preflight_df: pd.DataFrame,
+    tile_spectral_df: pd.DataFrame,
+    transect_df: pd.DataFrame,
+    bedform_df: pd.DataFrame,
+    canonical_real_validation_status: str,
+) -> dict[str, Any]:
+    eligible_preflight = preflight_df[~preflight_df["excluded_from_preflight"]]
+    successful_transects = (
+        transect_df[transect_df["bedform_count_canonical"].notna()]
+        if not transect_df.empty
+        else transect_df
+    )
+    filter_flags = (
+        successful_transects["filter_stability_classification"]
+        if not successful_transects.empty
+        else pd.Series(dtype=object)
+    )
+    return {
+        "analog_id": "IDRBNR_CEND1111",
+        "native_resolution_m": native_resolution_m,
+        "2000m_best_valid_fraction": eligible_preflight["best_valid_fraction_2000m"].max()
+        if not eligible_preflight.empty
+        else None,
+        "1000m_best_valid_fraction": eligible_preflight["best_valid_fraction_1000m"].max()
+        if not eligible_preflight.empty
+        else None,
+        "canonical_support_tile_count": int(
+            eligible_preflight["qualifying_tile_count_1000m"].fillna(0).sum()
+        ),
+        "three_wavelength_eligible_tile_count": int(
+            tile_spectral_df["meets_3_wavelengths_across_tile"].sum()
+            if not tile_spectral_df.empty
+            else 0
+        ),
+        "successful_canonical_transect_count": int(len(successful_transects)),
+        "canonical_bedform_count": int(len(bedform_df)),
+        "filter_stable_transect_count": int(
+            (filter_flags == idrbnr_analog.FILTER_STABLE_AT_TESTED_SCALES).sum()
+        ),
+        "filter_sensitive_transect_count": int(
+            (filter_flags == idrbnr_analog.FILTER_SCALE_SENSITIVE).sum()
+        ),
+        "canonical_real_validation_status": canonical_real_validation_status,
+    }
+
+
+CROSS_ANALOG_SUMMARY_COLUMNS = (
+    "analog_id",
+    "native_resolution_m",
+    "2000m_best_valid_fraction",
+    "1000m_best_valid_fraction",
+    "canonical_support_tile_count",
+    "three_wavelength_eligible_tile_count",
+    "successful_canonical_transect_count",
+    "canonical_bedform_count",
+    "filter_stable_transect_count",
+    "filter_sensitive_transect_count",
+    "canonical_real_validation_status",
+)
+
+
+def _cmd_build_idrbnr_sandwave_validation(args: argparse.Namespace) -> int:
+    """MAR-017B: tests the SAME reusable, already-accepted sand-wave
+    morphometry engine against a SECOND independent open Southern North
+    Sea analog (JNCC/Cefas IDRBNR CEND 11/11) -- a real canonical-real-
+    data method-validation milestone, never PL854 evidence. Every output
+    lives under `data/processed/analogs/idr_bnr_cend1111/`. Canonical
+    support preflight (Section 7) runs BEFORE any morphometry; if it
+    fails, this correctly stops early with a negative, honestly-reported
+    dataset-suitability result (Section 9) -- a valid, complete ticket
+    outcome, never a bug to route around.
+    """
+
+    config = load_study_config(args.config)
+
+    zip_path = config.paths.raw_dir / "analogs" / "idr_bnr_cend1111" / "IDRBNR-Bathy.zip"
+    acquisition = idrbnr_provider.download_idrbnr_bathy_zip(zip_path)
+    print(
+        f"IDRBNR-Bathy.zip: {acquisition.byte_size} bytes, sha256={acquisition.sha256[:16]}..., "
+        f"already_cached={acquisition.already_cached}"
+    )
+
+    analogs_dir = config.paths.processed_dir / "analogs"
+    analog_dir = analogs_dir / "idr_bnr_cend1111"
+    maps_dir = analog_dir / "maps"
+    analog_dir.mkdir(parents=True, exist_ok=True)
+    maps_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Building source file inventory (Section 5)...")
+    source_inventory_df = idrbnr_provider.build_source_file_inventory(zip_path)
+    source_inventory_path = analog_dir / "source_file_inventory.parquet"
+    source_inventory_df.to_parquet(source_inventory_path, index=False)
+    print(f"  {len(source_inventory_df)} archive member(s) -> {source_inventory_path}")
+
+    print("Running canonical support preflight on every raster candidate (Section 7)...")
+    preflight_df = idrbnr_analog.run_canonical_support_preflight(zip_path)
+    preflight_path = analog_dir / "canonical_support_preflight.parquet"
+    preflight_df.to_parquet(preflight_path, index=False)
+    eligible_preflight = preflight_df[~preflight_df["excluded_from_preflight"]]
+    for _, row in preflight_df.iterrows():
+        print(
+            f"  {row['raster_candidate_id']}: 2000m best={row['best_valid_fraction_2000m']}, "
+            f"passing={row['qualifying_tile_count_2000m']}; "
+            f"1000m best={row['best_valid_fraction_1000m']}, "
+            f"passing={row['qualifying_tile_count_1000m']}"
+            + (f" -- EXCLUDED: {row['exclusion_reason']}" if row["excluded_from_preflight"] else "")
+        )
+    print(f"  -> {preflight_path}")
+
+    early_stop_status = idrbnr_analog.derive_early_stop_status(preflight_df)
+
+    if eligible_preflight.empty:
+        raise RuntimeError(
+            "DATA_INTEGRITY_FAILURE: every raster candidate in the archive was excluded from "
+            "the canonical support preflight (unreadable or CRS-inconsistent) -- there is no "
+            "credible candidate left to report on, even negatively."
+        )
+
+    # The candidate with the highest achieved 1000 m valid fraction, shown as QA-figure
+    # background regardless of outcome -- purely a display choice, never a selection.
+    background_row = eligible_preflight.loc[
+        eligible_preflight["best_valid_fraction_1000m"].fillna(0.0).idxmax()
+    ]
+    background_candidate_id = background_row["raster_candidate_id"]
+    bg_data, bg_valid, bg_extent = idrbnr_analog.get_background_for_map(
+        zip_path, background_candidate_id
+    )
+
+    tile_spectral_path = analog_dir / "tile_spectral_morphometry.parquet"
+    transect_path = analog_dir / "transect_morphometry.parquet"
+    bedform_path = analog_dir / "individual_bedforms.parquet"
+    extrema_path = analog_dir / "detected_profile_extrema.gpkg"
+    method_map_path: Path | None = None
+    stats_map_path: Path | None = None
+
+    if early_stop_status is not None:
+        print()
+        print(f"EARLY STOP (Section 9): {early_stop_status}")
+        best_1000 = background_row["best_valid_fraction_1000m"]
+        reason = (
+            f"No candidate among {len(eligible_preflight)} credible raster candidates reaches "
+            f">=90% valid data at a >=1000 m tile size (best achieved: "
+            f"{best_1000 * 100:.1f}% at 1000 m, by {background_candidate_id})."
+        )
+        print(f"  {reason}")
+
+        tile_spectral_df = pd.DataFrame(columns=list(idrbnr_analog.TILE_SPECTRAL_COLUMNS))
+        transect_df = pd.DataFrame(columns=list(idrbnr_analog.TRANSECT_COLUMNS))
+        bedform_df = pd.DataFrame(columns=list(idrbnr_analog.INDIVIDUAL_BEDFORM_COLUMNS))
+        tile_spectral_df.to_parquet(tile_spectral_path, index=False)
+        transect_df.to_parquet(transect_path, index=False)
+        bedform_df.to_parquet(bedform_path, index=False)
+
+        support_audit_path = swmap.render_canonical_support_audit_map(
+            background_elevation=bg_data,
+            background_valid=bg_valid,
+            background_extent_m=bg_extent,
+            background_candidate_id=background_candidate_id,
+            qualifying_2000m_tiles=[],
+            qualifying_1000m_tiles=[],
+            no_qualifying_tile_message=(
+                f"NO QUALIFYING >=1000 m CANONICAL TILE IN ANY CANDIDATE (best: "
+                f"{best_1000 * 100:.1f}% at 1000 m, required >=90%)"
+            ),
+            output_path=maps_dir / "idr_bnr_canonical_support_audit.png",
+        )
+
+        canonical_real_validation_status, canonical_real_validation_reason = (
+            early_stop_status,
+            reason,
+        )
+    else:
+        selection = idrbnr_analog.select_primary_grid_from_preflight(preflight_df)
+        selected_candidate_id = selection["selected_raster_candidate_id"]
+        print(f"Selected primary grid (Section 8): {selected_candidate_id}")
+
+        print("Searching for canonical analysis tiles (Section 10)...")
+        canonical_tiles, tile_search_meta = idrbnr_analog.build_tile_candidates(
+            zip_path, selected_candidate_id
+        )
+        print(f"  {len(canonical_tiles)} canonical candidate tile(s)")
+
+        tile_spectral_df = idrbnr_analog.build_tile_spectral_table(
+            zip_path, selected_candidate_id, canonical_tiles
+        )
+        tile_spectral_df = idrbnr_analog.select_detailed_validation_tiles(tile_spectral_df)
+        tile_spectral_df.to_parquet(tile_spectral_path, index=False)
+        selected_ids = (
+            tile_spectral_df[tile_spectral_df["selected_for_detailed_validation"]][
+                "tile_id"
+            ].tolist()
+            if not tile_spectral_df.empty
+            else []
+        )
+        print(
+            f"  {len(tile_spectral_df)} tile(s) analyzed, {len(selected_ids)} selected for "
+            f"detailed validation (Sections 12/13) -> {tile_spectral_path}"
+        )
+
+        transect_df, bedform_df, crests_gdf, troughs_gdf = (
+            idrbnr_analog.build_transect_and_bedform_tables(
+                zip_path, selected_candidate_id, tile_spectral_df
+            )
+        )
+        transect_df.to_parquet(transect_path, index=False)
+        bedform_df.to_parquet(bedform_path, index=False)
+        print(f"  {len(transect_df)} transect(s) -> {transect_path}")
+        print(f"  {len(bedform_df)} canonical individual bedform(s) -> {bedform_path}")
+
+        if extrema_path.exists():
+            extrema_path.unlink()
+        if not crests_gdf.empty:
+            crests_gdf.to_file(extrema_path, layer="detected_crests", driver="GPKG")
+        if not troughs_gdf.empty:
+            troughs_gdf.to_file(extrema_path, layer="detected_troughs", driver="GPKG")
+
+        # `find_valid_tiles` returns candidates from exactly ONE tile size (whichever passed
+        # first in its 2000 m -> 1000 m cascade) -- every entry in `canonical_tiles` shares
+        # `tile_search_meta["tile_size_used_m"]`, so it buckets into exactly one of the two
+        # QA-figure overlay lists, never both.
+        tile_footprints = [(t.center_x_m, t.center_y_m, t.tile_size_m) for t in canonical_tiles]
+        qualifying_2000m_tiles = (
+            tile_footprints
+            if tile_search_meta["tile_size_used_m"] == swm.CANONICAL_TILE_SIZE_M
+            else []
+        )
+        qualifying_1000m_tiles = (
+            tile_footprints if tile_search_meta["tile_size_used_m"] == swm.MIN_TILE_SIZE_M else []
+        )
+        support_audit_path = swmap.render_canonical_support_audit_map(
+            background_elevation=bg_data,
+            background_valid=bg_valid,
+            background_extent_m=bg_extent,
+            background_candidate_id=background_candidate_id,
+            qualifying_2000m_tiles=qualifying_2000m_tiles,
+            qualifying_1000m_tiles=qualifying_1000m_tiles,
+            no_qualifying_tile_message=None,
+            output_path=maps_dir / "idr_bnr_canonical_support_audit.png",
+        )
+
+        any_meets_3wl = bool(tile_spectral_df["meets_3_wavelengths_across_tile"].any())
+        successful_transects = (
+            transect_df[transect_df["bedform_count_canonical"].notna()]
+            if not transect_df.empty
+            else transect_df
+        )
+        canonical_real_validation_status, canonical_real_validation_reason = (
+            idrbnr_analog.derive_canonical_real_validation_status(
+                canonical_tile_count=len(tile_spectral_df),
+                any_meets_3_wavelengths=any_meets_3wl,
+                successful_transect_count=len(successful_transects),
+                canonical_bedform_count=len(bedform_df),
+            )
+        )
+        print(f"Canonical real validation status (Section 18): {canonical_real_validation_status}")
+        print(f"  {canonical_real_validation_reason}")
+
+        if selected_ids and not bedform_df.empty:
+            top_tile_row = (
+                tile_spectral_df[tile_spectral_df["selected_for_detailed_validation"]]
+                .sort_values(
+                    ["directional_concentration", "spectral_peak_to_median_power_ratio"],
+                    ascending=[False, False],
+                )
+                .iloc[0]
+            )
+            method_inputs = idrbnr_analog.get_method_figure_inputs(
+                zip_path, selected_candidate_id, top_tile_row, transect_df, bedform_df
+            )
+            method_map_path = swmap.render_method_figure(
+                **method_inputs,
+                output_path=maps_dir / "idr_bnr_sandwave_morphometry_validation.png",
+                title="IDRBNR CEND 11/11 -- Sand-Wave Morphometry Canonical Validation",
+                subtitle="Canonical >=1000 m support",
+            )
+        if not bedform_df.empty:
+            stats_map_path = swmap.render_bedform_distribution_figure(
+                bedforms_df=bedform_df,
+                output_path=maps_dir / "idr_bnr_canonical_bedform_statistics.png",
+                title="IDRBNR CEND 11/11 -- Canonical real-data validation -- Bedform "
+                "Distributions",
+            )
+
+    print("Writing canonical real-validation metadata (Sections 19/25)...")
+    contract = idrbnr_analog.build_pipeline_transfer_contract(
+        canonical_real_validation_status=canonical_real_validation_status,
+        canonical_real_validation_reason=canonical_real_validation_reason,
+    )
+    validation_metadata = {
+        "preflight_summary": {
+            "credible_candidate_count": int(len(eligible_preflight)),
+            "excluded_candidate_count": int(preflight_df["excluded_from_preflight"].sum()),
+            "best_valid_fraction_2000m": float(
+                eligible_preflight["best_valid_fraction_2000m"].max()
+            )
+            if not eligible_preflight.empty
+            and eligible_preflight["best_valid_fraction_2000m"].notna().any()
+            else None,
+            "best_valid_fraction_1000m": float(
+                eligible_preflight["best_valid_fraction_1000m"].max()
+            )
+            if not eligible_preflight.empty
+            and eligible_preflight["best_valid_fraction_1000m"].notna().any()
+            else None,
+            "background_candidate_shown_in_support_audit_figure": background_candidate_id,
+        },
+        **contract,
+    }
+    metadata_path = analog_dir / "morphometry_validation_metadata.json"
+    metadata_path.write_text(
+        json.dumps(validation_metadata, indent=2, default=str), encoding="utf-8"
+    )
+
+    print("Building cross-analog validation-support summary (Section 23)...")
+    hhw_row = _build_hhw_cross_analog_summary_row(analogs_dir)
+    native_res_row = source_inventory_df[source_inventory_df["is_raster_candidate"]]
+    native_resolution_m = (
+        float(native_res_row["pixel_size_x_m"].dropna().iloc[0])
+        if not native_res_row["pixel_size_x_m"].dropna().empty
+        else None
+    )
+    idrbnr_row = _build_idrbnr_cross_analog_summary_row(
+        native_resolution_m=native_resolution_m,
+        preflight_df=preflight_df,
+        tile_spectral_df=tile_spectral_df,
+        transect_df=transect_df,
+        bedform_df=bedform_df,
+        canonical_real_validation_status=canonical_real_validation_status,
+    )
+    cross_analog_df = pd.DataFrame([hhw_row, idrbnr_row])[list(CROSS_ANALOG_SUMMARY_COLUMNS)]
+    cross_analog_path = analogs_dir / "sandwave_morphometry_analog_validation_summary.parquet"
+    cross_analog_df.to_parquet(cross_analog_path, index=False)
+    print(f"  -> {cross_analog_path}")
+
+    print()
+    print("=== Outputs ===")
+    for label, path in (
+        ("source_file_inventory_parquet", source_inventory_path),
+        ("canonical_support_preflight_parquet", preflight_path),
+        ("tile_spectral_morphometry_parquet", tile_spectral_path),
+        ("transect_morphometry_parquet", transect_path),
+        ("individual_bedforms_parquet", bedform_path),
+        ("detected_profile_extrema_gpkg", extrema_path if extrema_path.exists() else None),
+        ("morphometry_validation_metadata_json", metadata_path),
+        ("cross_analog_validation_summary_parquet", cross_analog_path),
+        ("canonical_support_audit_png", support_audit_path),
+        ("sandwave_morphometry_validation_png", method_map_path),
+        ("canonical_bedform_statistics_png", stats_map_path),
+    ):
+        print(f"  {label}: {path}")
+
+    print()
+    question = (
+        "DID IDRBNR PROVIDE SUFFICIENT CONTIGUOUS REAL BATHYMETRY TO VALIDATE THE CANONICAL "
+        "MORPHOMETRY WORKFLOW?"
+    )
+    answer = (
+        "YES"
+        if canonical_real_validation_status == idrbnr_analog.CANONICAL_REAL_DATA_VALIDATED
+        else "NO"
+    )
+    print(f"{question} {answer}")
+    print(f"STATUS: {canonical_real_validation_status}")
+    print()
+    print(
+        "IDRBNR CEND 11/11 IS A METHOD-DEVELOPMENT ANALOG ONLY AND DOES NOT ENTER PL854 "
+        "SCIENTIFIC EVIDENCE."
+    )
+    print("CANONICAL REAL-DATA VALIDATION DOES NOT MEAN PL854 MORPHOLOGY HAS BEEN VALIDATED.")
+    return 0
+
+
 def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> datetime:
     """The live dataset's own start timestamp, or `fallback_now` if it could not be discovered."""
 
@@ -4984,6 +5419,23 @@ def build_parser() -> argparse.ArgumentParser:
     build_analog_sandwave_morphometry_parser.set_defaults(
         func=_cmd_build_analog_sandwave_morphometry
     )
+
+    build_idrbnr_sandwave_validation_parser = subparsers.add_parser(
+        "build-idrbnr-sandwave-validation",
+        help=(
+            "Second open-analog CANONICAL real-data sand-wave morphometry validation "
+            "(MAR-017B) on the JNCC/Cefas Inner Dowsing, Race Bank and North Ridge cSAC "
+            "(IDRBNR CEND 11/11) analog dataset -- never PL854 evidence. Runs a canonical "
+            "support preflight before any morphometry and stops early with an explicit, "
+            "honest status if no candidate raster provides a qualifying >=1000 m tile. "
+            "Outputs live under processed/analogs/idr_bnr_cend1111/. Downloads the official "
+            "processed-bathymetry ZIP once (cached thereafter); requires internet on first run."
+        ),
+    )
+    build_idrbnr_sandwave_validation_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file (used for paths only)."
+    )
+    build_idrbnr_sandwave_validation_parser.set_defaults(func=_cmd_build_idrbnr_sandwave_validation)
 
     return parser
 

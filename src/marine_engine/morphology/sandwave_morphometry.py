@@ -511,6 +511,74 @@ def select_canonical_eligible_tiles(
     return rank_and_select_top_tiles(eligible, top_n=top_n)
 
 
+def _square_tiles_overlap(
+    center_x_1: float,
+    center_y_1: float,
+    size_1: float,
+    center_x_2: float,
+    center_y_2: float,
+    size_2: float,
+) -> bool:
+    half_sum = (size_1 + size_2) / 2.0
+    return abs(center_x_1 - center_x_2) < half_sum and abs(center_y_1 - center_y_2) < half_sum
+
+
+def select_spatially_independent_eligible_tiles(
+    tile_diagnostics: list[dict[str, Any]],
+    *,
+    max_tiles: int = 5,
+    min_wavelengths: int = MIN_WAVELENGTHS_ACROSS_TILE,
+) -> list[dict[str, Any]]:
+    """MAR-017B Section 13: detailed canonical validation must never
+    report many heavily-overlapping tiles as independent validation
+    samples. Applies the SAME strict `>=3`-wavelengths eligibility as
+    `select_canonical_eligible_tiles` (no fallback), ranks the eligible
+    pool by the same descriptive (directional_concentration, then
+    spectral peak-to-median power ratio) ordering, then walks the ranked
+    list greedily: a candidate is accepted only if its square footprint
+    does not overlap any tile already accepted. Stops at `max_tiles`
+    (default 5) or when the ranked list is exhausted, whichever comes
+    first -- never forces `max_tiles` by accepting an overlapping or
+    ineligible tile. Each `tile_diagnostics` entry must additionally
+    provide `center_x_m`/`center_y_m` alongside `tile_size_m` and
+    `diagnostics["dominant_wavelength_m"]`."""
+
+    eligible = [
+        d
+        for d in tile_diagnostics
+        if meets_wavelengths_across_tile(
+            d["diagnostics"]["dominant_wavelength_m"], d["tile_size_m"], min_wavelengths
+        )
+    ]
+    ranked = sorted(
+        eligible,
+        key=lambda d: (
+            d["diagnostics"]["directional_concentration"],
+            d["diagnostics"]["spectral_peak_to_median_power_ratio"],
+        ),
+        reverse=True,
+    )
+
+    selected: list[dict[str, Any]] = []
+    for candidate in ranked:
+        if len(selected) >= max_tiles:
+            break
+        overlaps_existing = any(
+            _square_tiles_overlap(
+                candidate["center_x_m"],
+                candidate["center_y_m"],
+                candidate["tile_size_m"],
+                s["center_x_m"],
+                s["center_y_m"],
+                s["tile_size_m"],
+            )
+            for s in selected
+        )
+        if not overlaps_existing:
+            selected.append(candidate)
+    return selected
+
+
 # --- Section 14: cross-crest transects ------------------------------------------------------
 
 
