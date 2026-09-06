@@ -1154,5 +1154,61 @@ otherwise, never an interactive credential prompt.
   range-overlap correctness, source-stated-only temporal matching, true-
   width rendering, and the absence of any score/probability/accuracy term
   anywhere in the output schemas; the full offline suite (917 tests) and
-  repo-wide `ruff format`/`ruff check` pass clean. No further ticket has
-  started.
+  repo-wide `ruff format`/`ruff check` pass clean.
+
+- `MAR-016`: a DATA-DISCOVERY / ACCESS-RECOVERY audit, never a new model --
+  asks whether MAR-015's demonstrated gap (pipeline-scale/current-era
+  seabed morphology, since MAR-007 is 1991-1992-sourced) can actually be
+  closed with verified open data. A new provider
+  (`providers/bgs_offshore_surveys.py`) queries BGS's real, public OGC API
+  (`ogcapi.bgs.ac.uk`, collection `offshore-oil-gas-site-surveys` -- its
+  own description states "BGS do not hold the data") spatially against the
+  real PL854 AOI, real bbox + CQL2 `filter` queries, never the interactive
+  viewer. Real result: **14 candidates** found (9 route-intersecting, 2
+  AOI-only, 3 nearby-only), and all 5 of the ticket's named candidates
+  confirmed live, including a genuine demonstration of Section 3's own
+  warning -- `bgs_ref_no=GB02SS0003` ("Anglia A") and `decc_ref_no=GS_807`
+  ("Bedevere rig site survey") both cite block 48/18, yet GS_807's real
+  footprint sits ~12.9 km from the route (confirmed geometrically, never
+  assumed from the shared block number). Several real footprints are
+  near-perfect rectangles (`footprint_rectangularity` >= 0.96) consistent
+  with a licensed block extent rather than an as-run survey track --
+  flagged explicitly and never allowed to justify
+  `CAN_ADDRESS_PIPELINE_SCALE_MORPHOLOGY_GAP` on its own; the real best
+  nominal route-coverage candidates (GB02SS0003/GB03SS0002, 42.1%) are
+  block-shaped and metadata-only, so neither qualifies. **Every one of the
+  14 real candidates is `METADATA_ONLY_CUSTODIAN_REQUEST_REQUIRED`** (BGS's
+  own collection statement) -- independently cross-validated against
+  MAR-005's own, separate, earlier BGS check (a completely different
+  GeoNetwork CSW protocol, `metadata.bgs.ac.uk`), which agrees exactly on
+  dates/access/restriction for the two candidates both tickets checked. A
+  dedicated Fugro-2018 dossier
+  (`anglia_fugro_2018_recovery_dossier.json`) traces the official
+  2018 pre-decommissioning survey to two real, cited gov.uk decommissioning
+  filings (Ithaca Energy's programme + Hartley Anderson's April-2020
+  Environmental Appraisal, which verbatim confirms 20-28 m depth, ~5 m
+  sandwaves, 8 freespans/97 m, 19 exposed sections/519 m, and a poorly-
+  sorted-coarse-sand sample) -- but the survey itself has **no discoverable
+  catalogue record anywhere searched** (BGS, data.gov.uk/National Data
+  Library, MEDIN, Marine Data Exchange); only the descriptive EA PDF is
+  public, no MBES/XYZ/GeoTIFF grid was found, so its dossier status is
+  `REPORT_EVIDENCE_ONLY`. Three real, verified-open Southern North Sea
+  analog datasets (Cefas ECREC, JNCC/Cefas Inner Dowsing-Race Bank-North
+  Ridge cSAC, Sheringham Shoal OWF) are recorded separately as
+  `METHOD_DEVELOPMENT_ANALOG_ONLY` -- never PL854 evidence. Six outputs are
+  written under `seabed_data/` and `maps/` (a 14-row survey-inventory
+  parquet, an intentionally-empty file-inventory parquet since no
+  downloadable file was ever found, the Fugro dossier, an access-gap JSON
+  answering all 6 Section 19 questions literally, a coverage map colouring
+  footprints ONLY by real route/AOI overlap class, and a timeline making
+  the 1991-92/2018/2024-2026 temporal mismatch visually obvious) via
+  `uv run marine-engine inventory-highres-seabed-data configs/pl854.yaml`
+  (the one live step; every classification/rendering afterward is pure
+  offline computation on the acquired data). 16 new tests across
+  `test_highres_seabed_survey_inventory{,_map}.py` cover acquisition-year/
+  update-date separation, the block-number-is-not-overlap discipline, real-
+  geometry-vs-bounding-box intersection, metadata-only access never
+  upgrading to open, equipment-parsed-never-implies-downloadable-data, and
+  the absence of any score/probability/susceptibility term anywhere; the
+  full offline suite (933 tests) and repo-wide `ruff format`/`ruff check`
+  pass clean. No further ticket has started.

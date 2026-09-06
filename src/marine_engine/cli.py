@@ -39,7 +39,7 @@ from marine_engine.preprocessing.chainage import (
     load_pipeline_route,
     print_chainage_report,
 )
-from marine_engine.providers import nsta_freespan
+from marine_engine.providers import bgs_offshore_surveys, nsta_freespan
 from marine_engine.providers.bathymetry import acquisition, bgs, emodnet, inventory, ukho
 from marine_engine.providers.metocean import acquisition as metocean_acquisition
 from marine_engine.providers.metocean import copernicus
@@ -73,6 +73,8 @@ from marine_engine.validation import (
     freespan_context_audit,
     freespan_context_audit_map,
     freespan_model_context,
+    highres_seabed_survey_inventory,
+    highres_seabed_survey_inventory_map,
 )
 
 
@@ -4264,6 +4266,150 @@ def _cmd_audit_freespan_context(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_inventory_highres_seabed_data(args: argparse.Namespace) -> int:
+    """MAR-016: high-resolution seabed survey recovery + access audit. The
+    ONE live network step this command performs is the BGS OGC API
+    acquisition; every classification, table, dossier, and map is then
+    built purely from that acquired data (no further network access). A
+    DATA-DISCOVERY / ACCESS-RECOVERY milestone -- never a new freespan
+    model, susceptibility score, morphology weighting, or canonical raster.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pipeline_gpkg_path, aoi_gpkg_path, _chainage_gpkg_path, _interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+
+    if not pipeline_gpkg_path.exists() or not aoi_gpkg_path.exists():
+        print(
+            f"error: missing canonical pipeline/AOI under {study_dir}; run build-aoi first",
+            file=sys.stderr,
+        )
+        return 1
+
+    working_crs = config.crs.horizontal
+    try:
+        route, _attributes, source_crs = load_pipeline_route(pipeline_gpkg_path, pipeline_id)
+    except InvalidPipelineRouteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if source_crs != working_crs:
+        print(
+            f"error: pipeline CRS {source_crs} does not match configured working CRS {working_crs}",
+            file=sys.stderr,
+        )
+        return 1
+
+    aoi_gdf = gpd.read_file(aoi_gpkg_path, layer="study_aoi")
+    aoi_geometry = unary_union(aoi_gdf.geometry)
+    aoi_bbox_wgs84 = highres_seabed_survey_inventory.compute_aoi_bbox_wgs84(
+        aoi_geometry, working_crs
+    )
+
+    cache_dir = config.paths.raw_dir / "bgs_offshore_surveys"
+    manifest_path = (
+        config.paths.interim_dir
+        / pipeline_id.lower()
+        / "bgs_offshore_surveys"
+        / "acquisition_manifest.json"
+    )
+    try:
+        acquisition_report = bgs_offshore_surveys.acquire_bgs_survey_candidates(
+            aoi_bbox_wgs84=aoi_bbox_wgs84,
+            bbox_pad_deg=0.05,
+            cache_dir=cache_dir,
+            manifest_path=manifest_path,
+        )
+    except bgs_offshore_surveys.BgsOffshoreSurveysServiceError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    survey_inventory_df = highres_seabed_survey_inventory.build_survey_inventory_table(
+        acquisition_report.merged_features,
+        route=route,
+        aoi_geometry=aoi_geometry,
+        working_crs=working_crs,
+    )
+    footprints_gdf = highres_seabed_survey_inventory.build_survey_footprints_gdf(
+        acquisition_report.merged_features, working_crs=working_crs
+    )
+    file_inventory_df = highres_seabed_survey_inventory.build_empty_file_inventory_table()
+
+    seabed_data_dir = study_dir / "seabed_data"
+    maps_dir = study_dir / "maps"
+
+    survey_inventory_path = seabed_data_dir / "high_resolution_survey_inventory.parquet"
+    survey_inventory_path.parent.mkdir(parents=True, exist_ok=True)
+    survey_inventory_df.to_parquet(survey_inventory_path, index=False)
+
+    file_inventory_path = seabed_data_dir / "high_resolution_file_inventory.parquet"
+    file_inventory_path.parent.mkdir(parents=True, exist_ok=True)
+    file_inventory_df.to_parquet(file_inventory_path, index=False)
+
+    fugro_dossier = highres_seabed_survey_inventory.build_fugro_2018_recovery_dossier(
+        survey_inventory_df=survey_inventory_df, retrieved_at_utc=datetime.now(UTC).isoformat()
+    )
+    fugro_dossier["analog_datasets"] = list(highres_seabed_survey_inventory.ANALOG_DATASET_REGISTRY)
+    fugro_dossier_path = seabed_data_dir / "anglia_fugro_2018_recovery_dossier.json"
+    fugro_dossier_path.parent.mkdir(parents=True, exist_ok=True)
+    fugro_dossier_path.write_text(
+        json.dumps(fugro_dossier, indent=2, default=str), encoding="utf-8"
+    )
+
+    access_gap_report = highres_seabed_survey_inventory.build_access_gap_report(
+        survey_inventory_df=survey_inventory_df, fugro_dossier=fugro_dossier
+    )
+    access_gap_report["survey_footprint_metadata_does_not_imply_data_custody"] = True
+    access_gap_path = seabed_data_dir / "seabed_data_access_gap.json"
+    access_gap_path.parent.mkdir(parents=True, exist_ok=True)
+    access_gap_path.write_text(
+        json.dumps(access_gap_report, indent=2, default=str), encoding="utf-8"
+    )
+
+    background_raster_path = study_dir / "bathymetry" / "emodnet_baseline_lat_100m.tif"
+    background_raster_path = background_raster_path if background_raster_path.exists() else None
+
+    coverage_map_path = highres_seabed_survey_inventory_map.render_survey_inventory_coverage_map(
+        survey_inventory_df=survey_inventory_df,
+        footprints_gdf=footprints_gdf,
+        route=route,
+        aoi_geometry=aoi_geometry,
+        output_path=maps_dir / "pl854_high_resolution_survey_inventory.png",
+        background_raster_path=background_raster_path,
+    )
+    timeline_path = highres_seabed_survey_inventory_map.render_seabed_data_timeline(
+        survey_inventory_df=survey_inventory_df,
+        output_path=maps_dir / "pl854_seabed_data_timeline.png",
+    )
+
+    print(f"Survey inventory: {len(survey_inventory_df)} candidate(s) -> {survey_inventory_path}")
+    print(f"File inventory: {len(file_inventory_df)} file(s) -> {file_inventory_path}")
+    print(f"Fugro 2018 dossier: {fugro_dossier_path}")
+    print(f"Access-gap report: {access_gap_path}")
+    print(f"Coverage map: {coverage_map_path}")
+    print(f"Timeline: {timeline_path}")
+    print()
+    highres_seabed_survey_inventory.print_survey_inventory_report(
+        survey_inventory_df=survey_inventory_df,
+        access_gap_report=access_gap_report,
+        outputs={
+            "high_resolution_survey_inventory_parquet": survey_inventory_path,
+            "high_resolution_file_inventory_parquet": file_inventory_path,
+            "anglia_fugro_2018_recovery_dossier_json": fugro_dossier_path,
+            "seabed_data_access_gap_json": access_gap_path,
+            "coverage_map_png": coverage_map_path,
+            "timeline_png": timeline_path,
+        },
+    )
+    return 0
+
+
 def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> datetime:
     """The live dataset's own start timestamp, or `fallback_now` if it could not be discovered."""
 
@@ -4515,6 +4661,21 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     audit_freespan_context_parser.set_defaults(func=_cmd_audit_freespan_context)
+
+    inventory_highres_seabed_data_parser = subparsers.add_parser(
+        "inventory-highres-seabed-data",
+        help=(
+            "High-resolution seabed survey recovery + access audit (MAR-016): queries the "
+            "BGS OGC API for real oil/gas site-survey footprints near PL854, classifies real "
+            "route/AOI overlap and data access, and audits whether the pipeline-scale seabed-"
+            "morphology gap can be closed with verified open data -- requires build-aoi to "
+            "have already run; live BGS network access, requires internet."
+        ),
+    )
+    inventory_highres_seabed_data_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    inventory_highres_seabed_data_parser.set_defaults(func=_cmd_inventory_highres_seabed_data)
 
     return parser
 
