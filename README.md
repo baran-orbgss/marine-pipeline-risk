@@ -1276,3 +1276,61 @@ otherwise, never an interactive credential prompt.
   anywhere) cover the required list; the full offline suite (962 tests)
   and repo-wide `ruff format`/`ruff check` pass clean. No further ticket
   has started.
+
+- `MAR-017A`: a SUPPORT-SCALE INTEGRITY REPAIR of MAR-017, triggered by an
+  external review that found the original HHW run had silently cascaded
+  its CANONICAL 2D tile search below the ticket's own stated >=1000 m
+  floor (down to 250 m), let those 250 m tiles populate the canonical
+  validation outputs despite failing the required `tile_size_m /
+  dominant_wavelength_m >= 3.0` eligibility test, and never gated a
+  detected 21.1 m trough-to-trough feature out of the canonical 30 m
+  bedform output (the Butterworth cutoff attenuates, it does not
+  mathematically zero sub-cutoff content). All three are now fixed by
+  splitting one conflated pipeline into two, permanently separate ones:
+  `find_valid_tiles` (CANONICAL) tries only 2000 m then 1000 m and
+  legitimately returns empty rather than cascading further; the OLD
+  cascade-to-100 m logic now lives only in the new, explicitly-labelled
+  `find_exploratory_small_support_tiles`
+  (`EXPLORATORY_SMALL_SUPPORT_DIAGNOSTIC`, every row stamped
+  `canonical_validation_eligible=false`/
+  `reason=BELOW_MINIMUM_SPATIAL_SUPPORT`, never written into a canonical
+  parquet). Canonical tile selection (`select_canonical_eligible_tiles`)
+  now enforces the >=3-wavelengths condition with **zero fallback** --
+  0/1/2 eligible tiles are selected as 0/1/2, never forced to 3 from an
+  ineligible pool (the OLD `select_top_tiles`'s exact bug). A new explicit
+  post-detection gate (`apply_canonical_wavelength_gate`) rejects any
+  bedform with `wavelength_m < 30` from canonical output and reports the
+  rejected count for QA, applied identically in both places a canonical
+  bedform list is built (the persisted table and the method-figure
+  profile) so the two can never drift apart. Re-run on the real HHW data
+  with the repaired engine: canonical tile search found **zero** tiles at
+  both 2000 m (best achieved 49.4%) and 1000 m (best achieved 55.9%) --
+  correctly empty `tile_spectral_morphometry.parquet` /
+  `transect_morphometry.parquet` / `individual_bedforms.parquet`, no stale
+  `detected_profile_extrema.gpkg`; the separate exploratory search found 7
+  tiles at 250 m (94.9% best), yielding 9 transects (3 honestly excluded
+  for insufficient along-transect density, as before) and **10** canonical-
+  gated bedforms (down from the old, ungated 11) -- the wavelength gate
+  correctly rejected exactly 1 sub-30 m feature (the real, previously-
+  leaking 21.1 m one), with every remaining bedform confirmed >=30 m
+  (minimum 35.28 m) by independent re-verification. `pipeline_transfer_
+  contract.json` now separates two questions that must never collapse
+  into one: "is the generic engine implemented" (**YES**, unchanged by
+  real-data outcome) vs. "has the full canonical workflow been validated
+  on HHW" (**NO**, a real, honestly-reported property of this dataset's
+  coverage, not a defect of the engine) -- both derived from the actual
+  run's tile/bedform counts, never hard-coded. A new `analog_validation_
+  gap.json` records the maximum valid fraction achieved at all four tried
+  tile sizes, why HHW fails canonical support, and the next analog
+  candidate identified for a future ticket (JNCC/Cefas's "Inner Dowsing,
+  Race Bank and North Ridge cSAC" processed bathymetry, same CEND 11/11
+  survey programme, not yet downloaded or processed). The exploratory
+  method/statistics/dominant-scale figures now carry unmistakable red
+  subtitles/banners identifying them as below the canonical floor (never
+  presented as accepted validation), including a figure-layout fix so the
+  banner text never collides with the plot title. 12 new MAR-017A-lettered
+  tests (Section 15's A-L, split across both test files by which module
+  they exercise) plus 3 pre-existing tests updated for the new function
+  signatures/behaviour; the full offline suite (975 tests, 25 live/network
+  tests correctly deselected) and repo-wide `ruff format`/`ruff check`
+  pass clean. No further ticket has started.

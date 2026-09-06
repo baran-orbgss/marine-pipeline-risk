@@ -9,7 +9,9 @@ test_sandwave_morphometry.py alongside the reusable engine).
 
 import inspect
 import json
+from pathlib import Path
 
+import pandas as pd
 import pytest
 from shapely.geometry import LineString
 
@@ -79,7 +81,10 @@ def test_N_every_canonical_table_schema_carries_the_analog_only_flags():
 
 
 def test_N_pipeline_transfer_contract_states_pl854_evidence_is_false():
-    contract = hhw.build_pipeline_transfer_contract()
+    contract = hhw.build_pipeline_transfer_contract(
+        hhw_canonical_2d_validation_status=hhw.HHW_CANONICAL_2D_TILE_VALIDATION_NOT_SUPPORTED,
+        hhw_detailed_bedform_validation_status=hhw.NOT_CANONICALLY_VALIDATED,
+    )
     assert contract["pl854_evidence"] is False
     assert contract["pl854_feature_input"] is False
     assert contract["pl854_validation_input"] is False
@@ -105,7 +110,10 @@ def test_O_no_canonical_column_schema_contains_a_forbidden_term():
 
 
 def test_O_pipeline_transfer_contract_contains_no_forbidden_term():
-    contract = hhw.build_pipeline_transfer_contract()
+    contract = hhw.build_pipeline_transfer_contract(
+        hhw_canonical_2d_validation_status=hhw.HHW_CANONICAL_2D_TILE_VALIDATION_NOT_SUPPORTED,
+        hhw_detailed_bedform_validation_status=hhw.NOT_CANONICALLY_VALIDATED,
+    )
     dumped = json.dumps(contract, default=str).lower()
     for token in _FORBIDDEN_OUTPUT_TERMS:
         assert token not in dumped, token
@@ -137,26 +145,131 @@ def test_transect_and_bedform_flow_on_a_synthetic_tile_never_touches_hhw():
     assert all(length == pytest.approx(250.0, rel=0.05) for length in lengths)
 
 
-def test_select_top_tiles_falls_back_gracefully_when_no_tile_meets_3_wavelengths():
-    import pandas as pd
+def test_select_canonical_top_tiles_never_falls_back_to_an_ineligible_tile():
+    """MAR-017A Section 5 directly fixes the review's Issue B: the OLD
+    `select_top_tiles` fell back to an ineligible pool whenever nothing
+    met the strict >=3-wavelengths condition, which is exactly how HHW's
+    real 250 m tiles ended up in a canonical validation output. Neither
+    tile below meets the condition, so NONE may be selected."""
 
     df = pd.DataFrame(
         [
             {
                 "tile_id": "t1",
+                "tile_size_m": 2000.0,
                 "directional_concentration": 0.9,
                 "spectral_peak_to_median_power_ratio": 5.0,
+                "dominant_wavelength_m": 1000.0,  # 2000/1000 = 2.0x -- ineligible
                 "meets_3_wavelengths_across_tile": False,
                 "rank_selected_top3": False,
+                "canonical_validation_eligible": True,
+                "reason": None,
             },
             {
                 "tile_id": "t2",
+                "tile_size_m": 2000.0,
                 "directional_concentration": 0.5,
                 "spectral_peak_to_median_power_ratio": 2.0,
+                "dominant_wavelength_m": 900.0,  # 2000/900 = 2.22x -- also ineligible
                 "meets_3_wavelengths_across_tile": False,
                 "rank_selected_top3": False,
+                "canonical_validation_eligible": True,
+                "reason": None,
             },
         ]
     )
-    ranked = hhw.select_top_tiles(df, top_n=1)
-    assert ranked[ranked["rank_selected_top3"]]["tile_id"].tolist() == ["t1"]
+    ranked = hhw.select_canonical_top_tiles(df, top_n=1)
+    assert ranked[ranked["rank_selected_top3"]].empty
+
+
+# --- MAR-017A Section 15's own required test list (A-L) -- B/I/J/K/L land here since they ---
+# --- exercise this analog-orchestration module; A/C/D/E/F/G/H live in ----------------------
+# --- test_sandwave_morphometry.py alongside the reusable engine functions they test --------
+
+
+def test_mar017a_B_zero_canonical_tiles_yields_empty_well_formed_output_not_fake_rows():
+    empty_df = hhw.build_tile_spectral_table(Path("unused.zip"), "unused_grid", [], canonical=True)
+    assert empty_df.empty
+    assert list(empty_df.columns) == list(hhw.TILE_SPECTRAL_COLUMNS)
+
+
+def test_mar017a_I_exploratory_tiles_carry_noncanonical_semantics_through_selection():
+    df = pd.DataFrame(
+        [
+            {
+                "tile_id": "t1",
+                "tile_size_m": 250.0,
+                "directional_concentration": 0.9,
+                "spectral_peak_to_median_power_ratio": 5.0,
+                "dominant_wavelength_m": 100.0,
+                "meets_3_wavelengths_across_tile": False,
+                "rank_selected_top3": False,
+                "canonical_validation_eligible": False,
+                "reason": hhw.BELOW_MINIMUM_SPATIAL_SUPPORT,
+            },
+            {
+                "tile_id": "t2",
+                "tile_size_m": 250.0,
+                "directional_concentration": 0.5,
+                "spectral_peak_to_median_power_ratio": 2.0,
+                "dominant_wavelength_m": 90.0,
+                "meets_3_wavelengths_across_tile": False,
+                "rank_selected_top3": False,
+                "canonical_validation_eligible": False,
+                "reason": hhw.BELOW_MINIMUM_SPATIAL_SUPPORT,
+            },
+        ]
+    )
+    selected = hhw.select_exploratory_top_tiles(df, top_n=1)
+    # The lenient exploratory ranking must never erase or "promote" the noncanonical stamp.
+    assert selected["canonical_validation_eligible"].eq(False).all()
+    assert selected["reason"].eq(hhw.BELOW_MINIMUM_SPATIAL_SUPPORT).all()
+    assert selected[selected["rank_selected_top3"]]["tile_id"].tolist() == ["t1"]
+
+
+def test_mar017a_J_transfer_readiness_keeps_question_a_and_b_independent():
+    validated_contract = hhw.build_pipeline_transfer_contract(
+        hhw_canonical_2d_validation_status=hhw.CANONICALLY_VALIDATED,
+        hhw_detailed_bedform_validation_status=hhw.CANONICALLY_VALIDATED,
+    )
+    not_validated_contract = hhw.build_pipeline_transfer_contract(
+        hhw_canonical_2d_validation_status=hhw.HHW_CANONICAL_2D_TILE_VALIDATION_NOT_SUPPORTED,
+        hhw_detailed_bedform_validation_status=hhw.NOT_CANONICALLY_VALIDATED,
+    )
+    # Question A (generic engine readiness) never changes with the real-HHW validation outcome.
+    assert validated_contract["transfer_readiness"]["answer_A"] == "YES"
+    assert not_validated_contract["transfer_readiness"]["answer_A"] == "YES"
+    # Question B (real-HHW validation) DOES change, and is never collapsed into question A.
+    assert validated_contract["transfer_readiness"]["answer_B"] == "YES"
+    assert not_validated_contract["transfer_readiness"]["answer_B"] == "NO"
+
+
+def test_mar017a_K_cli_never_writes_exploratory_dataframes_into_canonical_outputs():
+    from marine_engine import cli
+
+    source = inspect.getsource(cli._cmd_build_analog_sandwave_morphometry)
+    tile_write_line = next(
+        line
+        for line in source.splitlines()
+        if "tile_spectral_path" in line and ".to_parquet" in line
+    )
+    assert "canonical_spectral_df" in tile_write_line
+    transect_write_line = next(
+        line for line in source.splitlines() if "transect_path" in line and ".to_parquet" in line
+    )
+    assert "canonical_transect_df" in transect_write_line
+    bedform_write_line = next(
+        line for line in source.splitlines() if "bedform_path" in line and ".to_parquet" in line
+    )
+    assert "canonical_bedform_df" in bedform_write_line
+
+
+def test_mar017a_L_pl854_evidence_flags_remain_false_after_the_repair():
+    contract = hhw.build_pipeline_transfer_contract(
+        hhw_canonical_2d_validation_status=hhw.HHW_CANONICAL_2D_TILE_VALIDATION_NOT_SUPPORTED,
+        hhw_detailed_bedform_validation_status=hhw.NOT_CANONICALLY_VALIDATED,
+    )
+    assert contract["pl854_evidence"] is False
+    assert contract["pl854_feature_input"] is False
+    assert contract["pl854_validation_input"] is False
+    assert contract["method_development_analog_only"] is True

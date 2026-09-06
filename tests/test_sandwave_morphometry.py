@@ -237,15 +237,118 @@ def test_L_uniformly_sparse_raster_yields_no_valid_tiles():
     assert meta["tile_size_used_m"] is None
 
 
-def test_L_a_dense_cluster_is_found_even_below_the_canonical_size():
+def test_L_a_dense_but_small_cluster_is_canonically_rejected_but_exploratory_found():
+    """MAR-017A: a genuinely dense patch too small for the canonical
+    >=1000 m floor must never be picked up by the CANONICAL search
+    (`find_valid_tiles` no longer cascades below 1000 m) -- only the
+    separate, explicitly-labelled exploratory search may find it."""
+
     valid = np.zeros((3000, 3000), dtype=bool)
-    valid[:300, :300] = True  # a genuinely dense 300x300 patch
+    valid[:300, :300] = True  # a genuinely dense 300x300 patch -- well below 1000 m
     transform = rasterio.transform.from_origin(500000.0, 5900000.0, PIXEL_SIZE_M, PIXEL_SIZE_M)
-    candidates, meta = swm.find_valid_tiles(
-        valid, PIXEL_SIZE_M, transform=transform, tile_size_m=2000.0, absolute_floor_m=100.0
+
+    canonical_candidates, canonical_meta = swm.find_valid_tiles(
+        valid, PIXEL_SIZE_M, transform=transform, tile_size_m=2000.0
     )
-    assert len(candidates) > 0
-    assert meta["tile_size_used_m"] <= 300.0
+    assert canonical_candidates == []
+    assert canonical_meta["tile_size_used_m"] is None
+
+    exploratory_candidates, exploratory_meta = swm.find_exploratory_small_support_tiles(
+        valid, PIXEL_SIZE_M, transform=transform, starting_size_m=500.0, absolute_floor_m=100.0
+    )
+    assert len(exploratory_candidates) > 0
+    assert exploratory_meta["tile_size_used_m"] <= 300.0
+
+
+# --- MAR-017A Section 15's own required test list (A-L) -- prefixed `mar017a_` to avoid ----
+# --- colliding with MAR-017 Section 29's unrelated A-L lettering above ---------------------
+
+
+def test_mar017a_A_canonical_search_cascades_to_1000m_but_never_further():
+    rng = np.random.default_rng(11)
+    valid = rng.random((3000, 3000)) < 0.30  # sparse everywhere...
+    valid[500:1500, 500:1500] = (
+        rng.random((1000, 1000)) < 0.96
+    )  # ...except one dense 1000x1000 block
+    transform = rasterio.transform.from_origin(500000.0, 5900000.0, PIXEL_SIZE_M, PIXEL_SIZE_M)
+    _candidates, meta = swm.find_valid_tiles(valid, PIXEL_SIZE_M, transform=transform)
+    sizes_tried = [entry["tile_size_m"] for entry in meta["cascade_log"]]
+    assert all(size >= swm.MIN_TILE_SIZE_M for size in sizes_tried)
+    assert meta["tile_size_used_m"] == swm.MIN_TILE_SIZE_M  # found only at the 1000 m floor
+
+
+def test_mar017a_B_zero_qualifying_tiles_yields_a_real_empty_list_not_fake_data():
+    valid_sparse = np.zeros((3000, 3000), dtype=bool)  # nothing valid anywhere
+    transform = rasterio.transform.from_origin(500000.0, 5900000.0, PIXEL_SIZE_M, PIXEL_SIZE_M)
+    candidates, meta = swm.find_valid_tiles(valid_sparse, PIXEL_SIZE_M, transform=transform)
+    assert candidates == []
+    assert meta["tile_size_used_m"] is None
+    assert all(entry["outcome"] != "OK" for entry in meta["cascade_log"])
+
+
+def test_mar017a_C_tile_at_2point9_wavelengths_is_not_eligible():
+    assert (
+        swm.meets_wavelengths_across_tile(dominant_wavelength_m=1000.0, tile_size_m=2900.0) is False
+    )
+
+
+def test_mar017a_D_tile_at_exactly_3point0_wavelengths_is_eligible():
+    assert (
+        swm.meets_wavelengths_across_tile(dominant_wavelength_m=1000.0, tile_size_m=3000.0) is True
+    )
+
+
+def test_mar017a_E_no_fallback_selects_an_ineligible_tile():
+    pool = [
+        {
+            "tile_id": "only_2.9x",
+            "tile_size_m": 2900.0,
+            "diagnostics": {
+                "dominant_wavelength_m": 1000.0,
+                "directional_concentration": 0.99,
+                "spectral_peak_to_median_power_ratio": 50.0,
+            },
+        },
+        {
+            "tile_id": "only_2.0x",
+            "tile_size_m": 2000.0,
+            "diagnostics": {
+                "dominant_wavelength_m": 1000.0,
+                "directional_concentration": 0.95,
+                "spectral_peak_to_median_power_ratio": 40.0,
+            },
+        },
+    ]
+    selected = swm.select_canonical_eligible_tiles(pool, top_n=3)
+    assert selected == []  # never forces a top_n pick from an all-ineligible pool
+
+
+def test_mar017a_F_a_21m_detected_feature_is_rejected_from_canonical_output():
+    bedforms = [
+        {"wavelength_m": 21.1, "wave_height_m": 0.3},
+        {"wavelength_m": 45.0, "wave_height_m": 1.2},
+    ]
+    canonical, rejected_count = swm.apply_canonical_wavelength_gate(bedforms)
+    assert [b["wavelength_m"] for b in canonical] == [45.0]
+    assert rejected_count == 1
+
+
+def test_mar017a_G_a_30m_feature_remains_eligible_at_the_exact_boundary():
+    bedforms = [{"wavelength_m": 30.0, "wave_height_m": 0.5}]
+    canonical, rejected_count = swm.apply_canonical_wavelength_gate(bedforms)
+    assert len(canonical) == 1
+    assert rejected_count == 0
+
+
+def test_mar017a_H_rejected_sub_cutoff_count_is_reported_not_dropped_silently():
+    bedforms = [
+        {"wavelength_m": 12.0, "wave_height_m": 0.1},
+        {"wavelength_m": 21.1, "wave_height_m": 0.3},
+        {"wavelength_m": 60.0, "wave_height_m": 1.5},
+    ]
+    canonical, rejected_count = swm.apply_canonical_wavelength_gate(bedforms)
+    assert len(canonical) == 1
+    assert rejected_count == 2
 
 
 # --- Shared: no forbidden downstream-modelling terms in this module's own vocabulary -------

@@ -1,4 +1,5 @@
-"""HHW CEND 11/11 sand-wave morphometry analog orchestration (MAR-017).
+"""HHW CEND 11/11 sand-wave morphometry analog orchestration (MAR-017 /
+MAR-017A).
 
 Analog-only semantics (Section 3) -- never PL854 evidence
 -------------------------------------------------------------
@@ -17,6 +18,28 @@ bathymetry product" and should be preferred. Which ONE of those four real
 grids is actually used is decided here at runtime by evaluating each
 one's own best-achievable tile validity (never assumed/hard-coded), using
 the SAME cascading tile search the engine itself uses.
+
+Canonical vs. exploratory outputs (MAR-017A Sections 3-4)
+-----------------------------------------------------------------
+An external review found the original MAR-017 run had cascaded the
+CANONICAL 2D tile search below the ticket's own >=1000 m floor (down to
+250 m) and had let 250 m-tile results populate the canonical validation
+outputs. This module now keeps two entirely separate pipelines:
+
+- CANONICAL: `build_tile_candidates` (the engine's restored, >=1000 m-only
+  `find_valid_tiles`) -> `tile_spectral_morphometry.parquet` -> STRICT
+  `>=3`-wavelengths-across-tile eligibility
+  (`swm.select_canonical_eligible_tiles`, no fallback) ->
+  `transect_morphometry.parquet` / `individual_bedforms.parquet` /
+  `detected_profile_extrema.gpkg`. For the real HHW dataset this
+  legitimately produces EMPTY tables (Section 2: "this is a valid
+  scientific result").
+- EXPLORATORY: `build_exploratory_tile_candidates` (the engine's separate
+  below-floor `find_exploratory_small_support_tiles`) ->
+  `exploratory_small_support_tile_diagnostics.parquet`, every row stamped
+  `canonical_validation_eligible=false`/
+  `reason=BELOW_MINIMUM_SPATIAL_SUPPORT`. Used only for the exploratory
+  figure -- never written into a canonical-schema parquet.
 """
 
 from datetime import UTC, datetime
@@ -48,6 +71,19 @@ ANALYSIS_DECIMATION = (
     2  # effective ~2 m/px scan for tile-candidate SEARCH; final tiles read at native res
 )
 
+# --- MAR-017A Section 4: exploratory-diagnostic vocabulary ---------------------------------
+EXPLORATORY_SMALL_SUPPORT_DIAGNOSTIC = "EXPLORATORY_SMALL_SUPPORT_DIAGNOSTIC"
+BELOW_MINIMUM_SPATIAL_SUPPORT = "BELOW_MINIMUM_SPATIAL_SUPPORT"
+
+# --- MAR-017A Section 8: explicit validation-status vocabulary -----------------------------
+IMPLEMENTED_AND_SYNTHETICALLY_VERIFIED = "IMPLEMENTED_AND_SYNTHETICALLY_VERIFIED"
+INSUFFICIENT_CONTINUOUS_SPATIAL_SUPPORT = "INSUFFICIENT_CONTINUOUS_SPATIAL_SUPPORT"
+NOT_CANONICALLY_VALIDATED = "NOT_CANONICALLY_VALIDATED"
+CANONICALLY_VALIDATED = "CANONICALLY_VALIDATED"
+HHW_CANONICAL_2D_TILE_VALIDATION_NOT_SUPPORTED = (
+    "HHW_CANONICAL_2D_TILE_VALIDATION_NOT_SUPPORTED_BY_AVAILABLE_COVERAGE"
+)
+
 TILE_INVENTORY_COLUMNS = (
     "tile_id",
     "grid_directory",
@@ -58,6 +94,11 @@ TILE_INVENTORY_COLUMNS = (
     "below_ticket_floor_1000m",
 )
 
+# Shared by both the CANONICAL (`tile_spectral_morphometry.parquet`) and EXPLORATORY
+# (`exploratory_small_support_tile_diagnostics.parquet`) tables -- `canonical_validation_
+# eligible`/`reason` are what tells them apart; a canonical row always has
+# `canonical_validation_eligible=true`/`reason=None`, an exploratory row always has
+# `false`/`BELOW_MINIMUM_SPATIAL_SUPPORT` (MAR-017A Section 4).
 TILE_SPECTRAL_COLUMNS = (
     "tile_id",
     "grid_directory",
@@ -74,6 +115,8 @@ TILE_SPECTRAL_COLUMNS = (
     "spectral_peak_to_median_power_ratio",
     "meets_3_wavelengths_across_tile",
     "rank_selected_top3",
+    "canonical_validation_eligible",
+    "reason",
     *ANALOG_ONLY_FLAGS.keys(),
     "scientific_role",
 )
@@ -91,6 +134,7 @@ TRANSECT_COLUMNS = (
     "pixel_size_m",
     "canonical_cutoff_m",
     "bedform_count_canonical",
+    "sub_cutoff_extrema_rejected_count",
     "median_wavelength_m_canonical",
     "median_wave_height_m_canonical",
     "filter_sensitivity_flags",
@@ -216,12 +260,26 @@ def read_native_window_by_center(
 def build_tile_candidates(
     zip_path: Path, grid_dir: str
 ) -> tuple[list[swm.TileCandidate], dict[str, Any]]:
-    """Section 11: the real, cascading tile search on the selected grid, at
-    a modest decimation for search-phase speed -- final analysis always
-    re-reads each candidate at NATIVE resolution (`read_native_window_by_center`)."""
+    """CANONICAL tile search (MAR-017A Section 3): tries only 2000 m then
+    1000 m, at a modest decimation for search-phase speed -- final
+    analysis always re-reads each candidate at NATIVE resolution
+    (`read_native_window_by_center`). Legitimately returns an empty list
+    if no >=1000 m tile meets the required valid fraction anywhere."""
 
     _data, valid, transform, pixel_size_m = _decimated_read(zip_path, grid_dir, ANALYSIS_DECIMATION)
     tiles, meta = swm.find_valid_tiles(valid, pixel_size_m, transform=transform)
+    return tiles, meta
+
+
+def build_exploratory_tile_candidates(
+    zip_path: Path, grid_dir: str
+) -> tuple[list[swm.TileCandidate], dict[str, Any]]:
+    """EXPLORATORY_SMALL_SUPPORT_DIAGNOSTIC (MAR-017A Section 4): the
+    separate below-canonical-floor cascade -- never used for canonical
+    validation outputs."""
+
+    _data, valid, transform, pixel_size_m = _decimated_read(zip_path, grid_dir, ANALYSIS_DECIMATION)
+    tiles, meta = swm.find_exploratory_small_support_tiles(valid, pixel_size_m, transform=transform)
     return tiles, meta
 
 
@@ -244,11 +302,15 @@ def build_tile_inventory_table(tiles: list[swm.TileCandidate], grid_dir: str) ->
 
 
 def build_tile_spectral_table(
-    zip_path: Path, grid_dir: str, tiles: list[swm.TileCandidate]
+    zip_path: Path, grid_dir: str, tiles: list[swm.TileCandidate], *, canonical: bool
 ) -> pd.DataFrame:
-    """Section 12/20: `tile_spectral_morphometry.parquet`, one row per
-    valid tile -- always re-reads each tile at NATIVE resolution before
-    any spectral processing."""
+    """Section 12/20: one row per valid tile -- always re-reads each tile
+    at NATIVE resolution before any spectral processing. `canonical=True`
+    stamps `canonical_validation_eligible=true`/`reason=None` (feeds
+    `tile_spectral_morphometry.parquet`); `canonical=False` stamps
+    `canonical_validation_eligible=false`/`reason=BELOW_MINIMUM_SPATIAL_
+    SUPPORT` (feeds `exploratory_small_support_tile_diagnostics.parquet`,
+    MAR-017A Section 4) -- the two are never mixed into the same file."""
 
     rows = []
     for tile in tiles:
@@ -276,6 +338,8 @@ def build_tile_spectral_table(
                 **diagnostics,
                 "meets_3_wavelengths_across_tile": meets_3wl,
                 "rank_selected_top3": False,
+                "canonical_validation_eligible": canonical,
+                "reason": None if canonical else BELOW_MINIMUM_SPATIAL_SUPPORT,
                 **ANALOG_ONLY_FLAGS,
                 "scientific_role": SCIENTIFIC_ROLE,
             }
@@ -286,23 +350,42 @@ def build_tile_spectral_table(
     return df[list(TILE_SPECTRAL_COLUMNS)]
 
 
-def select_top_tiles(tile_spectral_df: pd.DataFrame, *, top_n: int = 3) -> pd.DataFrame:
-    """Section 13: transparent ranking convenience only -- never a
-    scientific probability or bedform score. Prefers tiles that ALSO
-    satisfy the >=3-wavelengths-across-tile requirement where any exist,
-    but never silently drops every real candidate if none do (a real,
-    reportable limitation of this specific analog dataset's coverage)."""
+def select_canonical_top_tiles(tile_spectral_df: pd.DataFrame, *, top_n: int = 3) -> pd.DataFrame:
+    """MAR-017A Section 5: STRICT `tile_size_m/dominant_wavelength_m >=
+    3.0` eligibility -- NO fallback to an ineligible pool. If fewer than
+    `top_n` tiles qualify, only that many are selected; if none qualify,
+    none are selected (never forces `top_n`)."""
 
     if tile_spectral_df.empty:
         return tile_spectral_df
 
-    eligible = tile_spectral_df[tile_spectral_df["meets_3_wavelengths_across_tile"]]
-    pool = eligible if not eligible.empty else tile_spectral_df
-    ranked = pool.sort_values(
-        ["directional_concentration", "spectral_peak_to_median_power_ratio"],
-        ascending=[False, False],
-    )
-    top_ids = set(ranked.head(top_n)["tile_id"])
+    diagnostics_pool = [
+        {"tile_id": row["tile_id"], "tile_size_m": row["tile_size_m"], "diagnostics": row.to_dict()}
+        for _, row in tile_spectral_df.iterrows()
+    ]
+    selected = swm.select_canonical_eligible_tiles(diagnostics_pool, top_n=top_n)
+    top_ids = {d["tile_id"] for d in selected}
+    result = tile_spectral_df.copy()
+    result["rank_selected_top3"] = result["tile_id"].isin(top_ids)
+    return result
+
+
+def select_exploratory_top_tiles(tile_spectral_df: pd.DataFrame, *, top_n: int = 3) -> pd.DataFrame:
+    """A lenient (non-canonical) ranking used ONLY to pick which
+    exploratory tiles the exploratory diagnostic figures visualise --
+    these tiles are NEVER canonical-eligible (Section 5's strict
+    >=3-wavelengths test is a CANONICAL-selection concept only) and never
+    populate a canonical output (MAR-017A Section 4)."""
+
+    if tile_spectral_df.empty:
+        return tile_spectral_df
+
+    diagnostics_pool = [
+        {"tile_id": row["tile_id"], "diagnostics": row.to_dict()}
+        for _, row in tile_spectral_df.iterrows()
+    ]
+    selected = swm.rank_and_select_top_tiles(diagnostics_pool, top_n=top_n)
+    top_ids = {d["tile_id"] for d in selected}
     result = tile_spectral_df.copy()
     result["rank_selected_top3"] = result["tile_id"].isin(top_ids)
     return result
@@ -311,9 +394,15 @@ def select_top_tiles(tile_spectral_df: pd.DataFrame, *, top_n: int = 3) -> pd.Da
 def build_transect_and_bedform_tables(
     zip_path: Path, grid_dir: str, top_tiles_df: pd.DataFrame
 ) -> tuple[pd.DataFrame, pd.DataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """Sections 14-21: three cross-crest transects per selected tile, the
-    canonical (30 m) bedform detection plus 20/40 m filter-sensitivity QA,
-    and the transect-based crest/trough point layers."""
+    """Sections 14-21: three cross-crest transects per selected tile
+    (`top_tiles_df` rows with `rank_selected_top3=True`), bedform
+    detection through the explicit 30 m wavelength gate
+    (`swm.apply_canonical_wavelength_gate`) plus 20/40 m filter-
+    sensitivity QA, and the transect-based crest/trough point layers.
+    Generic over its `top_tiles_df` input -- works identically whether
+    given CANONICAL (>=1000 m) or EXPLORATORY (<1000 m) selected tiles;
+    the caller decides which schema/file the result is written to
+    (MAR-017A Sections 3-4)."""
 
     transect_rows: list[dict[str, Any]] = []
     bedform_rows: list[dict[str, Any]] = []
@@ -347,6 +436,7 @@ def build_transect_and_bedform_tables(
                         "pixel_size_m": None,
                         "canonical_cutoff_m": swm.CANONICAL_SHORT_WAVELENGTH_CUTOFF_M,
                         "bedform_count_canonical": None,
+                        "sub_cutoff_extrema_rejected_count": None,
                         "median_wavelength_m_canonical": None,
                         "median_wave_height_m_canonical": None,
                         "filter_sensitivity_flags": "EXCLUDED_INSUFFICIENT_VALID_DATA",
@@ -370,7 +460,18 @@ def build_transect_and_bedform_tables(
             filtered_canonical = swm.low_pass_filter_profile(
                 detrended, pixel_size_m, swm.CANONICAL_SHORT_WAVELENGTH_CUTOFF_M
             )
-            bedforms = swm.compute_bedform_morphometrics(detrended, filtered_canonical, distances_m)
+            detected_bedforms = swm.compute_bedform_morphometrics(
+                detrended, filtered_canonical, distances_m
+            )
+            # MAR-017A Section 6/7: the Butterworth filter attenuates rather than
+            # mathematically zeroes sub-cutoff content -- a real run demonstrated a
+            # detected 21.1 m trough-to-trough feature surviving a nominal 30 m filter.
+            # This explicit hard gate enforces the canonical minimum wavelength; anything
+            # rejected is counted (`sub_cutoff_extrema_rejected_count`), never silently
+            # dropped.
+            bedforms, sub_cutoff_rejected_count = swm.apply_canonical_wavelength_gate(
+                detected_bedforms
+            )
             sensitivity = swm.run_filter_sensitivity_qa(detrended, distances_m, pixel_size_m)
 
             for i, bedform in enumerate(bedforms):
@@ -424,6 +525,7 @@ def build_transect_and_bedform_tables(
                     "pixel_size_m": pixel_size_m,
                     "canonical_cutoff_m": swm.CANONICAL_SHORT_WAVELENGTH_CUTOFF_M,
                     "bedform_count_canonical": len(bedforms),
+                    "sub_cutoff_extrema_rejected_count": sub_cutoff_rejected_count,
                     "median_wavelength_m_canonical": (
                         float(np.median([b["wavelength_m"] for b in bedforms]))
                         if bedforms
@@ -580,7 +682,10 @@ def get_method_figure_inputs(
             filtered = swm.low_pass_filter_profile(
                 detrended, 1.0, swm.CANONICAL_SHORT_WAVELENGTH_CUTOFF_M
             )
-            bedforms = swm.compute_bedform_morphometrics(detrended, filtered, distances_m)
+            detected_bedforms = swm.compute_bedform_morphometrics(detrended, filtered, distances_m)
+            # MAR-017A Section 6: the same explicit hard gate as the canonical table --
+            # never display a sub-30 m detected extremum as a sand-wave-scale bedform.
+            bedforms, _rejected = swm.apply_canonical_wavelength_gate(detected_bedforms)
             profile_data = {
                 "profile_distances_m": distances_m,
                 "profile_raw_detrended": detrended,
@@ -616,13 +721,136 @@ def _spatial_short_wavelength_filter(residual: np.ndarray, pixel_size_m: float) 
     return np.real(np.fft.ifft2(spectrum))
 
 
-# --- Section 25: pipeline-transfer contract -------------------------------------------------
+# --- MAR-017A Section 14: next-analog candidate (identified, NOT processed here) ----------
+
+NEXT_ANALOG_CANDIDATE: dict[str, Any] = {
+    "name": "Processed bathymetry from Inner Dowsing, Race Bank and North Ridge cSAC",
+    "custodian": "Joint Nature Conservation Committee (JNCC) / Cefas",
+    "cruise_id": "CEND 11/11",
+    "expected_resource": "IDRBNR-Bathy.zip",
+    "licence": "UK Open Government Licence (OGL)",
+    "reason_for_candidacy": (
+        "Same survey programme as HHW (CEND 11/11), but a distinct geographic product that "
+        "may have different coverage geometry."
+    ),
+    "downloaded_or_processed_in_mar017a": False,
+}
+
+ALTERNATIVE_ANALOG_CANDIDATES_FROM_MAR016: tuple[dict[str, Any], ...] = (
+    {
+        "name": "East Coast Regional Environmental Characterisation (ECREC)",
+        "custodian": "Cefas",
+        "access_class": "OPEN_DIRECT_DOWNLOAD",
+    },
+    {
+        "name": "Inner Dowsing, Race Bank & North Ridge cSAC -- Processed Bathymetry",
+        "custodian": "JNCC / Cefas",
+        "access_class": "OPEN_DIRECT_DOWNLOAD",
+    },
+    {
+        "name": "Sheringham Shoal Offshore Wind Farm bathymetric survey",
+        "custodian": "Fugro EMU Ltd (for Scira Offshore Energy Ltd)",
+        "access_class": "ACCESS_UNKNOWN",
+    },
+)
 
 
-def build_pipeline_transfer_contract() -> dict[str, Any]:
+def build_analog_validation_gap_report(
+    *,
+    canonical_cascade_log: list[dict[str, Any]],
+    exploratory_cascade_log: list[dict[str, Any]],
+    canonical_tile_count: int,
+    exploratory_tile_count: int,
+    any_canonical_tile_meets_3_wavelengths: bool,
+) -> dict[str, Any]:
+    """MAR-017A Section 13: `analog_validation_gap.json` -- every field
+    derived from the REAL cascade logs of this run, never hard-coded."""
+
+    max_valid_fraction_by_tile_size_m: dict[str, float] = {}
+    for entry in (*canonical_cascade_log, *exploratory_cascade_log):
+        frac = entry.get("best_achieved_valid_fraction")
+        if frac is not None:
+            size_key = str(entry["tile_size_m"])
+            max_valid_fraction_by_tile_size_m[size_key] = max(
+                max_valid_fraction_by_tile_size_m.get(size_key, 0.0), frac
+            )
+
     return {
         "scientific_role": SCIENTIFIC_ROLE,
         **ANALOG_ONLY_FLAGS,
+        "why_hhw_fails_canonical_support": (
+            "HHW's processed bathymetry is genuinely sparse/swath-like: no square tile "
+            ">=1000 m anywhere in the selected primary grid reaches the required 90% "
+            "valid-data fraction. This is a real, demonstrated property of this dataset's "
+            "coverage, not a bug."
+        ),
+        "max_valid_fraction_by_tile_size_m": max_valid_fraction_by_tile_size_m,
+        "canonical_tile_count": canonical_tile_count,
+        "exploratory_tile_count": exploratory_tile_count,
+        "any_canonical_tile_meets_3_wavelengths_condition": any_canonical_tile_meets_3_wavelengths,
+        "recommended_next_analog_dataset_properties": [
+            "contiguous gridded bathymetry",
+            ">=1000 m square area with >=90% valid data",
+            "native resolution sufficient to resolve >=30 m bedforms",
+            "preferably multiple kilometres of natural seabed",
+            "no large anthropogenic structures dominating the analysis area",
+        ],
+        "next_analog_candidate_identified_not_processed": NEXT_ANALOG_CANDIDATE,
+        "alternative_analog_candidates_from_mar016": list(
+            ALTERNATIVE_ANALOG_CANDIDATES_FROM_MAR016
+        ),
+        "generated_at_utc": datetime.now(UTC).isoformat(),
+    }
+
+
+# --- Section 25: pipeline-transfer contract -------------------------------------------------
+
+
+def build_pipeline_transfer_contract(
+    *,
+    hhw_canonical_2d_validation_status: str,
+    hhw_detailed_bedform_validation_status: str,
+) -> dict[str, Any]:
+    """MAR-017A Sections 8-9: three explicit status fields and the
+    transfer-readiness question split into two SEPARATE questions that
+    must never be collapsed into one. The two HHW-specific statuses are
+    passed in by the caller, derived from the REAL run's own tile/bedform
+    counts -- never hard-coded here."""
+
+    return {
+        "scientific_role": SCIENTIFIC_ROLE,
+        **ANALOG_ONLY_FLAGS,
+        "core_engine_implementation_status": IMPLEMENTED_AND_SYNTHETICALLY_VERIFIED,
+        "hhw_canonical_2d_validation_status": hhw_canonical_2d_validation_status,
+        "hhw_detailed_bedform_validation_status": hhw_detailed_bedform_validation_status,
+        "transfer_readiness": {
+            "question_A": (
+                "IS THE SCIENTIFIC CORE IMPLEMENTED GENERICALLY FOR A FUTURE PL854 "
+                "HIGH-RESOLUTION RASTER?"
+            ),
+            "answer_A": "YES",
+            "answer_A_explanation": (
+                "The reusable engine (marine_engine.morphology.sandwave_morphometry) never "
+                "references an HHW-specific identifier or coordinate (verified by source "
+                "inspection) and operates only on an arbitrary raster + geometry + metre-scale "
+                "parameters; its full pipeline is synthetically verified against known "
+                "sinusoidal DEMs/profiles."
+            ),
+            "question_B": (
+                "HAS THE FULL CANONICAL REAL-DATA MORPHOMETRY WORKFLOW BEEN VALIDATED ON HHW "
+                "UNDER ITS OWN SUPPORT REQUIREMENTS?"
+            ),
+            "answer_B": "NO"
+            if hhw_canonical_2d_validation_status != CANONICALLY_VALIDATED
+            else "YES",
+            "answer_B_explanation": (
+                "HHW's real coverage does not provide a single >=1000 m, >=90%-valid tile, so "
+                "the canonical 2D tile validation and canonical detailed-bedform validation "
+                "protocols could not be exercised on real data -- this is a demonstrated "
+                "property of THIS analog dataset, never a defect of the engine itself "
+                "(question A)."
+            ),
+        },
         "required_inputs_for_a_future_pl854_survey": [
             "gridded bathymetry, or a point cloud convertible to a regular grid",
             "known horizontal CRS",

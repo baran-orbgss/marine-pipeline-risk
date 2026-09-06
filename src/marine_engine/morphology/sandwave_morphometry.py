@@ -26,6 +26,29 @@ crest/trough is always read back from the UNFILTERED, detrended profile
 at that position, never the filtered value itself (which is deliberately
 smoothed/attenuated).
 
+Filter semantics: attenuation, not a hard zero (MAR-017A Section 7)
+--------------------------------------------------------------------------
+The 30 m cutoff used throughout is a spectral ATTENUATION scale (a
+zero-phase Butterworth low-pass) -- it does not mathematically guarantee
+every sub-cutoff wavelength vanishes from the detected extrema. A real
+run demonstrated a detected 21.1 m trough-to-trough feature surviving a
+nominal 30 m filter. The CANONICAL bedform output therefore always
+applies an explicit, separate hard gate afterward
+(`apply_canonical_wavelength_gate`): any detected bedform with
+`wavelength_m < 30` is excluded from the canonical output and counted,
+never silently dropped.
+
+Canonical tile-size floor is never lowered to force a result
+--------------------------------------------------------------------
+`find_valid_tiles` (the CANONICAL 2D validation path) tries only 2000 m
+then 1000 m -- if neither meets the required valid-data fraction
+anywhere, it returns an EMPTY candidate list. That is a correct
+scientific result for a dataset with insufficient continuous spatial
+support, never a bug to paper over by shrinking the floor. A SEPARATE,
+explicitly-labelled `find_exploratory_small_support_tiles` cascades below
+that floor for diagnostic purposes only -- its results must never be
+presented as canonical validation.
+
 References (Section 27)
 ---------------------------
 Knaapen, M.A.F. (2005). Sandwave migration predictor based on shape
@@ -275,23 +298,20 @@ def find_valid_tiles(
     min_tile_size_m: float = MIN_TILE_SIZE_M,
     min_valid_fraction: float = MIN_VALID_FRACTION,
     step_fraction: float = 0.5,
-    absolute_floor_m: float = 100.0,
 ) -> tuple[list[TileCandidate], dict[str, Any]]:
-    """Section 11: search fixed-size candidate tiles for >=`min_valid_
-    fraction`. Cascades tile size DOWN (2000 -> ... -> `min_tile_size_m`)
-    if the canonical size finds nothing; if even `min_tile_size_m` finds
-    nothing, continues cascading toward `absolute_floor_m` and reports
-    this honestly rather than silently forcing a fake pass or returning
-    an empty pipeline (Section 19's "do not hide instability" applied
-    here too)."""
+    """CANONICAL 2D tile search (MAR-017A Section 3): tries `tile_size_m`
+    (2000 m) then cascades DOWN only as far as `min_tile_size_m` (1000 m)
+    -- NEVER further. If no tile at >=1000 m meets >=`min_valid_fraction`,
+    returns an EMPTY candidate list. That is a correct, expected
+    scientific result for a dataset with insufficient continuous spatial
+    support, never a bug to work around by shrinking the floor (this
+    module never names a specific caller dataset -- Section 25). See
+    `find_exploratory_small_support_tiles` for the separate, clearly-
+    labelled below-floor diagnostic path."""
 
     sizes_to_try = []
     size = tile_size_m
     while size >= min_tile_size_m:
-        sizes_to_try.append(size)
-        size /= 2.0
-    size = min_tile_size_m / 2.0
-    while size >= absolute_floor_m:
         sizes_to_try.append(size)
         size /= 2.0
 
@@ -355,6 +375,87 @@ def find_valid_tiles(
     return [], {"cascade_log": cascade_log, "tile_size_used_m": None, "below_ticket_floor": None}
 
 
+def find_exploratory_small_support_tiles(
+    valid: np.ndarray,
+    pixel_size_m: float,
+    *,
+    transform,
+    starting_size_m: float = 500.0,
+    min_valid_fraction: float = MIN_VALID_FRACTION,
+    step_fraction: float = 0.5,
+    absolute_floor_m: float = 100.0,
+) -> tuple[list[TileCandidate], dict[str, Any]]:
+    """EXPLORATORY_SMALL_SUPPORT_DIAGNOSTIC (MAR-017A Section 4): the
+    below-canonical-floor cascade (`starting_size_m` down to
+    `absolute_floor_m`) that the original MAR-017 implementation
+    mistakenly used for CANONICAL validation. Kept only as a clearly
+    separate, explicitly-labelled diagnostic path -- callers must never
+    feed these tiles into a canonical validation output, and must stamp
+    every one with `canonical_validation_eligible=false` and
+    `reason=BELOW_MINIMUM_SPATIAL_SUPPORT`."""
+
+    sizes_to_try = []
+    size = starting_size_m
+    while size >= absolute_floor_m:
+        sizes_to_try.append(size)
+        size /= 2.0
+
+    cascade_log: list[dict[str, Any]] = []
+    for candidate_size_m in sizes_to_try:
+        tile_size_px = max(int(round(candidate_size_m / pixel_size_m)), 1)
+        if tile_size_px > valid.shape[0] or tile_size_px > valid.shape[1]:
+            cascade_log.append(
+                {"tile_size_m": candidate_size_m, "outcome": "TOO_LARGE_FOR_RASTER_EXTENT"}
+            )
+            continue
+        frac_grid = compute_valid_fraction_grid(valid, tile_size_px)
+        if frac_grid.size == 0:
+            cascade_log.append(
+                {"tile_size_m": candidate_size_m, "outcome": "TOO_LARGE_FOR_RASTER_EXTENT"}
+            )
+            continue
+        best_achieved = float(frac_grid.max())
+        passing = np.argwhere(frac_grid >= min_valid_fraction)
+        cascade_log.append(
+            {
+                "tile_size_m": candidate_size_m,
+                "best_achieved_valid_fraction": best_achieved,
+                "passing_tile_count": int(len(passing)),
+                "outcome": "OK" if len(passing) > 0 else "NO_TILE_MET_THRESHOLD",
+            }
+        )
+        if len(passing) == 0:
+            continue
+
+        step_px = max(int(tile_size_px * step_fraction), 1)
+        seen_origins: set[tuple[int, int]] = set()
+        candidates: list[TileCandidate] = []
+        for row_px, col_px in passing:
+            snapped = (int(row_px) // step_px * step_px, int(col_px) // step_px * step_px)
+            if snapped in seen_origins:
+                continue
+            seen_origins.add(snapped)
+            row0, col0 = int(row_px), int(col_px)
+            center_col = col0 + tile_size_px / 2.0
+            center_row = row0 + tile_size_px / 2.0
+            center_x, center_y = transform * (center_col, center_row)
+            candidates.append(
+                TileCandidate(
+                    tile_id=f"tile_{row0}_{col0}_{tile_size_px}",
+                    row_origin_px=row0,
+                    col_origin_px=col0,
+                    tile_size_px=tile_size_px,
+                    tile_size_m=candidate_size_m,
+                    valid_fraction=float(frac_grid[row_px, col_px]),
+                    center_x_m=float(center_x),
+                    center_y_m=float(center_y),
+                )
+            )
+        return candidates, {"cascade_log": cascade_log, "tile_size_used_m": candidate_size_m}
+
+    return [], {"cascade_log": cascade_log, "tile_size_used_m": None}
+
+
 # --- Section 13: transparent, non-scoring tile ranking (a method-development convenience) --
 
 
@@ -383,6 +484,31 @@ def meets_wavelengths_across_tile(
     min_wavelengths: int = MIN_WAVELENGTHS_ACROSS_TILE,
 ) -> bool:
     return tile_size_m >= min_wavelengths * dominant_wavelength_m
+
+
+def select_canonical_eligible_tiles(
+    tile_diagnostics: list[dict[str, Any]],
+    *,
+    top_n: int = 3,
+    min_wavelengths: int = MIN_WAVELENGTHS_ACROSS_TILE,
+) -> list[dict[str, Any]]:
+    """MAR-017A Section 5: STRICT `tile_size_m / dominant_wavelength_m >=
+    3.0` eligibility for CANONICAL tile selection -- NO fallback to an
+    ineligible pool. Each `tile_diagnostics` entry must provide
+    `tile_size_m` and `diagnostics["dominant_wavelength_m"]`. Returns only
+    the tiles that qualify (ranked by `rank_and_select_top_tiles`), up to
+    `top_n` -- if fewer than `top_n` qualify, returns only that many; if
+    none qualify, returns an empty list. Never forces `top_n` by including
+    an ineligible tile."""
+
+    eligible = [
+        d
+        for d in tile_diagnostics
+        if meets_wavelengths_across_tile(
+            d["diagnostics"]["dominant_wavelength_m"], d["tile_size_m"], min_wavelengths
+        )
+    ]
+    return rank_and_select_top_tiles(eligible, top_n=top_n)
 
 
 # --- Section 14: cross-crest transects ------------------------------------------------------
@@ -544,6 +670,23 @@ def compute_bedform_morphometrics(
             }
         )
     return bedforms
+
+
+def apply_canonical_wavelength_gate(
+    bedforms: list[dict[str, Any]], cutoff_m: float = CANONICAL_SHORT_WAVELENGTH_CUTOFF_M
+) -> tuple[list[dict[str, Any]], int]:
+    """MAR-017A Section 6/7: the zero-phase Butterworth low-pass is a
+    spectral ATTENUATION scale, not a mathematical guarantee that every
+    sub-cutoff extremum vanishes -- a real run demonstrated a detected
+    21.1 m trough-to-trough feature surviving a nominal 30 m filter. This
+    explicit post-detection gate enforces `wavelength_m >= cutoff_m` for
+    the CANONICAL sand-wave-scale bedform output. Rejected bedforms are
+    counted, never silently dropped -- track the returned count as
+    `SUB_CUTOFF_EXTREMUM_REJECTED` QA."""
+
+    canonical = [b for b in bedforms if b["wavelength_m"] >= cutoff_m]
+    rejected_count = len(bedforms) - len(canonical)
+    return canonical, rejected_count
 
 
 def compute_crest_to_crest_spacing(

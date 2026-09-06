@@ -107,12 +107,17 @@ def render_method_figure(
     bedforms: list[dict[str, Any]],
     output_path: Path,
     title: str = "HHW CEND 11/11 -- Sand-Wave Morphometry Method",
+    subtitle: str | None = None,
     dpi: int = 150,
 ) -> Path:
     """Section 22: panels A (native bathymetry), B (filtered/detrended
     sand-wave surface), C (crest orientation + 3 transects), D (one
     representative profile with detected crests/troughs/wavelength/
-    height) -- for the single highest-ranked candidate tile."""
+    height) -- for the single highest-ranked candidate tile. `subtitle`
+    (MAR-017A Section 12) makes exploratory/below-canonical-floor results
+    visually unmistakable -- pass e.g. "Exploratory 250 m support -- below
+    canonical >=1000 m validation floor" whenever this figure is NOT
+    canonical validation."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(2, 2, figsize=(14.0, 12.0))
@@ -196,6 +201,17 @@ def render_method_figure(
     ax_d.grid(True, alpha=0.3)
 
     fig.suptitle(title, fontsize=14, fontweight="bold")
+    if subtitle:
+        fig.text(
+            0.5,
+            0.955,
+            subtitle,
+            ha="center",
+            va="top",
+            fontsize=10.5,
+            color="tab:red",
+            fontweight="bold",
+        )
     fig.text(
         0.01,
         0.01,
@@ -220,11 +236,15 @@ def render_bedform_distribution_figure(
     bedforms_df: pd.DataFrame,
     output_path: Path,
     title: str = "HHW CEND 11/11 -- Detected Bedform Distributions",
+    subtitle: str | None = None,
     dpi: int = 150,
 ) -> Path:
     """Section 23: wavelength/wave-height/asymmetry distributions across
     only the successfully-detected complete bedforms -- no predictive
-    distribution is ever fitted."""
+    distribution is ever fitted. `subtitle` (MAR-017A Section 12) must
+    say EXPLORATORY whenever `bedforms_df` did not come from canonical
+    (>=1000 m, >=90%-valid) tiles -- an exploratory n must never be
+    presented as an accepted site bedform distribution."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.5))
@@ -243,6 +263,17 @@ def render_bedform_distribution_figure(
         ax.grid(True, alpha=0.3)
 
     fig.suptitle(title, fontsize=13, fontweight="bold")
+    if subtitle:
+        fig.text(
+            0.5,
+            0.90,
+            subtitle,
+            ha="center",
+            va="top",
+            fontsize=10,
+            color="tab:red",
+            fontweight="bold",
+        )
     fig.text(
         0.01,
         0.01,
@@ -253,7 +284,7 @@ def render_bedform_distribution_figure(
         fontsize=8,
         color="0.2",
     )
-    fig.tight_layout(rect=(0, 0.05, 1, 0.94))
+    fig.tight_layout(rect=(0, 0.05, 1, 0.88 if subtitle else 0.94))
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return output_path
@@ -271,11 +302,19 @@ def render_dominant_bedform_scale_map(
     tile_size_m: float,
     output_path: Path,
     title: str = "HHW CEND 11/11 -- Dominant Bedform Scale",
+    subtitle: str | None = None,
+    canonical_unavailable_message: str | None = None,
     dpi: int = 150,
 ) -> Path:
     """Section 24: candidate tiles over the background bathymetry, coloured
     by `dominant_wavelength_m`, with an orientation glyph for
-    `dominant_crest_azimuth_deg`. No risk/hazard/freespan language."""
+    `dominant_crest_azimuth_deg`. No risk/hazard/freespan language.
+    `subtitle` labels the plotted set as exploratory when applicable
+    (MAR-017A Section 12); `canonical_unavailable_message`, when given,
+    is displayed prominently INSTEAD of ever silently plotting exploratory
+    points as if they were canonical (Section 12: "if canonical tile set
+    is empty: state this visibly rather than plotting exploratory points
+    as canonical")."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(11.0, 9.0))
@@ -352,9 +391,27 @@ def render_dominant_bedform_scale_map(
         ax.set_xlim(max(xmin, background_extent_m[0]), min(xmax, background_extent_m[1]))
         ax.set_ylim(max(ymin, background_extent_m[2]), min(ymax, background_extent_m[3]))
 
-    ax.set_title(title, fontsize=13, fontweight="bold")
     ax.set_xlabel("Easting (m)")
     ax.set_ylabel("Northing (m)")
+    # A figure-level suptitle (not ax.set_title) so its position is independent of how
+    # tight_layout resizes the axes below -- ax.set_title is pinned to the axes' own edge,
+    # which collided with the fig-level message text once the axes were shrunk to make room
+    # for it (MAR-017A: this message must be prominent and legible, never overlapping the
+    # plot title, and never leaving a large blank gap either).
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    message = canonical_unavailable_message or subtitle
+    if message:
+        fig.text(
+            0.5,
+            0.94,
+            message,
+            ha="center",
+            va="top",
+            fontsize=10.5 if canonical_unavailable_message else 10,
+            color="tab:red",
+            fontweight="bold",
+            transform=fig.transFigure,
+        )
     fig.text(
         0.01,
         0.01,
@@ -367,7 +424,8 @@ def render_dominant_bedform_scale_map(
         color="0.2",
         transform=fig.transFigure,
     )
-    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    top = 0.88 if message else 0.94
+    fig.tight_layout(rect=(0, 0.04, 1, top))
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return output_path

@@ -4414,13 +4414,18 @@ def _cmd_inventory_highres_seabed_data(args: argparse.Namespace) -> int:
 
 
 def _cmd_build_analog_sandwave_morphometry(args: argparse.Namespace) -> int:
-    """MAR-017: builds and validates the reusable high-resolution sand-wave
-    morphometry engine on the real, open HHW CEND 11/11 analog dataset --
-    never PL854 evidence. The PL854 config is used only for project
-    paths/conventions; every output lives under
+    """MAR-017 / MAR-017A: builds and validates the reusable high-
+    resolution sand-wave morphometry engine on the real, open HHW CEND
+    11/11 analog dataset -- never PL854 evidence. The PL854 config is
+    used only for project paths/conventions; every output lives under
     `data/processed/analogs/hhw_cend1111/`, never a PL854 feature/
     validation layer. The one live step is the official ZIP download,
     which is cached and skipped on subsequent runs.
+
+    MAR-017A keeps CANONICAL (>=1000 m, >=90%-valid, >=3-wavelengths-
+    eligible) and EXPLORATORY (below that floor) outputs strictly
+    separate -- canonical outputs are legitimately empty for this real
+    dataset (Section 2: "this is a valid scientific result").
     """
 
     config = load_study_config(args.config)
@@ -4465,93 +4470,225 @@ def _cmd_build_analog_sandwave_morphometry(args: argparse.Namespace) -> int:
         output_path=maps_dir / "hhw_native_bathymetry_overview.png",
     )
 
-    print("Searching for valid analysis tiles (Section 11, cascading tile size)...")
-    tiles, tile_search_meta = hhw_analog.build_tile_candidates(zip_path, grid_dir)
-    print(
-        f"  tile size used: {tile_search_meta['tile_size_used_m']} m "
-        f"(below the ticket's 1000 m floor: {tile_search_meta['below_ticket_floor']}), "
-        f"{len(tiles)} candidate tile(s)"
-    )
-    for entry in tile_search_meta["cascade_log"]:
+    # --- CANONICAL 2D tile search (MAR-017A Section 3): >=1000 m only, never lower --------
+    print("Searching for CANONICAL analysis tiles (>=1000 m, >=90% valid, Section 3)...")
+    canonical_tiles, canonical_search_meta = hhw_analog.build_tile_candidates(zip_path, grid_dir)
+    print(f"  {len(canonical_tiles)} canonical candidate tile(s)")
+    for entry in canonical_search_meta["cascade_log"]:
         print(f"    {entry}")
 
-    print("Running 2D spectral bedform diagnostics per tile (Section 12)...")
-    tile_spectral_df = hhw_analog.build_tile_spectral_table(zip_path, grid_dir, tiles)
+    canonical_spectral_df = hhw_analog.build_tile_spectral_table(
+        zip_path, grid_dir, canonical_tiles, canonical=True
+    )
+    canonical_spectral_df = hhw_analog.select_canonical_top_tiles(canonical_spectral_df, top_n=3)
     tile_spectral_path = analog_dir / "tile_spectral_morphometry.parquet"
-    tile_spectral_df.to_parquet(tile_spectral_path, index=False)
-    print(f"  {len(tile_spectral_df)} tile(s) analyzed -> {tile_spectral_path}")
+    canonical_spectral_df.to_parquet(tile_spectral_path, index=False)
+    canonical_selected_ids = (
+        canonical_spectral_df[canonical_spectral_df["rank_selected_top3"]]["tile_id"].tolist()
+        if not canonical_spectral_df.empty
+        else []
+    )
+    print(
+        f"  {len(canonical_spectral_df)} canonical tile(s) analyzed, "
+        f"{len(canonical_selected_ids)} strictly >=3-wavelengths-eligible -> {tile_spectral_path}"
+    )
 
-    top_tiles_df = hhw_analog.select_top_tiles(tile_spectral_df, top_n=3)
-    tile_spectral_df = top_tiles_df
-    tile_spectral_df.to_parquet(tile_spectral_path, index=False)
-    selected_tile_ids = tile_spectral_df[tile_spectral_df["rank_selected_top3"]]["tile_id"].tolist()
-    print(f"  top {len(selected_tile_ids)} selected: {selected_tile_ids}")
-
-    print("Generating cross-crest transects + bedform detection (Sections 14-21)...")
-    transect_df, bedform_df, crests_gdf, troughs_gdf = hhw_analog.build_transect_and_bedform_tables(
-        zip_path, grid_dir, top_tiles_df
+    canonical_transect_df, canonical_bedform_df, canonical_crests_gdf, canonical_troughs_gdf = (
+        hhw_analog.build_transect_and_bedform_tables(zip_path, grid_dir, canonical_spectral_df)
     )
     transect_path = analog_dir / "transect_morphometry.parquet"
-    transect_df.to_parquet(transect_path, index=False)
+    canonical_transect_df.to_parquet(transect_path, index=False)
     bedform_path = analog_dir / "individual_bedforms.parquet"
-    bedform_df.to_parquet(bedform_path, index=False)
-    print(f"  {len(transect_df)} transect(s) -> {transect_path}")
-    print(f"  {len(bedform_df)} individual bedform(s) -> {bedform_path}")
+    canonical_bedform_df.to_parquet(bedform_path, index=False)
+    print(f"  {len(canonical_transect_df)} canonical transect(s) -> {transect_path}")
+    print(f"  {len(canonical_bedform_df)} canonical individual bedform(s) -> {bedform_path}")
 
     extrema_path = analog_dir / "detected_profile_extrema.gpkg"
-    if not crests_gdf.empty:
-        crests_gdf.to_file(extrema_path, layer="detected_crests", driver="GPKG")
-    if not troughs_gdf.empty:
-        troughs_gdf.to_file(extrema_path, layer="detected_troughs", driver="GPKG")
-    print(f"  crest/trough point layers -> {extrema_path}")
+    if extrema_path.exists():
+        extrema_path.unlink()
+    if not canonical_crests_gdf.empty:
+        canonical_crests_gdf.to_file(extrema_path, layer="detected_crests", driver="GPKG")
+    if not canonical_troughs_gdf.empty:
+        canonical_troughs_gdf.to_file(extrema_path, layer="detected_troughs", driver="GPKG")
+    print(f"  canonical crest/trough point layers -> {extrema_path}")
 
+    # --- EXPLORATORY_SMALL_SUPPORT_DIAGNOSTIC (MAR-017A Section 4): below the canonical ----
+    # --- floor, never used to populate a canonical output ----------------------------------
+    print("Searching for EXPLORATORY small-support diagnostic tiles (Section 4)...")
+    exploratory_tiles, exploratory_search_meta = hhw_analog.build_exploratory_tile_candidates(
+        zip_path, grid_dir
+    )
+    print(
+        f"  tile size used: {exploratory_search_meta['tile_size_used_m']} m, "
+        f"{len(exploratory_tiles)} exploratory candidate tile(s)"
+    )
+    for entry in exploratory_search_meta["cascade_log"]:
+        print(f"    {entry}")
+
+    exploratory_spectral_df = hhw_analog.build_tile_spectral_table(
+        zip_path, grid_dir, exploratory_tiles, canonical=False
+    )
+    exploratory_spectral_df = hhw_analog.select_exploratory_top_tiles(
+        exploratory_spectral_df, top_n=3
+    )
+    exploratory_tile_path = analog_dir / "exploratory_small_support_tile_diagnostics.parquet"
+    exploratory_spectral_df.to_parquet(exploratory_tile_path, index=False)
+    print(
+        f"  {len(exploratory_spectral_df)} exploratory tile(s) analyzed -> {exploratory_tile_path}"
+    )
+
+    exploratory_transect_df, exploratory_bedform_df, _exp_crests_gdf, _exp_troughs_gdf = (
+        hhw_analog.build_transect_and_bedform_tables(zip_path, grid_dir, exploratory_spectral_df)
+    )
+    print(
+        f"  {len(exploratory_transect_df)} exploratory transect(s), "
+        f"{len(exploratory_bedform_df)} exploratory bedform(s) (figure use only, never persisted "
+        "as a canonical-schema file)"
+    )
+
+    # --- MAR-017A Section 8: explicit, real-data-derived validation statuses --------------
+    canonical_tile_count = len(canonical_spectral_df)
+    canonical_bedform_count = len(canonical_bedform_df)
+    hhw_canonical_2d_validation_status = (
+        hhw_analog.CANONICALLY_VALIDATED
+        if canonical_tile_count > 0
+        else hhw_analog.HHW_CANONICAL_2D_TILE_VALIDATION_NOT_SUPPORTED
+    )
+    hhw_detailed_bedform_validation_status = (
+        hhw_analog.CANONICALLY_VALIDATED
+        if canonical_bedform_count > 0
+        else hhw_analog.NOT_CANONICALLY_VALIDATED
+    )
+    any_canonical_meets_3wl = (
+        bool(canonical_spectral_df["meets_3_wavelengths_across_tile"].any())
+        if not canonical_spectral_df.empty
+        else False
+    )
+
+    # --- Figures (Sections 8/22-24): canonical if available, otherwise clearly-labelled ----
+    # --- exploratory -- never both, never presented as equivalent (Section 12) -------------
     print("Rendering method/statistics/spectral maps (Sections 22-24)...")
-    top_tile_row = (
-        tile_spectral_df[tile_spectral_df["rank_selected_top3"]]
-        .sort_values(
-            ["directional_concentration", "spectral_peak_to_median_power_ratio"],
-            ascending=[False, False],
+    canonical_method_path = maps_dir / "hhw_sandwave_morphometry_method.png"
+    exploratory_method_path = maps_dir / "hhw_exploratory_small_support_morphometry.png"
+    use_canonical_for_figures = bool(canonical_selected_ids) and canonical_bedform_count > 0
+
+    if use_canonical_for_figures:
+        exploratory_method_path.unlink(missing_ok=True)
+        figure_tile_df, figure_transect_df, figure_bedform_df = (
+            canonical_spectral_df,
+            canonical_transect_df,
+            canonical_bedform_df,
         )
-        .iloc[0]
-    )
-    method_inputs = hhw_analog.get_method_figure_inputs(
-        zip_path, grid_dir, top_tile_row, transect_df, bedform_df
-    )
-    method_map_path = swmap.render_method_figure(
-        **method_inputs, output_path=maps_dir / "hhw_sandwave_morphometry_method.png"
-    )
+        method_output_path = canonical_method_path
+        method_subtitle = None
+        stats_subtitle = None
+        spectral_subtitle = None
+        canonical_unavailable_message = None
+    else:
+        canonical_method_path.unlink(missing_ok=True)
+        figure_tile_df, figure_transect_df, figure_bedform_df = (
+            exploratory_spectral_df,
+            exploratory_transect_df,
+            exploratory_bedform_df,
+        )
+        method_output_path = exploratory_method_path
+        method_subtitle = "Exploratory 250 m support -- below canonical >=1000 m validation floor"
+        stats_subtitle = (
+            "EXPLORATORY (below-canonical-floor) bedforms -- not an accepted site distribution"
+        )
+        spectral_subtitle = "EXPLORATORY tiles shown (canonical set is empty)"
+        canonical_unavailable_message = (
+            "CANONICAL tile set is EMPTY for this dataset -- points below are EXPLORATORY only"
+        )
+
+    if not figure_tile_df.empty:
+        top_tile_row = (
+            figure_tile_df[figure_tile_df["rank_selected_top3"]]
+            .sort_values(
+                ["directional_concentration", "spectral_peak_to_median_power_ratio"],
+                ascending=[False, False],
+            )
+            .iloc[0]
+        )
+        method_inputs = hhw_analog.get_method_figure_inputs(
+            zip_path, grid_dir, top_tile_row, figure_transect_df, figure_bedform_df
+        )
+        method_map_path = swmap.render_method_figure(
+            **method_inputs, output_path=method_output_path, subtitle=method_subtitle
+        )
+    else:
+        method_map_path = None
+        print("  no canonical or exploratory tile available -- method figure skipped")
+
     stats_map_path = swmap.render_bedform_distribution_figure(
-        bedforms_df=bedform_df, output_path=maps_dir / "hhw_sandwave_morphometry_statistics.png"
+        bedforms_df=figure_bedform_df,
+        output_path=maps_dir / "hhw_sandwave_morphometry_statistics.png",
+        subtitle=stats_subtitle,
     )
     spectral_map_path = swmap.render_dominant_bedform_scale_map(
         background_elevation=bg_data,
         background_valid=bg_valid,
         background_extent_m=bg_extent,
-        tile_spectral_df=tile_spectral_df,
-        tile_size_m=float(tile_spectral_df["tile_size_m"].iloc[0]),
+        tile_spectral_df=figure_tile_df,
+        tile_size_m=float(figure_tile_df["tile_size_m"].iloc[0])
+        if not figure_tile_df.empty
+        else 250.0,
         output_path=maps_dir / "hhw_dominant_bedform_scale.png",
+        subtitle=spectral_subtitle,
+        canonical_unavailable_message=canonical_unavailable_message,
     )
 
-    print("Writing pipeline-transfer contract (Section 25)...")
-    contract = hhw_analog.build_pipeline_transfer_contract()
+    print("Writing pipeline-transfer contract (Sections 8-9/25)...")
+    contract = hhw_analog.build_pipeline_transfer_contract(
+        hhw_canonical_2d_validation_status=hhw_canonical_2d_validation_status,
+        hhw_detailed_bedform_validation_status=hhw_detailed_bedform_validation_status,
+    )
     contract_path = analog_dir / "pipeline_transfer_contract.json"
     contract_path.write_text(json.dumps(contract, indent=2, default=str), encoding="utf-8")
+
+    print("Writing analog validation-gap report (Section 13)...")
+    validation_gap = hhw_analog.build_analog_validation_gap_report(
+        canonical_cascade_log=canonical_search_meta["cascade_log"],
+        exploratory_cascade_log=exploratory_search_meta["cascade_log"],
+        canonical_tile_count=canonical_tile_count,
+        exploratory_tile_count=len(exploratory_spectral_df),
+        any_canonical_tile_meets_3_wavelengths=any_canonical_meets_3wl,
+    )
+    validation_gap_path = analog_dir / "analog_validation_gap.json"
+    validation_gap_path.write_text(
+        json.dumps(validation_gap, indent=2, default=str), encoding="utf-8"
+    )
 
     print()
     print("=== Outputs ===")
     for label, path in (
         ("source_file_inventory_parquet", source_inventory_path),
-        ("tile_spectral_morphometry_parquet", tile_spectral_path),
-        ("transect_morphometry_parquet", transect_path),
-        ("individual_bedforms_parquet", bedform_path),
-        ("detected_profile_extrema_gpkg", extrema_path),
+        ("tile_spectral_morphometry_parquet (canonical)", tile_spectral_path),
+        ("exploratory_small_support_tile_diagnostics_parquet", exploratory_tile_path),
+        ("transect_morphometry_parquet (canonical)", transect_path),
+        ("individual_bedforms_parquet (canonical)", bedform_path),
+        ("detected_profile_extrema_gpkg (canonical)", extrema_path),
         ("pipeline_transfer_contract_json", contract_path),
+        ("analog_validation_gap_json", validation_gap_path),
         ("native_bathymetry_overview_png", overview_map_path),
-        ("sandwave_morphometry_method_png", method_map_path),
+        ("method_figure_png", method_map_path),
         ("sandwave_morphometry_statistics_png", stats_map_path),
         ("dominant_bedform_scale_png", spectral_map_path),
     ):
         print(f"  {label}: {path}")
+    print()
+    print(f"CORE_ENGINE_IMPLEMENTATION_STATUS: {hhw_analog.IMPLEMENTED_AND_SYNTHETICALLY_VERIFIED}")
+    print(f"HHW_CANONICAL_2D_VALIDATION_STATUS: {hhw_canonical_2d_validation_status}")
+    print(f"HHW_DETAILED_BEDFORM_VALIDATION_STATUS: {hhw_detailed_bedform_validation_status}")
+    print()
+    # --- MAR-017A Section 17: the three required, verbatim validation-status statements ----
+    print("THE GENERIC MORPHOMETRY ENGINE IS IMPLEMENTED AND SYNTHETICALLY VERIFIED.")
+    sufficiency_word = "DOES" if canonical_tile_count > 0 else "DOES NOT"
+    print(
+        f"HHW {sufficiency_word} PROVIDE SUFFICIENT CONTIGUOUS SPATIAL SUPPORT FOR THE "
+        "CANONICAL REAL-DATA VALIDATION PROTOCOL."
+    )
+    print("EXPLORATORY SUB-1000-M TILE RESULTS ARE NOT CANONICAL MORPHOMETRY VALIDATION.")
     print()
     print(
         "HHW CEND 11/11 IS A METHOD-DEVELOPMENT ANALOG ONLY AND DOES NOT ENTER PL854 SCIENTIFIC "
