@@ -14,6 +14,7 @@ import xarray as xr
 from shapely.ops import unary_union
 
 from marine_engine import __version__
+from marine_engine.analogs import hhw_cend1111 as hhw_analog
 from marine_engine.config import load_study_config
 from marine_engine.metocean import (
     combined_bed_shear,
@@ -25,6 +26,7 @@ from marine_engine.metocean import (
 )
 from marine_engine.metocean import evidence as metocean_evidence
 from marine_engine.morphology import regional
+from marine_engine.morphology import sandwave_morphometry_map as swmap
 from marine_engine.preprocessing import bathymetry, source_resolution
 from marine_engine.preprocessing.aoi import (
     InvalidAoiGeometryError,
@@ -41,6 +43,7 @@ from marine_engine.preprocessing.chainage import (
 )
 from marine_engine.providers import bgs_offshore_surveys, nsta_freespan
 from marine_engine.providers.bathymetry import acquisition, bgs, emodnet, inventory, ukho
+from marine_engine.providers.bathymetry import hhw_cend1111 as hhw_provider
 from marine_engine.providers.metocean import acquisition as metocean_acquisition
 from marine_engine.providers.metocean import copernicus
 from marine_engine.providers.nsta import (
@@ -4410,6 +4413,157 @@ def _cmd_inventory_highres_seabed_data(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_analog_sandwave_morphometry(args: argparse.Namespace) -> int:
+    """MAR-017: builds and validates the reusable high-resolution sand-wave
+    morphometry engine on the real, open HHW CEND 11/11 analog dataset --
+    never PL854 evidence. The PL854 config is used only for project
+    paths/conventions; every output lives under
+    `data/processed/analogs/hhw_cend1111/`, never a PL854 feature/
+    validation layer. The one live step is the official ZIP download,
+    which is cached and skipped on subsequent runs.
+    """
+
+    config = load_study_config(args.config)
+
+    zip_path = config.paths.raw_dir / "analogs" / "hhw_cend1111" / "HHW-Bathy.zip"
+    acquisition = hhw_provider.download_hhw_bathy_zip(zip_path)
+    print(
+        f"HHW-Bathy.zip: {acquisition.byte_size} bytes, sha256={acquisition.sha256[:16]}..., "
+        f"already_cached={acquisition.already_cached}"
+    )
+
+    analog_dir = config.paths.processed_dir / "analogs" / "hhw_cend1111"
+    maps_dir = analog_dir / "maps"
+    analog_dir.mkdir(parents=True, exist_ok=True)
+    maps_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Building source file inventory (Section 5)...")
+    source_inventory_df = hhw_provider.build_source_file_inventory(zip_path)
+    source_inventory_path = analog_dir / "source_file_inventory.parquet"
+    source_inventory_df.to_parquet(source_inventory_path, index=False)
+    print(f"  {len(source_inventory_df)} archive member(s) -> {source_inventory_path}")
+
+    print("Selecting primary grid (Section 2/25, data-driven)...")
+    selection = hhw_analog.select_primary_grid(zip_path)
+    grid_dir = selection["selected_grid_directory"]
+    print(f"  selected: {grid_dir}")
+
+    print("Rendering native bathymetry overview (Section 8, no morphology yet)...")
+    bg_data, bg_valid, bg_extent = hhw_analog.get_background_for_map(zip_path, grid_dir)
+    overview_row = source_inventory_df[
+        (source_inventory_df["grid_directory"] == grid_dir)
+        & (source_inventory_df["readable_by_rasterio"] == True)  # noqa: E712 -- pandas needs `== True`, not `is True`, against a nullable/object column
+    ].iloc[0]
+    overview_map_path = swmap.render_native_bathymetry_overview(
+        elevation=bg_data,
+        valid=bg_valid,
+        extent_m=bg_extent,
+        crs=str(overview_row["crs"]),
+        native_pixel_size_m=float(overview_row["pixel_size_x_m"]),
+        survey_year=hhw_provider.HHW_SURVEY_YEAR,
+        nodata_value=float(overview_row["nodata"]),
+        output_path=maps_dir / "hhw_native_bathymetry_overview.png",
+    )
+
+    print("Searching for valid analysis tiles (Section 11, cascading tile size)...")
+    tiles, tile_search_meta = hhw_analog.build_tile_candidates(zip_path, grid_dir)
+    print(
+        f"  tile size used: {tile_search_meta['tile_size_used_m']} m "
+        f"(below the ticket's 1000 m floor: {tile_search_meta['below_ticket_floor']}), "
+        f"{len(tiles)} candidate tile(s)"
+    )
+    for entry in tile_search_meta["cascade_log"]:
+        print(f"    {entry}")
+
+    print("Running 2D spectral bedform diagnostics per tile (Section 12)...")
+    tile_spectral_df = hhw_analog.build_tile_spectral_table(zip_path, grid_dir, tiles)
+    tile_spectral_path = analog_dir / "tile_spectral_morphometry.parquet"
+    tile_spectral_df.to_parquet(tile_spectral_path, index=False)
+    print(f"  {len(tile_spectral_df)} tile(s) analyzed -> {tile_spectral_path}")
+
+    top_tiles_df = hhw_analog.select_top_tiles(tile_spectral_df, top_n=3)
+    tile_spectral_df = top_tiles_df
+    tile_spectral_df.to_parquet(tile_spectral_path, index=False)
+    selected_tile_ids = tile_spectral_df[tile_spectral_df["rank_selected_top3"]]["tile_id"].tolist()
+    print(f"  top {len(selected_tile_ids)} selected: {selected_tile_ids}")
+
+    print("Generating cross-crest transects + bedform detection (Sections 14-21)...")
+    transect_df, bedform_df, crests_gdf, troughs_gdf = hhw_analog.build_transect_and_bedform_tables(
+        zip_path, grid_dir, top_tiles_df
+    )
+    transect_path = analog_dir / "transect_morphometry.parquet"
+    transect_df.to_parquet(transect_path, index=False)
+    bedform_path = analog_dir / "individual_bedforms.parquet"
+    bedform_df.to_parquet(bedform_path, index=False)
+    print(f"  {len(transect_df)} transect(s) -> {transect_path}")
+    print(f"  {len(bedform_df)} individual bedform(s) -> {bedform_path}")
+
+    extrema_path = analog_dir / "detected_profile_extrema.gpkg"
+    if not crests_gdf.empty:
+        crests_gdf.to_file(extrema_path, layer="detected_crests", driver="GPKG")
+    if not troughs_gdf.empty:
+        troughs_gdf.to_file(extrema_path, layer="detected_troughs", driver="GPKG")
+    print(f"  crest/trough point layers -> {extrema_path}")
+
+    print("Rendering method/statistics/spectral maps (Sections 22-24)...")
+    top_tile_row = (
+        tile_spectral_df[tile_spectral_df["rank_selected_top3"]]
+        .sort_values(
+            ["directional_concentration", "spectral_peak_to_median_power_ratio"],
+            ascending=[False, False],
+        )
+        .iloc[0]
+    )
+    method_inputs = hhw_analog.get_method_figure_inputs(
+        zip_path, grid_dir, top_tile_row, transect_df, bedform_df
+    )
+    method_map_path = swmap.render_method_figure(
+        **method_inputs, output_path=maps_dir / "hhw_sandwave_morphometry_method.png"
+    )
+    stats_map_path = swmap.render_bedform_distribution_figure(
+        bedforms_df=bedform_df, output_path=maps_dir / "hhw_sandwave_morphometry_statistics.png"
+    )
+    spectral_map_path = swmap.render_dominant_bedform_scale_map(
+        background_elevation=bg_data,
+        background_valid=bg_valid,
+        background_extent_m=bg_extent,
+        tile_spectral_df=tile_spectral_df,
+        tile_size_m=float(tile_spectral_df["tile_size_m"].iloc[0]),
+        output_path=maps_dir / "hhw_dominant_bedform_scale.png",
+    )
+
+    print("Writing pipeline-transfer contract (Section 25)...")
+    contract = hhw_analog.build_pipeline_transfer_contract()
+    contract_path = analog_dir / "pipeline_transfer_contract.json"
+    contract_path.write_text(json.dumps(contract, indent=2, default=str), encoding="utf-8")
+
+    print()
+    print("=== Outputs ===")
+    for label, path in (
+        ("source_file_inventory_parquet", source_inventory_path),
+        ("tile_spectral_morphometry_parquet", tile_spectral_path),
+        ("transect_morphometry_parquet", transect_path),
+        ("individual_bedforms_parquet", bedform_path),
+        ("detected_profile_extrema_gpkg", extrema_path),
+        ("pipeline_transfer_contract_json", contract_path),
+        ("native_bathymetry_overview_png", overview_map_path),
+        ("sandwave_morphometry_method_png", method_map_path),
+        ("sandwave_morphometry_statistics_png", stats_map_path),
+        ("dominant_bedform_scale_png", spectral_map_path),
+    ):
+        print(f"  {label}: {path}")
+    print()
+    print(
+        "HHW CEND 11/11 IS A METHOD-DEVELOPMENT ANALOG ONLY AND DOES NOT ENTER PL854 SCIENTIFIC "
+        "EVIDENCE."
+    )
+    print(
+        "MAR-017 BUILDS A REUSABLE HIGH-RESOLUTION MORPHOMETRY ENGINE; IT DOES NOT CREATE A "
+        "PL854 FREESPAN PREDICTION OR SUSCEPTIBILITY SCORE."
+    )
+    return 0
+
+
 def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> datetime:
     """The live dataset's own start timestamp, or `fallback_now` if it could not be discovered."""
 
@@ -4676,6 +4830,23 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     inventory_highres_seabed_data_parser.set_defaults(func=_cmd_inventory_highres_seabed_data)
+
+    build_analog_sandwave_morphometry_parser = subparsers.add_parser(
+        "build-analog-sandwave-morphometry",
+        help=(
+            "Reusable high-resolution sand-wave morphometry engine (MAR-017), built and "
+            "validated on the real, open JNCC/Cefas HHW CEND 11/11 analog dataset -- never "
+            "PL854 evidence. The PL854 config is used only for project paths/conventions; "
+            "outputs live under processed/analogs/hhw_cend1111/. Downloads the official "
+            "processed-bathymetry ZIP once (cached thereafter); requires internet on first run."
+        ),
+    )
+    build_analog_sandwave_morphometry_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file (used for paths only)."
+    )
+    build_analog_sandwave_morphometry_parser.set_defaults(
+        func=_cmd_build_analog_sandwave_morphometry
+    )
 
     return parser
 

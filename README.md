@@ -1211,4 +1211,68 @@ otherwise, never an interactive credential prompt.
   upgrading to open, equipment-parsed-never-implies-downloadable-data, and
   the absence of any score/probability/susceptibility term anywhere; the
   full offline suite (933 tests) and repo-wide `ruff format`/`ruff check`
-  pass clean. No further ticket has started.
+  pass clean.
+
+- `MAR-017`: a reusable HIGH-RESOLUTION SAND-WAVE MORPHOMETRY ENGINE, built
+  and validated on a real, open Southern North Sea analog -- never PL854
+  evidence, never a freespan model. Since MAR-016 found no verified open
+  PL854-specific bathymetric grid, the engine is developed instead on
+  JNCC/Cefas's real "Processed bathymetry from Haisborough, Hammond and
+  Winterton cSAC" (CEND 11/11, RV Cefas Endeavour, 2011-06-11 to
+  2011-06-21, UK Open Government Licence) -- `HHW-Bathy.zip`, confirmed
+  127,960,429 bytes, downloaded and checksummed once and cached
+  thereafter. Opening the real archive shows genuine ESRI Arc/INFO Binary
+  Grid format (13 separate `hdr.adf`-rooted grids, never assumed GeoTIFF)
+  at a real 1 m native resolution, EPSG:32631 -- read directly from inside
+  the ZIP via GDAL's `/vsizip/` filesystem, never fully extracted (~7.1 GB
+  uncompressed) to disk. The primary grid (`asciito_hhw_2` of the four
+  "official processed bathymetry" candidates) is selected at runtime by
+  evaluating each one's own best-achievable tile validity -- never
+  hard-coded. Real result, reported honestly rather than forced: the
+  ticket's 2000 m/1000 m canonical/floor tile sizes found **zero** tiles
+  clearing 90% valid data anywhere (best achieved 49%/56%); the cascade
+  had to continue to **250 m** (94.9% best) before finding 7 valid tiles --
+  a genuine, demonstrated property of this dataset's real swath-line
+  coverage pattern (not a full-corridor mosaic), not a bug, and explicitly
+  flagged as below the ticket's own stated floor. A real bug WAS found and
+  fixed during development: incompletely-filled nodata gaps were leaking
+  the source's float32 nodata sentinel into the 2D FFT (a colourbar
+  literally scaled to `1e37`), corrupting several tiles' spectral
+  diagnostics -- fixed by always seeding gap-fill at the tile's own valid
+  mean (never the raw sentinel) with a hard-clamp safety net, after which
+  every diagnostic became physically sensible. Across the 7 valid tiles,
+  3 were selected (by directional concentration, then peak-to-median
+  power ratio -- a transparent ranking convenience, never a score) for 3
+  cross-crest transects each; 3 of the 9 were honestly excluded
+  (insufficient density along the transect itself, recorded in the table
+  as `EXCLUDED_INSUFFICIENT_VALID_DATA`, never silently dropped) and the
+  remaining 6 detected **11 real individual bedforms** (wavelength
+  21-147 m, height 0.19-6.25 m, asymmetry -0.56 to +0.49) -- every one
+  correctly flagged `FILTER_SCALE_SENSITIVE` under the 20/30/40 m
+  comparison, an honest consequence of tiles this small relative to the
+  detected bedform scale. Ten outputs are written under
+  `processed/analogs/hhw_cend1111/` (never a PL854 layer -- every
+  canonical row/JSON carries `pl854_evidence=false` and
+  `scientific_role=HIGH_RESOLUTION_SANDBED_MORPHOMETRY_METHOD_DEVELOPMENT_
+  ANALOG`): a 127-row source-file inventory, the tile/transect/individual-
+  bedform parquets, a crest/trough point GeoPackage, a pipeline-transfer
+  contract naming exactly what a future PL854 survey must provide, and
+  four PNGs (a pre-morphology QA overview, the primary method figure
+  showing native bathymetry / filtered surface / crest orientation+
+  transects / an annotated profile, a bedform-statistics figure, and a
+  dominant-wavelength map) via
+  `uv run marine-engine build-analog-sandwave-morphometry configs/pl854.yaml`
+  (one live download, cached thereafter). The reusable engine itself
+  (`morphology/sandwave_morphometry{,_map}.py`) never references an HHW-
+  specific identifier or coordinate -- verified by source inspection --
+  and operates only on an arbitrary raster + geometry + metre-scale
+  parameters, so it can later accept a real PL854 survey unchanged. 29 new
+  tests across `test_sandwave_morphometry.py` (synthetic sinusoidal DEMs:
+  wavelength/height/orientation recovery, positive-down sign handling,
+  trend-removal wavelength preservation, ripple suppression, zero-phase
+  crest positions, hand-exact asymmetry, nodata-tile exclusion) and
+  `test_hhw_cend1111_analog.py` (analog-only flags, no HHW identifier in
+  the reusable engine, no forbidden score/risk/migration-rate term
+  anywhere) cover the required list; the full offline suite (962 tests)
+  and repo-wide `ruff format`/`ruff check` pass clean. No further ticket
+  has started.
