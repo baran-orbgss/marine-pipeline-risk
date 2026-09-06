@@ -78,6 +78,7 @@ uv run marine-engine resolve-bathymetry-sources configs/pl854.yaml
 uv run marine-engine build-regional-morphology configs/pl854.yaml
 uv run marine-engine build-sediment-evidence configs/pl854.yaml
 uv run marine-engine build-metocean-evidence configs/pl854.yaml
+uv run marine-engine build-engineering-evidence-atlas configs/pl854.yaml
 ```
 
 `ingest-pipeline`, `discover-bathymetry`, `fetch-bathymetry`,
@@ -1490,4 +1491,78 @@ otherwise, never an interactive credential prompt.
   bedform-count floor, analog-only flags, cross-analog schema purity,
   and the final closed-search decision); the full offline suite (1035
   tests, 25 live/network tests correctly deselected) and repo-wide `ruff
-  format`/`ruff check` pass clean. No further ticket has started.
+  format`/`ruff check` pass clean.
+
+- `MAR-018`: the PL854 Engineering Evidence Atlas -- a map-first GIS/
+  report packaging milestone, deliberately introducing NO new scientific
+  model and NO fused score: every value in the new `evidence_atlas`
+  package is read from an already-accepted MAR-007/010/011A/012/013/014/
+  014A/014B/014C/015/016 output and, at most, renamed/joined/relabelled.
+  The canonical `pl854_section_evidence.parquet` (14 rows, one per real
+  hydro-pair support section) is built by merging six already-aligned
+  segment tables (current/wave/combined-shear/mobility/scour/freespan-
+  counts) purely on `segment_id`/`hydro_pair_id`, with every merge passed
+  `validate="one_to_one"` so a silent schema drift in any upstream ticket
+  would fail loudly here rather than silently corrupt the atlas -- the
+  shared 14-section grid this depends on (first asserted by MAR-015) is
+  thereby verified again, not just assumed. Real reconnaissance overturned
+  several of the ticket's own assumptions before any code was written:
+  its "MAR-016" label for regional morphology was actually MAR-007
+  (MAR-016 is the separate high-res survey-access audit); its guessed
+  column names `combined_tau_max_p95_lower_pa`/`upper_pa` do not exist
+  anywhere -- the real min/max-across-roughness-scenarios columns
+  (`tau_max_p95_sensitivity_min_pa`/`max_pa`) live only in the segments
+  GeoPackage, never in the stats parquet; MAR-013's "mobility capacity"
+  is a plain float from a fixed 9-point D50 ladder, never a range-string
+  class like "0.5-1.0 mm"; and every regional-morphology column carries
+  a unit suffix the ticket's own names omitted (`slope_500m_deg`, not
+  `slope_500m`). The `highres_survey_inventory` GIS layer needed real
+  footprint polygons that the accepted MAR-016 table itself does not
+  carry (kept geometry-free on purpose); rather than fabricate one, it is
+  rebuilt OFFLINE from the same already-cached raw BGS GeoJSON responses
+  MAR-016 itself fetched (zero network, zero new science), reusing MAR-
+  016's own `build_survey_footprints_gdf` helper unchanged. The atlas
+  GeoPackage (7 layers: `pipeline_route`, `engineering_support_sections`,
+  `observed_freespans_2018`, `historical_freespans_2012_2018`,
+  `observed_psa_d50_points`, `highres_survey_inventory`,
+  `chainage_reference_points`) is confirmed EPSG:32631 throughout with no
+  null geometry, and the 8 real 2018 freespan events keep their true,
+  variable-length (0.25-26.2 m) route-substring geometry, never widened.
+  Real facts the atlas surfaces: 8 official 2018 corridor freespans
+  (97.42 m/23.16 m/0.41 m) occupy only 3 of 14 hydrodynamic support
+  sections; 19 exposed sections/519 m remain aggregate-only (no spatial
+  locations exist); noncohesive p95 mobility capacity is 0.5-1.0 mm
+  across the route; MAR-014's p95 screening class is spatially uniform
+  at 0.03xD; and all 14 real MAR-016 high-resolution survey candidates
+  remain `METADATA_ONLY_CUSTODIAN_REQUEST_REQUIRED` -- no verified open
+  PL854-specific high-resolution bathymetric grid exists. Three real,
+  unticketed bugs were found by actually looking at the rendered output
+  rather than trusting the code: the primary 4-panel atlas figure's
+  first 2x2 layout attempt (guessed height ratios) left large blank
+  margins in every panel -- `ax.set_aspect("equal")` always shrinks a
+  mismatched axes box down to the data's own aspect ratio rather than
+  the reverse, confirmed by directly introspecting `ax.get_position()`
+  rather than continuing to guess, then fixed by deriving each panel's
+  height from its width and the real content aspect ratio (~2.6:1, route
+  + background raster, padded); the section-summary table had no
+  explicit column widths, so long text overflowed visibly into
+  neighbouring cells -- fixed with explicit `colWidths` and a `bbox` that
+  fills the axes exactly; and the provenance timeline's auto-generated
+  date-range label rounded fractional years naively (`.0f` formatting
+  turned a 2024.55-2026.67 span into the misleading "2025-2027") --
+  fixed by requiring the caller to pass an exact, pre-formatted label
+  rather than reconstructing one from rounded floats. 21 new tests in
+  `test_evidence_atlas.py` cover the required list (derived, not
+  hard-coded, section count; 2018 events remain corridor-level/
+  unresolved-by-line and are never enlarged in GIS geometry; exposure
+  stays non-spatial; evidence types never mix within one scientific
+  role; no fused score/probability/risk field anywhere; MAR-012/013
+  values pass through unmodified; 0.03xD stays a screening class, never
+  a design requirement; the 1991-1992 morphology label and non-25m
+  hydrodynamic support scale are preserved; the GeoPackage opens with
+  every expected EPSG:32631 layer; the HTML report builds with the
+  Python `socket` module itself blocked; MAR-017 analog data never
+  reaches a section-evidence column or the `core` module's own source);
+  the full offline suite (1056 tests, 25 live/network tests correctly
+  deselected) and repo-wide `ruff format`/`ruff check` pass clean. No
+  further ticket has started.

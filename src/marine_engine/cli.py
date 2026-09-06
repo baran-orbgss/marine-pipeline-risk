@@ -18,6 +18,9 @@ from marine_engine.analogs import greater_gabbard_2014 as gg_analog
 from marine_engine.analogs import hhw_cend1111 as hhw_analog
 from marine_engine.analogs import idr_bnr_cend1111 as idrbnr_analog
 from marine_engine.config import load_study_config
+from marine_engine.evidence_atlas import core as evidence_atlas_core
+from marine_engine.evidence_atlas import maps as evidence_atlas_maps
+from marine_engine.evidence_atlas import report as evidence_atlas_report
 from marine_engine.metocean import (
     combined_bed_shear,
     combined_bed_shear_map,
@@ -5632,6 +5635,355 @@ def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> da
     return datetime.fromtimestamp(time_range_ms[0] / 1000.0, tz=UTC)
 
 
+def _fractional_year(ts: pd.Timestamp) -> float:
+    year_start = pd.Timestamp(year=ts.year, month=1, day=1, tz=ts.tz)
+    year_end = pd.Timestamp(year=ts.year + 1, month=1, day=1, tz=ts.tz)
+    return ts.year + (ts - year_start) / (year_end - year_start)
+
+
+def _cmd_build_engineering_evidence_atlas(args: argparse.Namespace) -> int:
+    """MAR-018: PL854 engineering evidence atlas -- map-first GIS/report
+    packaging of already-accepted MAR-007/010-016 outputs. No network. No new
+    scientific model: every value here is read, joined, and relabelled, never
+    recomputed. MAR-017 analog outputs are report context only.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    interim_pl854_dir = config.paths.interim_dir / pipeline_id.lower()
+    working_crs = config.crs.horizontal
+
+    missing = evidence_atlas_core.check_upstream_integrity(study_dir)
+    if missing:
+        print(
+            "error: missing required accepted upstream output(s) -- run the corresponding "
+            "upstream 'build-*' commands first:",
+            file=sys.stderr,
+        )
+        for item in missing:
+            print(f"  - {item}", file=sys.stderr)
+        return 1
+
+    atlas_dir = study_dir / "evidence_atlas"
+    maps_dir = study_dir / "maps"
+    report_dir = study_dir / "report"
+
+    print("Building canonical section evidence table (Section 6)...")
+    section_df = evidence_atlas_core.build_section_evidence_table(study_dir)
+    section_evidence_path = atlas_dir / "pl854_section_evidence.parquet"
+    metocean_evidence.write_parquet(section_df, section_evidence_path)
+    print(f"  {len(section_df)} section(s) -> {section_evidence_path}")
+
+    print("Building GIS atlas GeoPackage layers (Sections 7-8)...")
+    pipeline_layer = evidence_atlas_core.build_pipeline_route_layer(study_dir)
+    route = pipeline_layer.geometry.iloc[0]
+    sections_gdf = evidence_atlas_core.build_engineering_support_sections_layer(
+        study_dir, section_df
+    )
+    freespans_2018_gdf = evidence_atlas_core.build_observed_freespans_2018_layer(study_dir)
+    historical_freespans_gdf = evidence_atlas_core.build_historical_freespans_layer(study_dir)
+    psa_points_gdf = evidence_atlas_core.build_observed_psa_d50_points_layer(
+        study_dir, interim_pl854_dir
+    )
+    bgs_manifest_path = interim_pl854_dir / "bgs_offshore_surveys" / "acquisition_manifest.json"
+    highres_survey_inventory_path = (
+        study_dir / "seabed_data" / "high_resolution_survey_inventory.parquet"
+    )
+    highres_survey_gdf = evidence_atlas_core.build_highres_survey_inventory_layer(
+        manifest_path=bgs_manifest_path,
+        inventory_path=highres_survey_inventory_path,
+        working_crs=working_crs,
+    )
+    chainage_reference_gdf = evidence_atlas_core.build_chainage_reference_points_layer(study_dir)
+
+    layers = {
+        "pipeline_route": pipeline_layer,
+        "engineering_support_sections": sections_gdf,
+        "observed_freespans_2018": freespans_2018_gdf,
+        "historical_freespans_2012_2018": historical_freespans_gdf,
+        "observed_psa_d50_points": psa_points_gdf,
+        "highres_survey_inventory": highres_survey_gdf,
+        "chainage_reference_points": chainage_reference_gdf,
+    }
+    crs_mismatches = evidence_atlas_core.verify_projected_layers_crs(layers)
+    if crs_mismatches:
+        print(f"error: GIS layer(s) not in {working_crs}: {crs_mismatches}", file=sys.stderr)
+        return 1
+
+    atlas_gpkg_path = atlas_dir / "pl854_engineering_evidence_atlas.gpkg"
+    evidence_atlas_core.write_evidence_atlas_gpkg(atlas_gpkg_path, layers)
+    written_layers = [name for name, gdf in layers.items() if gdf is not None and not gdf.empty]
+    print(f"  {len(written_layers)} layer(s) -> {atlas_gpkg_path}")
+
+    generated_at_utc = datetime.now(UTC).isoformat()
+
+    print("Writing evidence variable manifest (Section 16)...")
+    evidence_manifest = evidence_atlas_report.build_evidence_variable_manifest(
+        generated_at_utc=generated_at_utc
+    )
+    evidence_manifest_path = atlas_dir / "evidence_atlas_manifest.json"
+    evidence_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_manifest_path.write_text(
+        json.dumps(evidence_manifest, indent=2, default=str), encoding="utf-8"
+    )
+    print(f"  {evidence_manifest['variable_count']} variable(s) -> {evidence_manifest_path}")
+
+    condition_benchmark = json.loads(
+        (study_dir / "pipeline_condition" / "anglia_2018_condition_benchmark.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    observed_condition_summary = {
+        "event_count": int(freespans_2018_gdf["source_length_m"].count()),
+        "total_length_m": float(freespans_2018_gdf["source_length_m"].sum()),
+        "max_length_m": float(freespans_2018_gdf["source_length_m"].max()),
+        "max_height_m": float(freespans_2018_gdf["source_height_m"].max()),
+        "exposed_section_count": condition_benchmark["exposed_section_count"],
+        "total_exposed_length_m": condition_benchmark["total_exposed_length_m"],
+    }
+    key_limitations = (
+        "Hydrodynamic forcing (2024-2026) postdates the 2018 observations",
+        "Current/wave support (~1.5-2 km) vs observed spans (~0.2-23 m)",
+        "Route-scale morphology derives from 1991-1992 regional bathymetry",
+        "No verified open 2018 Fugro bathymetric grid",
+        "No observed continuous route embedment profile",
+        "No continuous quantitative route D50",
+        "PL854 vs PL855 freespan attribution unresolved",
+    )
+    background_raster_path = study_dir / "bathymetry" / "emodnet_baseline_lat_100m.tif"
+    background_raster_path = background_raster_path if background_raster_path.exists() else None
+
+    print("Rendering primary engineering evidence atlas map (Sections 9-12)...")
+    atlas_png_path = evidence_atlas_maps.render_engineering_evidence_atlas(
+        route=route,
+        sections_gdf=sections_gdf,
+        freespans_2018_gdf=freespans_2018_gdf,
+        historical_freespans_gdf=historical_freespans_gdf,
+        psa_points_gdf=psa_points_gdf,
+        highres_survey_gdf=highres_survey_gdf,
+        chainage_reference_gdf=chainage_reference_gdf,
+        observed_condition_summary=observed_condition_summary,
+        key_limitations=key_limitations,
+        output_path=maps_dir / "pl854_engineering_evidence_atlas.png",
+        background_raster_path=background_raster_path,
+    )
+    print(f"  -> {atlas_png_path}")
+
+    print("Rendering evidence strip (Section 13)...")
+    strip_png_path = evidence_atlas_maps.render_evidence_strip(
+        section_df=section_df,
+        freespans_2018_gdf=freespans_2018_gdf,
+        output_path=maps_dir / "pl854_engineering_evidence_strip.png",
+    )
+    print(f"  -> {strip_png_path}")
+
+    print("Rendering engineering section summary table (Section 14)...")
+    table_png_path = evidence_atlas_maps.render_section_summary_table(
+        section_df=section_df, output_path=maps_dir / "pl854_engineering_section_summary.png"
+    )
+    print(f"  -> {table_png_path}")
+
+    print("Rendering evidence provenance timeline (Section 15)...")
+    sediment_metadata = json.loads(
+        (study_dir / "sediment" / "sediment_evidence_metadata.json").read_text(encoding="utf-8")
+    )
+    morphology_metadata = json.loads(
+        (study_dir / "morphology" / "morphology_metadata.json").read_text(encoding="utf-8")
+    )
+    morphology_df = pd.read_parquet(
+        study_dir / "morphology" / "chainage_regional_morphology.parquet"
+    )
+    fugro_dossier = json.loads(
+        (study_dir / "seabed_data" / "anglia_fugro_2018_recovery_dossier.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    ea_publication_date = None
+    for ref in fugro_dossier.get("official_references", []):
+        if "Environmental Appraisal" in ref.get("title", ""):
+            ea_publication_date = ref.get("date")
+            break
+
+    combined_stats_df = pd.read_parquet(study_dir / "metocean" / "combined_bed_shear_stats.parquet")
+    overlap_start = pd.Timestamp(combined_stats_df["overlap_start_time_utc"].iloc[0])
+    overlap_end = pd.Timestamp(combined_stats_df["overlap_end_time_utc"].iloc[0])
+    wave_stats_df = pd.read_parquet(study_dir / "metocean" / "wave_orbital_velocity_stats.parquet")
+    wave_start = pd.Timestamp(wave_stats_df["start_time_utc"].iloc[0])
+    wave_end = pd.Timestamp(wave_stats_df["end_time_utc"].iloc[0])
+    sample_year_min = int(sediment_metadata["coverage_diagnostics"]["sample_year_min"])
+    sample_year_max = int(sediment_metadata["coverage_diagnostics"]["sample_year_max"])
+    morph_year_min = int(morphology_df["source_acquisition_year"].min())
+    morph_year_max = int(morphology_df["source_acquisition_year"].max())
+
+    epochs = [
+        {
+            "label": f"PSA samples ({sample_year_min}-{sample_year_max})",
+            "start_year": float(sample_year_min),
+            "end_year": float(sample_year_max),
+            "kind": "OBSERVATION_PERIOD",
+            "color": "#2E6F40",
+        },
+        {
+            "label": f"Legacy regional bathymetry, MAR-007 ({morph_year_min}-{morph_year_max})",
+            "start_year": float(morph_year_min),
+            "end_year": float(morph_year_max),
+            "kind": "OBSERVATION_PERIOD",
+            "color": "0.5",
+        },
+        {
+            "label": "2018 freespan/exposure survey",
+            "start_year": 2018.0,
+            "end_year": 2018.5,
+            "kind": "OBSERVATION_PERIOD",
+            "color": "#B4131A",
+        },
+        {
+            "label": (
+                "Contemporaneous current-wave overlap, MAR-012 "
+                f"({overlap_start.strftime('%b %Y')} - {overlap_end.strftime('%b %Y')})"
+            ),
+            "start_year": _fractional_year(overlap_start),
+            "end_year": _fractional_year(overlap_end),
+            "kind": "OBSERVATION_PERIOD",
+            "color": "#4C6EF5",
+        },
+        {
+            "label": f"Wave context ({wave_start.year} - {wave_end.strftime('%b %Y')})",
+            "start_year": _fractional_year(wave_start),
+            "end_year": _fractional_year(wave_end),
+            "kind": "OBSERVATION_PERIOD",
+            "color": "#C1440E",
+        },
+    ]
+    if ea_publication_date:
+        epochs.append(
+            {
+                "label": f"Anglia decommissioning EA published ({ea_publication_date})",
+                "start_year": float(ea_publication_date.split("-")[0]),
+                "end_year": float(ea_publication_date.split("-")[0]),
+                "kind": "PUBLICATION_EVENT",
+            }
+        )
+    timeline_png_path = evidence_atlas_maps.render_provenance_timeline(
+        epochs=epochs, output_path=maps_dir / "pl854_evidence_provenance_timeline.png"
+    )
+    print(f"  -> {timeline_png_path}")
+
+    print("Building human-readable engineering evidence report (Sections 17-24)...")
+    route_length_km = float(route.length) / 1000.0
+    depth_stats = {
+        "min_m": float(morphology_df["depth_lat_m"].min()),
+        "median_m": float(morphology_df["depth_lat_m"].median()),
+        "max_m": float(morphology_df["depth_lat_m"].max()),
+    }
+    seabed_data_access_gap = json.loads(
+        (study_dir / "seabed_data" / "seabed_data_access_gap.json").read_text(encoding="utf-8")
+    )
+    analog_family_status_path = (
+        config.paths.processed_dir
+        / "analogs"
+        / "sandwave_morphometry_engine_validation_status.json"
+    )
+    analog_family_status = (
+        json.loads(analog_family_status_path.read_text(encoding="utf-8"))
+        if analog_family_status_path.exists()
+        else {}
+    )
+
+    report_blocks = evidence_atlas_report.build_report_blocks(
+        section_df=section_df,
+        freespans_2018_gdf=freespans_2018_gdf,
+        historical_freespans_gdf=historical_freespans_gdf,
+        condition_benchmark=condition_benchmark,
+        route_length_km=route_length_km,
+        depth_stats=depth_stats,
+        sediment_metadata=sediment_metadata,
+        morphology_metadata=morphology_metadata,
+        highres_survey_df=pd.read_parquet(highres_survey_inventory_path),
+        seabed_data_access_gap=seabed_data_access_gap,
+        analog_family_status=analog_family_status,
+        key_limitations=key_limitations,
+    )
+    html_report_path = evidence_atlas_report.write_html_report(
+        report_blocks, report_dir / "pl854_engineering_evidence_report.html"
+    )
+    md_report_path = evidence_atlas_report.write_markdown_report(
+        report_blocks, report_dir / "pl854_engineering_evidence_report.md"
+    )
+    print(f"  HTML -> {html_report_path}")
+    print(f"  Markdown -> {md_report_path}")
+
+    print("Writing file package manifest (Section 25)...")
+    package_manifest = evidence_atlas_report.build_package_manifest(
+        deliverables={
+            "section_evidence_parquet": section_evidence_path,
+            "atlas_gpkg": atlas_gpkg_path,
+            "evidence_manifest_json": evidence_manifest_path,
+            "atlas_png": atlas_png_path,
+            "evidence_strip_png": strip_png_path,
+            "section_summary_png": table_png_path,
+            "provenance_timeline_png": timeline_png_path,
+            "html_report": html_report_path,
+            "md_report": md_report_path,
+        },
+        generated_at_utc=generated_at_utc,
+        project_root=Path.cwd(),
+    )
+    package_manifest_path = report_dir / "pl854_engineering_evidence_package_manifest.json"
+    evidence_atlas_report.write_package_manifest(package_manifest, package_manifest_path)
+    print(f"  {package_manifest['file_count']} file(s) -> {package_manifest_path}")
+
+    print()
+    print("=== PL854 Engineering Evidence Atlas (MAR-018) ===")
+    print()
+    print("## Atlas")
+    print(f"  Section count: {len(section_df)}")
+    event_section_count = int((section_df["observed_2018_freespan_count"].fillna(0) > 0).sum())
+    print(f"  Observed-event section count: {event_section_count}/{len(section_df)}")
+    print(f"  GeoPackage layers: {written_layers}")
+    atlas_dims = evidence_atlas_maps.read_png_dimensions(atlas_png_path)
+    strip_dims = evidence_atlas_maps.read_png_dimensions(strip_png_path)
+    print(f"  Primary atlas: {atlas_png_path} ({atlas_dims[0]}x{atlas_dims[1]} px)")
+    print(f"  Evidence strip: {strip_png_path} ({strip_dims[0]}x{strip_dims[1]} px)")
+    print()
+    print("## Report")
+    print(f"  HTML: {html_report_path}")
+    print(f"  Markdown: {md_report_path}")
+    print(f"  Package size: {sum(f['file_size_bytes'] for f in package_manifest['files'])} bytes")
+    print()
+    print("## Key factual findings")
+    print(f"  Route length: ~{route_length_km:.2f} km")
+    print(
+        f"  {observed_condition_summary['event_count']} official 2018 corridor freespans occupy "
+        f"{event_section_count}/{len(section_df)} hydrodynamic support sections"
+    )
+    print(
+        "  Noncohesive p95 mobility capacity: "
+        f"{section_df['mobility_capacity_p95_d50_mm'].min():.3g}-"
+        f"{section_df['mobility_capacity_p95_d50_mm'].max():.3g} mm"
+    )
+    print()
+    print("## Limitations")
+    for item in key_limitations:
+        print(f"  - {item}")
+    print()
+    print("MAR-018 DOES NOT CREATE A FREESPAN SUSCEPTIBILITY SCORE OR RISK MODEL.")
+    print(
+        "OBSERVED CONDITION, PHYSICS-BASED MODEL OUTPUTS, EMPIRICAL SCREENING, AND "
+        "LEGACY/REGIONAL CONTEXT REMAIN VISUALLY AND SEMANTICALLY SEPARATE."
+    )
+    print(
+        "THE PRIMARY PURPOSE OF MAR-018 IS HUMAN-READABLE GIS / ENGINEERING COMMUNICATION OF THE "
+        "ACCEPTED EVIDENCE BASE."
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -5945,6 +6297,23 @@ def build_parser() -> argparse.ArgumentParser:
     build_greater_gabbard_sandwave_validation_parser.set_defaults(
         func=_cmd_build_greater_gabbard_sandwave_validation
     )
+
+    build_engineering_evidence_atlas_parser = subparsers.add_parser(
+        "build-engineering-evidence-atlas",
+        help=(
+            "MAR-018: PL854 engineering evidence atlas -- map-first GIS/report packaging of "
+            "already-accepted MAR-007/010-016 outputs (observed condition, hydrodynamic "
+            "forcing, sediment mobility, scour-onset screening, regional morphology, "
+            "high-resolution survey-access audit). No network, no new scientific model: "
+            "every value is read, joined, and relabelled, never recomputed. MAR-017 analog "
+            "outputs are report context only. Outputs live under "
+            "processed/pl854/{evidence_atlas,maps,report}/."
+        ),
+    )
+    build_engineering_evidence_atlas_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_engineering_evidence_atlas_parser.set_defaults(func=_cmd_build_engineering_evidence_atlas)
 
     return parser
 
