@@ -35,6 +35,11 @@ _EMBEDMENT_RATIO_LADDER = (0.0, 0.03, 0.06, 0.10, 0.15)
 
 _KP_REFERENCE_INTERVAL_LABEL = "KP references: 0 / 5 / 10 / 15 / 20 / terminus"
 
+# Non-directional corridor naming (MAR-019 Section 5): canonical geometry direction is not
+# independently verified as physical installation direction (Anglia A vs. LOGGS), so this
+# must never read as an asserted flow/installation direction like "Anglia A -> LOGGS".
+_ROUTE_CORRIDOR_LABEL = "Anglia A-LOGGS corridor"
+
 # --- Shared cartographic helpers (mirrors combined_bed_shear_map.py's style) --------------
 
 
@@ -100,14 +105,14 @@ def _add_scale_bar(ax) -> None:
 
     x0 = xlim[0] + view_width_m * 0.05
     y0 = ax.get_ylim()[0] + abs(ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.05
-    ax.add_line(Line2D([x0, x0 + bar_m], [y0, y0], color="black", linewidth=2))
+    ax.add_line(Line2D([x0, x0 + bar_m], [y0, y0], color="black", linewidth=2.4))
     ax.annotate(
         f"{bar_km:g} km",
         (x0 + bar_m / 2.0, y0),
         textcoords="offset points",
         xytext=(0, 4),
         ha="center",
-        fontsize=7,
+        fontsize=9,
     )
 
 
@@ -120,9 +125,9 @@ def _add_north_arrow(ax) -> None:
         "N",
         xy=(x, y1),
         xytext=(x, y0),
-        arrowprops={"arrowstyle": "-|>", "color": "black", "linewidth": 1.3},
+        arrowprops={"arrowstyle": "-|>", "color": "black", "linewidth": 1.6},
         ha="center",
-        fontsize=8,
+        fontsize=10,
         fontweight="bold",
     )
 
@@ -133,13 +138,13 @@ def _add_kp_reference_labels(ax, chainage_reference_gdf: gpd.GeoDataFrame) -> No
 
     for _, row in chainage_reference_gdf.iterrows():
         point = row.geometry
-        ax.plot(point.x, point.y, marker="o", markersize=3, color="black", zorder=6)
+        ax.plot(point.x, point.y, marker="o", markersize=4, color="black", zorder=6)
         ax.annotate(
             row["reference_label"],
             (point.x, point.y),
             textcoords="offset points",
-            xytext=(5, -9),
-            fontsize=6,
+            xytext=(5, -10),
+            fontsize=7.5,
         )
 
 
@@ -153,12 +158,12 @@ def _add_panel_caption(ax, text: str) -> None:
         0.97,
         text,
         transform=ax.transAxes,
-        fontsize=7,
+        fontsize=8.5,
         color="0.15",
         va="top",
         ha="left",
         zorder=8,
-        bbox={"boxstyle": "round,pad=0.25", "fc": "white", "ec": "none", "alpha": 0.8},
+        bbox={"boxstyle": "round,pad=0.3", "fc": "white", "ec": "none", "alpha": 0.82},
     )
 
 
@@ -211,10 +216,10 @@ def _annotate_event_sections(ax, sections_gdf: gpd.GeoDataFrame) -> None:
             label,
             (centroid.x, centroid.y),
             textcoords="offset points",
-            xytext=(0, 20 + rank * 24),
-            fontsize=6.5,
+            xytext=(0, 22 + rank * 28),
+            fontsize=8,
             ha="center",
-            bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#B4131A", "alpha": 0.9},
+            bbox={"boxstyle": "round,pad=0.25", "fc": "white", "ec": "#B4131A", "alpha": 0.9},
         )
 
 
@@ -237,7 +242,7 @@ def _panel_a_observed_condition(
     _plot_freespan_reference_marks(ax, freespans_2018_gdf, halo=True)
     _annotate_event_sections(ax, sections_gdf)
     _add_kp_reference_labels(ax, chainage_reference_gdf)
-    ax.set_title("A. Observed Condition", fontsize=11, fontweight="bold")
+    ax.set_title("A. Observed Condition", fontsize=14, fontweight="bold")
     _add_panel_caption(
         ax, "OBSERVED -- official 2018 corridor freespans (bold red); 2012/2014 context (grey)"
     )
@@ -255,16 +260,19 @@ def _panel_b_hydrodynamic_forcing(
         sections_gdf.plot(
             column="combined_tau_max_p95_upper_pa",
             cmap="inferno",
-            linewidth=4,
+            linewidth=5,
             legend=True,
-            legend_kwds={"label": "Combined bed shear p95 upper bound (Pa)", "shrink": 0.55},
+            legend_kwds={"label": "Combined bed shear p95 upper bound (Pa)", "shrink": 0.6},
             ax=ax,
         )
+        cbar = ax.get_figure().axes[-1]
+        cbar.tick_params(labelsize=9)
+        cbar.yaxis.label.set_fontsize(9.5)
     else:
-        sections_gdf.plot(color="0.4", linewidth=4, ax=ax)
+        sections_gdf.plot(color="0.4", linewidth=5, ax=ax)
     _plot_freespan_reference_marks(ax, freespans_2018_gdf, halo=False)
     _add_kp_reference_labels(ax, chainage_reference_gdf)
-    ax.set_title("B. Hydrodynamic Bed Forcing", fontsize=11, fontweight="bold")
+    ax.set_title("B. Hydrodynamic Bed Forcing", fontsize=14, fontweight="bold")
     _add_panel_caption(
         ax,
         "MODELLED -- MAR-012 p95 sensitivity upper bound; 2018 events are reference marks only, "
@@ -283,7 +291,7 @@ def _panel_c_mobility_capacity(
     has_value = sections_gdf["mobility_capacity_p95_d50_mm"].notna().any()
     if has_value:
         colours = [cmap(norm(v)) for v in sections_gdf["mobility_capacity_p95_d50_mm"]]
-        sections_gdf.plot(ax=ax, color=colours, linewidth=4)
+        sections_gdf.plot(ax=ax, color=colours, linewidth=5)
         present = sorted(sections_gdf["mobility_capacity_p95_d50_mm"].dropna().unique())
         legend_handles = [
             Patch(facecolor=cmap(norm(v)), edgecolor=cmap(norm(v)), label=f"{v:g} mm")
@@ -292,15 +300,15 @@ def _panel_c_mobility_capacity(
         ax.legend(
             handles=legend_handles,
             title="p95 mobility capacity (largest passing D50)",
-            fontsize=6.5,
-            title_fontsize=7,
+            fontsize=8,
+            title_fontsize=8.5,
             loc="upper right",
         )
     else:
-        sections_gdf.plot(color="0.4", linewidth=4, ax=ax)
+        sections_gdf.plot(color="0.4", linewidth=5, ax=ax)
     _plot_freespan_reference_marks(ax, freespans_2018_gdf, halo=False)
     _add_kp_reference_labels(ax, chainage_reference_gdf)
-    ax.set_title("C. Noncohesive Sediment Mobility Capacity", fontsize=11, fontweight="bold")
+    ax.set_title("C. Noncohesive Sediment Mobility Capacity", fontsize=14, fontweight="bold")
     _add_panel_caption(
         ax,
         f"MODELLED -- discrete scale, ladder {ladder_values[0]:g}-{ladder_values[-1]:g} mm "
@@ -316,26 +324,31 @@ def _panel_d_evidence_support(
     psa_points_gdf: gpd.GeoDataFrame,
     chainage_reference_gdf: gpd.GeoDataFrame,
 ) -> None:
-    sections_gdf.plot(ax=ax, color="0.75", linewidth=3, zorder=1)
-    for _, row in sections_gdf.iterrows():
-        boundary_point = row.geometry.interpolate(0.0)
-        ax.plot(boundary_point.x, boundary_point.y, marker="|", color="0.3", markersize=8, zorder=2)
-
+    # Route/support-section structure is the visually PRIMARY layer in this panel (Section 7):
+    # drawn thicker/darker than the old style, and AFTER the survey hatch (never before), so it
+    # always reads on top rather than being visually competed with by the data-availability
+    # overlay.
     if highres_survey_gdf is not None and not highres_survey_gdf.empty:
         highres_survey_gdf.plot(
             ax=ax,
             facecolor="none",
-            edgecolor="#5A3EBD",
-            hatch="//",
-            linewidth=1.0,
-            alpha=0.7,
-            zorder=2,
+            edgecolor="#8B7BC7",
+            hatch="/",
+            linewidth=0.5,
+            alpha=0.3,
+            zorder=1,
+        )
+    sections_gdf.plot(ax=ax, color="0.55", linewidth=4, zorder=3)
+    for _, row in sections_gdf.iterrows():
+        boundary_point = row.geometry.interpolate(0.0)
+        ax.plot(
+            boundary_point.x, boundary_point.y, marker="|", color="0.25", markersize=10, zorder=4
         )
     if psa_points_gdf is not None and not psa_points_gdf.empty:
-        psa_points_gdf.plot(ax=ax, color="#1C7C54", marker="^", markersize=28, zorder=5)
+        psa_points_gdf.plot(ax=ax, color="#1C7C54", marker="^", markersize=34, zorder=5)
 
     _add_kp_reference_labels(ax, chainage_reference_gdf)
-    ax.set_title("D. Evidence / Data Support", fontsize=11, fontweight="bold")
+    ax.set_title("D. Evidence / Data Support", fontsize=14, fontweight="bold")
     survey_note = (
         f"{len(highres_survey_gdf)} route-area survey record(s), ALL metadata-only "
         "(no verified open high-resolution grid)"
@@ -346,10 +359,12 @@ def _panel_d_evidence_support(
         ax, f"DATA AVAILABILITY -- {survey_note}; triangles are observed PSA D50 points"
     )
     legend_handles = [
+        Line2D([0], [0], color="0.55", linewidth=4, label="Support-section structure"),
         Patch(
             facecolor="none",
-            edgecolor="#5A3EBD",
-            hatch="//",
+            edgecolor="#8B7BC7",
+            hatch="/",
+            alpha=0.5,
             label="High-res survey (metadata only)",
         ),
         Line2D(
@@ -358,12 +373,12 @@ def _panel_d_evidence_support(
             marker="^",
             color="none",
             markerfacecolor="#1C7C54",
-            markersize=7,
+            markersize=9,
             label="Observed PSA D50",
         ),
-        Line2D([0], [0], marker="|", color="0.3", markersize=8, label="Support-section boundary"),
+        Line2D([0], [0], marker="|", color="0.25", markersize=10, label="Support-section boundary"),
     ]
-    ax.legend(handles=legend_handles, fontsize=6, loc="upper right")
+    ax.legend(handles=legend_handles, fontsize=8, loc="upper right")
 
 
 def render_engineering_evidence_atlas(
@@ -399,11 +414,11 @@ def render_engineering_evidence_atlas(
     pad_x, pad_y = span_x * 0.06, span_y * 0.10
     content_aspect = (span_x + 2 * pad_x) / (span_y + 2 * pad_y)
 
-    fig_width = 16.0
-    col_width_in = fig_width * 0.94 / 2.0
+    fig_width = 21.0
+    col_width_in = fig_width * 0.96 / 2.0
     panel_height_in = col_width_in / content_aspect
-    text_row_height_in = 2.6
-    title_budget_in = 1.15
+    text_row_height_in = 3.3
+    title_budget_in = 1.4
     fig_height = title_budget_in + 2 * panel_height_in + 0.5 + text_row_height_in
 
     fig = plt.figure(figsize=(fig_width, fig_height))
@@ -475,10 +490,11 @@ def render_engineering_evidence_atlas(
         0.95,
         "\n".join(summary_lines),
         transform=summary_ax.transAxes,
-        fontsize=8.5,
+        fontsize=11.5,
         va="top",
         ha="left",
-        bbox={"boxstyle": "round,pad=0.5", "fc": "#F5F2E9", "ec": "0.4"},
+        linespacing=1.6,
+        bbox={"boxstyle": "round,pad=0.6", "fc": "#F5F2E9", "ec": "0.4"},
     )
 
     limitations_ax = fig.add_subplot(grid[2, 1])
@@ -491,25 +507,26 @@ def render_engineering_evidence_atlas(
         0.95,
         limitations_text,
         transform=limitations_ax.transAxes,
-        fontsize=7.5,
+        fontsize=10.5,
         va="top",
         ha="left",
-        bbox={"boxstyle": "round,pad=0.5", "fc": "#FBEEEE", "ec": "0.4"},
+        linespacing=1.6,
+        bbox={"boxstyle": "round,pad=0.6", "fc": "#FBEEEE", "ec": "0.4"},
     )
 
     fig.suptitle(
         "PL854 Engineering Evidence Atlas",
-        fontsize=16,
+        fontsize=21,
         fontweight="bold",
-        y=1.0 - 0.30 * title_budget_in / fig_height,
+        y=1.0 - 0.28 * title_budget_in / fig_height,
     )
     fig.text(
         0.5,
-        1.0 - 0.68 * title_budget_in / fig_height,
-        f"Anglia A -> LOGGS, Southern North Sea | {_KP_REFERENCE_INTERVAL_LABEL} | "
+        1.0 - 0.66 * title_budget_in / fig_height,
+        f"{_ROUTE_CORRIDOR_LABEL}, Southern North Sea | {_KP_REFERENCE_INTERVAL_LABEL} | "
         "MAP FIRST, REPORT SECOND -- no fused risk/susceptibility score anywhere in this atlas",
         ha="center",
-        fontsize=9,
+        fontsize=11.5,
         style="italic",
         color="0.25",
     )
@@ -522,36 +539,91 @@ def render_engineering_evidence_atlas(
 # --- Evidence strip (Section 13) -----------------------------------------------------------
 
 
+def _kp_primary_ticks(total_length_m: float) -> tuple[list[float], list[str]]:
+    """KP-formatted ticks at 0/5/10/15/20 km plus the exact route terminus
+    (Section 9) -- the terminus is always derived from the real route length,
+    never hard-coded to "23.48"."""
+
+    round_ticks_km = [0, 5, 10, 15, 20]
+    ticks_m = [km * 1000.0 for km in round_ticks_km if km * 1000.0 < total_length_m]
+    labels = [f"KP {km:g}" for km in round_ticks_km if km * 1000.0 < total_length_m]
+    ticks_m.append(total_length_m)
+    labels.append(f"KP {total_length_m / 1000.0:.2f}")
+    return ticks_m, labels
+
+
 def render_evidence_strip(
     *,
     section_df: pd.DataFrame,
     freespans_2018_gdf: gpd.GeoDataFrame,
     output_path: Path,
+    folk_class_descriptions: dict[str, str] | None = None,
     dpi: int = 150,
 ) -> Path:
     """6 aligned chainage bands for same-route evidence COMPARISON -- never a
-    fused score, correlation, or fitted trend (Section 13)."""
+    fused score, correlation, or fitted trend (Section 13). KP is the primary
+    horizontal reference (Section 9); chainage metres remain a secondary,
+    supporting reference on a light top axis."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    folk_class_descriptions = folk_class_descriptions or {}
     ordered = section_df.sort_values("start_chainage_m").reset_index(drop=True)
     total_length_m = float(ordered["end_chainage_m"].max())
 
-    fig, axes = plt.subplots(6, 1, figsize=(14, 11), sharex=True, gridspec_kw={"hspace": 0.15})
+    embedment_classes = sorted(ordered["p95_required_embedment_upper_class"].dropna().unique())
+    embedment_uniform = len(embedment_classes) == 1
 
-    # Band 1: official 2018 observed freespan intervals, TRUE width.
+    height_ratios = [0.9, 1.3, 1.3, 0.45 if embedment_uniform else 1.1, 1.3, 1.15]
+    fig = plt.figure(figsize=(15, 11.5))
+    grid = fig.add_gridspec(6, 1, height_ratios=height_ratios, hspace=0.22, top=0.92, bottom=0.08)
+    axes = [fig.add_subplot(grid[0, 0])]
+    axes += [fig.add_subplot(grid[i, 0], sharex=axes[0]) for i in range(1, 6)]
+
+    # Band 1: official 2018 observed freespan intervals, TRUE width, plus an
+    # independent visibility marker for screen readability (Section 10) -- the marker
+    # is placed via the axes' x-data/y-axes-fraction transform so it never implies a
+    # y-value, and never substitutes for the true-width span itself.
     ax = axes[0]
     if freespans_2018_gdf is not None and not freespans_2018_gdf.empty:
         for _, row in freespans_2018_gdf.iterrows():
             ax.axvspan(
                 row["canonical_chainage_min_m"], row["canonical_chainage_max_m"], color="#B4131A"
             )
-    ax.set_ylabel("2018\nfreespans\n(true width)", fontsize=7, rotation=0, ha="right", va="center")
+            mid_chainage_m = (
+                row["canonical_chainage_min_m"] + row["canonical_chainage_max_m"]
+            ) / 2.0
+            ax.plot(
+                mid_chainage_m,
+                0.78,
+                marker="v",
+                color="#B4131A",
+                markersize=7,
+                transform=ax.get_xaxis_transform(),
+                clip_on=False,
+                zorder=5,
+            )
+    ax.set_ylabel("2018\nfreespans\n(true width)", fontsize=8, rotation=0, ha="right", va="center")
     ax.set_yticks([])
     ax.set_title(
         "PL854 Engineering Evidence Strip -- same-route comparison, not prediction",
-        fontsize=11,
+        fontsize=13,
         fontweight="bold",
+        pad=14,
     )
+    ax.text(
+        0.995,
+        0.05,
+        "bar width = true tabulated spatial interval; marker (▽) = visibility aid only",
+        transform=ax.transAxes,
+        fontsize=6.5,
+        style="italic",
+        color="0.3",
+        ha="right",
+        va="bottom",
+    )
+    secondary_ax = ax.secondary_xaxis("top", functions=(lambda x: x, lambda x: x))
+    secondary_ax.set_xlabel("Chainage (m) -- secondary reference", fontsize=7.5, color="0.4")
+    secondary_ax.tick_params(labelsize=7, colors="0.4")
 
     # Band 2: combined bed-shear p95 sensitivity envelope.
     ax = axes[1]
@@ -564,7 +636,7 @@ def render_evidence_strip(
             color="#C1440E",
             alpha=0.6,
         )
-    ax.set_ylabel("Combined\nshear p95\n(Pa)", fontsize=7, rotation=0, ha="right", va="center")
+    ax.set_ylabel("Combined\nshear p95\n(Pa)", fontsize=8, rotation=0, ha="right", va="center")
 
     # Band 3: MAR-013 mobility capacity.
     ax = axes[2]
@@ -574,13 +646,35 @@ def render_evidence_strip(
         where="post",
         color="#2E6F40",
     )
-    ax.set_ylabel("Mobility\ncapacity\n(mm)", fontsize=7, rotation=0, ha="right", va="center")
+    ax.set_ylabel("Mobility\ncapacity\n(mm)", fontsize=8, rotation=0, ha="right", va="center")
 
-    # Band 4: MAR-014 required tested embedment class.
+    # Band 4: MAR-014 scour-onset screening class -- a slim categorical band when the
+    # real value is spatially uniform (Section 11), never labelled "required"/"safe"/
+    # "design" burial; falls back to the full line-plot rendering if a future dataset
+    # ever shows real spatial variation, so this stays correct rather than hard-coded to
+    # today's uniform finding.
     ax = axes[3]
-    embedment_values = pd.to_numeric(ordered["p95_required_embedment_upper_class"], errors="coerce")
-    ax.step(ordered["start_chainage_m"], embedment_values, where="post", color="#5A3EBD")
-    ax.set_ylabel("Embedment\nclass\n(xD)", fontsize=7, rotation=0, ha="right", va="center")
+    if embedment_uniform:
+        value = embedment_classes[0]
+        ax.set_facecolor("#EDE7F6")
+        ax.text(
+            0.5,
+            0.5,
+            f"Scour-onset screening: {value}D throughout current support",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=9.5,
+            fontweight="bold",
+            color="#3D2B7A",
+        )
+        ax.set_yticks([])
+    else:
+        embedment_values = pd.to_numeric(
+            ordered["p95_required_embedment_upper_class"], errors="coerce"
+        )
+        ax.step(ordered["start_chainage_m"], embedment_values, where="post", color="#5A3EBD")
+    ax.set_ylabel("Scour-onset\nscreening\n(xD)", fontsize=8, rotation=0, ha="right", va="center")
 
     # Band 5: local relief (1000 m radius) morphology context.
     ax = axes[4]
@@ -590,9 +684,10 @@ def render_evidence_strip(
         where="post",
         color="0.35",
     )
-    ax.set_ylabel("Local\nrelief\n(m)", fontsize=7, rotation=0, ha="right", va="center")
+    ax.set_ylabel("Local\nrelief\n(m)", fontsize=8, rotation=0, ha="right", va="center")
 
-    # Band 6: mapped 1:250k Folk class.
+    # Band 6: mapped 1:250k Folk class -- legend descriptions come ONLY from the
+    # already-existing BGS free-text label (never an invented meaning, Section 12).
     ax = axes[5]
     folk_classes = sorted(ordered["mapped_250k_folk_class"].dropna().unique())
     folk_colours = {cls: plt.get_cmap("tab10")(i) for i, cls in enumerate(folk_classes)}
@@ -603,27 +698,43 @@ def render_evidence_strip(
             color=folk_colours.get(row["mapped_250k_folk_class"], "0.8"),
         )
     ax.set_yticks([])
-    ax.set_ylabel("Folk\nclass\n(1:250k)", fontsize=7, rotation=0, ha="right", va="center")
-    handles = [Patch(facecolor=c, label=cls) for cls, c in folk_colours.items()]
+    ax.set_ylabel(
+        "Folk class\n(BGS 1:250k\nregional)", fontsize=8, rotation=0, ha="right", va="center"
+    )
+    handles = [
+        Patch(
+            facecolor=colour,
+            label=(
+                f"{cls} — {folk_class_descriptions[cls].lower()}"
+                if cls in folk_class_descriptions
+                else cls
+            ),
+        )
+        for cls, colour in folk_colours.items()
+    ]
     ax.legend(
         handles=handles,
         loc="upper center",
-        bbox_to_anchor=(0.5, -0.6),
+        bbox_to_anchor=(0.5, -0.75),
         ncol=len(handles),
-        fontsize=6.5,
+        fontsize=8,
     )
 
-    axes[-1].set_xlabel("Chainage (m)", fontsize=8)
+    kp_ticks_m, kp_labels = _kp_primary_ticks(total_length_m)
+    axes[-1].set_xticks(kp_ticks_m)
+    axes[-1].set_xticklabels(kp_labels)
+    axes[-1].tick_params(axis="x", labelsize=9.5)
+    axes[-1].set_xlabel("KP (primary reference)", fontsize=9)
     axes[-1].set_xlim(0.0, total_length_m)
 
     fig.text(
         0.5,
-        0.005,
+        0.01,
         "Bands are ALIGNED, not fused: observed / modelled (screening) / legacy-regional-context "
         "evidence remain visually and semantically distinct. No correlation or fitted trend is "
         "shown.",
         ha="center",
-        fontsize=7.5,
+        fontsize=8.5,
         style="italic",
         color="0.25",
     )

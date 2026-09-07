@@ -20,6 +20,7 @@ from marine_engine.analogs import idr_bnr_cend1111 as idrbnr_analog
 from marine_engine.config import load_study_config
 from marine_engine.evidence_atlas import core as evidence_atlas_core
 from marine_engine.evidence_atlas import maps as evidence_atlas_maps
+from marine_engine.evidence_atlas import poc as evidence_atlas_poc
 from marine_engine.evidence_atlas import report as evidence_atlas_report
 from marine_engine.metocean import (
     combined_bed_shear,
@@ -5984,6 +5985,267 @@ def _cmd_build_engineering_evidence_atlas(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_marine_poc_review_package(args: argparse.Namespace) -> int:
+    """MAR-019: OrbGSS Marine POC v0.1 external-reviewer package. Product-
+    framing / presentation only -- no new geohazard physics, no risk score, no
+    ML. Reuses MAR-018's already-accepted outputs by READING them back (never
+    rebuilding via `evidence_atlas.core`), so the canonical scientific values
+    can never drift during this ticket's work. No network.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    working_crs = config.crs.horizontal
+
+    missing = evidence_atlas_poc.check_mar018_outputs_present(study_dir)
+    if missing:
+        print(
+            "error: missing required accepted MAR-018 output(s) -- run "
+            "'build-engineering-evidence-atlas' first:",
+            file=sys.stderr,
+        )
+        for item in missing:
+            print(f"  - {item}", file=sys.stderr)
+        return 1
+
+    maps_dir = study_dir / "maps"
+    report_dir = study_dir / "report"
+    poc_dir = study_dir / "poc"
+
+    print("Reloading already-accepted MAR-018 section evidence + GIS layers (no recomputation)...")
+    mar018_paths = evidence_atlas_poc.required_mar018_outputs(study_dir)
+    section_df = pd.read_parquet(mar018_paths["section_evidence_parquet"])
+    layers = evidence_atlas_poc.read_atlas_gpkg_layers(
+        mar018_paths["atlas_gpkg"], working_crs=working_crs
+    )
+    route = layers["pipeline_route"].geometry.iloc[0]
+    print(f"  {len(section_df)} section(s), {len(layers)} GIS layer(s) reloaded unchanged")
+
+    condition_benchmark = json.loads(
+        mar018_paths["condition_benchmark"].read_text(encoding="utf-8")
+    )
+    freespans_2018_gdf = layers["observed_freespans_2018"]
+    observed_condition_summary = {
+        "event_count": int(freespans_2018_gdf["source_length_m"].count()),
+        "total_length_m": float(freespans_2018_gdf["source_length_m"].sum()),
+        "max_length_m": float(freespans_2018_gdf["source_length_m"].max()),
+        "max_height_m": float(freespans_2018_gdf["source_height_m"].max()),
+        "exposed_section_count": condition_benchmark["exposed_section_count"],
+        "total_exposed_length_m": condition_benchmark["total_exposed_length_m"],
+    }
+    key_limitations = (
+        "Hydrodynamic forcing (2024-2026) postdates the 2018 observations",
+        "Current/wave support (~1.5-2 km) vs observed spans (~0.2-23 m)",
+        "Route-scale morphology derives from 1991-1992 regional bathymetry",
+        "No verified open 2018 Fugro bathymetric grid",
+        "No observed continuous route embedment profile",
+        "No continuous quantitative route D50",
+        "PL854 vs PL855 freespan attribution unresolved",
+    )
+    background_raster_path = study_dir / "bathymetry" / "emodnet_baseline_lat_100m.tif"
+    background_raster_path = background_raster_path if background_raster_path.exists() else None
+
+    sediment_df = pd.read_parquet(mar018_paths["chainage_sediment_evidence"])
+    folk_class_descriptions = (
+        sediment_df[["mapped_250k_folk_class", "mapped_250k_folk_d50_text"]]
+        .drop_duplicates()
+        .set_index("mapped_250k_folk_class")["mapped_250k_folk_d50_text"]
+        .to_dict()
+    )
+
+    print("Re-rendering polished engineering evidence atlas (Sections 4-8)...")
+    atlas_png_path = evidence_atlas_maps.render_engineering_evidence_atlas(
+        route=route,
+        sections_gdf=layers["engineering_support_sections"],
+        freespans_2018_gdf=freespans_2018_gdf,
+        historical_freespans_gdf=layers["historical_freespans_2012_2018"],
+        psa_points_gdf=layers["observed_psa_d50_points"],
+        highres_survey_gdf=layers["highres_survey_inventory"],
+        chainage_reference_gdf=layers["chainage_reference_points"],
+        observed_condition_summary=observed_condition_summary,
+        key_limitations=key_limitations,
+        output_path=maps_dir / "pl854_engineering_evidence_atlas.png",
+        background_raster_path=background_raster_path,
+    )
+    print(f"  -> {atlas_png_path}")
+
+    print("Re-rendering polished KP evidence strip (Sections 9-12)...")
+    strip_png_path = evidence_atlas_maps.render_evidence_strip(
+        section_df=section_df,
+        freespans_2018_gdf=freespans_2018_gdf,
+        folk_class_descriptions=folk_class_descriptions,
+        output_path=maps_dir / "pl854_engineering_evidence_strip.png",
+    )
+    print(f"  -> {strip_png_path}")
+
+    print("Rebuilding engineering evidence report with corrected wording (Section 13-14)...")
+    morphology_df = pd.read_parquet(
+        study_dir / "morphology" / "chainage_regional_morphology.parquet"
+    )
+    depth_stats = {
+        "min_m": float(morphology_df["depth_lat_m"].min()),
+        "median_m": float(morphology_df["depth_lat_m"].median()),
+        "max_m": float(morphology_df["depth_lat_m"].max()),
+    }
+    sediment_metadata = json.loads(
+        (study_dir / "sediment" / "sediment_evidence_metadata.json").read_text(encoding="utf-8")
+    )
+    morphology_metadata = json.loads(
+        (study_dir / "morphology" / "morphology_metadata.json").read_text(encoding="utf-8")
+    )
+    seabed_data_access_gap = json.loads(
+        (study_dir / "seabed_data" / "seabed_data_access_gap.json").read_text(encoding="utf-8")
+    )
+    analog_family_status_path = (
+        config.paths.processed_dir
+        / "analogs"
+        / "sandwave_morphometry_engine_validation_status.json"
+    )
+    analog_family_status = (
+        json.loads(analog_family_status_path.read_text(encoding="utf-8"))
+        if analog_family_status_path.exists()
+        else {}
+    )
+    route_length_km = float(route.length) / 1000.0
+
+    report_blocks = evidence_atlas_report.build_report_blocks(
+        section_df=section_df,
+        freespans_2018_gdf=freespans_2018_gdf,
+        historical_freespans_gdf=layers["historical_freespans_2012_2018"],
+        condition_benchmark=condition_benchmark,
+        route_length_km=route_length_km,
+        depth_stats=depth_stats,
+        sediment_metadata=sediment_metadata,
+        morphology_metadata=morphology_metadata,
+        highres_survey_df=pd.read_parquet(
+            study_dir / "seabed_data" / "high_resolution_survey_inventory.parquet"
+        ),
+        seabed_data_access_gap=seabed_data_access_gap,
+        analog_family_status=analog_family_status,
+        key_limitations=key_limitations,
+    )
+    html_report_path = evidence_atlas_report.write_html_report(
+        report_blocks, report_dir / "pl854_engineering_evidence_report.html"
+    )
+    md_report_path = evidence_atlas_report.write_markdown_report(
+        report_blocks, report_dir / "pl854_engineering_evidence_report.md"
+    )
+    print(f"  HTML -> {html_report_path}")
+    print(f"  Markdown -> {md_report_path}")
+
+    print("Building POC overview (Sections 15-18)...")
+    overview_blocks = evidence_atlas_poc.build_poc_overview_blocks()
+    overview_html_path = poc_dir / "orbgss_marine_poc_overview.html"
+    overview_md_path = poc_dir / "orbgss_marine_poc_overview.md"
+    overview_html_path.parent.mkdir(parents=True, exist_ok=True)
+    overview_html_path.write_text(
+        evidence_atlas_report.render_blocks_html(
+            overview_blocks, title=evidence_atlas_poc.POC_TITLE
+        ),
+        encoding="utf-8",
+    )
+    overview_md_path.write_text(
+        evidence_atlas_report.render_blocks_markdown(overview_blocks), encoding="utf-8"
+    )
+    print(f"  HTML -> {overview_html_path}")
+    print(f"  Markdown -> {overview_md_path}")
+
+    print("Building external reviewer guide (Sections 19-21)...")
+    review_guide_path = poc_dir / "external_georisk_review_guide.md"
+    review_guide_path.write_text(evidence_atlas_poc.build_review_guide_markdown(), encoding="utf-8")
+    print(f"  -> {review_guide_path}")
+
+    print("Building POC package index (Section 22)...")
+    index_path = poc_dir / "index.html"
+    index_html = evidence_atlas_poc.build_poc_index_html(
+        deliverables=[
+            {
+                "title": "Marine POC Overview",
+                "href": "orbgss_marine_poc_overview.html",
+                "description": "3-5 minute product-demonstrator overview for an external "
+                "georisk engineer.",
+            },
+            {
+                "title": "Engineering Evidence Atlas",
+                "href": "../maps/pl854_engineering_evidence_atlas.png",
+                "description": "Map View: 4-panel spatial evidence/hazard figure (observed, "
+                "modelled, screening, data support).",
+            },
+            {
+                "title": "KP Evidence Strip",
+                "href": "../maps/pl854_engineering_evidence_strip.png",
+                "description": "KP / Route View: aligned along-route engineering evidence bands.",
+            },
+            {
+                "title": "Engineering Evidence Report",
+                "href": "../report/pl854_engineering_evidence_report.html",
+                "description": "Human-readable project conclusions, provenance and limitations.",
+            },
+            {
+                "title": "External Reviewer Guide",
+                "href": "external_georisk_review_guide.md",
+                "description": "Engineering/product questions for a domain reviewer, plus "
+                "data-authorization guidance.",
+            },
+        ]
+    )
+    index_path.write_text(index_html, encoding="utf-8")
+    print(f"  -> {index_path}")
+
+    print("Writing POC review-package manifest (Section 26)...")
+    generated_at_utc = datetime.now(UTC).isoformat()
+    package_manifest = evidence_atlas_report.build_package_manifest(
+        deliverables={
+            "poc_index_html": index_path,
+            "poc_overview_html": overview_html_path,
+            "poc_overview_md": overview_md_path,
+            "external_review_guide_md": review_guide_path,
+            "polished_atlas_png": atlas_png_path,
+            "polished_evidence_strip_png": strip_png_path,
+            "engineering_report_html": html_report_path,
+        },
+        generated_at_utc=generated_at_utc,
+        project_root=Path.cwd(),
+    )
+    package_manifest_path = poc_dir / "poc_review_package_manifest.json"
+    evidence_atlas_report.write_package_manifest(package_manifest, package_manifest_path)
+    print(f"  {package_manifest['file_count']} file(s) -> {package_manifest_path}")
+
+    atlas_dims = evidence_atlas_maps.read_png_dimensions(atlas_png_path)
+    strip_dims = evidence_atlas_maps.read_png_dimensions(strip_png_path)
+    print()
+    print("=== OrbGSS Marine POC Review Package (MAR-019) ===")
+    print()
+    print("## Presentation")
+    print(f"  Atlas dimensions: {atlas_dims[0]}x{atlas_dims[1]} px -> {atlas_png_path}")
+    print(f"  Strip dimensions: {strip_dims[0]}x{strip_dims[1]} px -> {strip_png_path}")
+    print()
+    print("## POC package")
+    print(
+        f"  {package_manifest['file_count']} file(s), "
+        f"{sum(f['file_size_bytes'] for f in package_manifest['files'])} bytes total"
+    )
+    print(f"  Manifest: {package_manifest_path}")
+    print(f"  Index: {index_path}")
+    print()
+    print(
+        "ORB GSS MARINE MODULE POC ASSUMES OPERATOR-SUPPLIED PROJECT-GRADE SURVEY / "
+        "GEOPHYSICAL / GEOTECHNICAL DATA IN A PRODUCTION DEPLOYMENT."
+    )
+    print(
+        "ORB GSS IS THE SOFTWARE ANALYTICS / GIS / ENGINEERING-COMMUNICATION LAYER; THIS "
+        "POC DOES NOT POSITION ORBGSS AS THE PRIMARY SURVEY OR DRILLING CONTRACTOR."
+    )
+    print("PL854 IS A PUBLIC-DATA DEVELOPMENT / DEMONSTRATION CASE.")
+    print("NO NEW GEOHAZARD PHYSICS OR RISK SCORE WAS INTRODUCED IN MAR-019.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -6314,6 +6576,22 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_engineering_evidence_atlas_parser.set_defaults(func=_cmd_build_engineering_evidence_atlas)
+
+    build_marine_poc_review_package_parser = subparsers.add_parser(
+        "build-marine-poc-review-package",
+        help=(
+            "MAR-019: OrbGSS Marine POC v0.1 external-reviewer package -- product-framing/"
+            "presentation only. Re-renders the MAR-018 atlas/strip with layout and typography "
+            "polish, corrects report wording, and builds a POC overview + external reviewer "
+            "guide + package index. No network, no new geohazard physics, no risk score. "
+            "Reuses MAR-018's accepted outputs by reading them back, never recomputing. "
+            "Outputs live under processed/pl854/poc/ (plus re-rendered maps/report/)."
+        ),
+    )
+    build_marine_poc_review_package_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_marine_poc_review_package_parser.set_defaults(func=_cmd_build_marine_poc_review_package)
 
     return parser
 

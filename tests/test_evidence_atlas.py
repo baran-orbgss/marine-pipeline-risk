@@ -440,7 +440,7 @@ def test_O_html_report_builds_without_network(monkeypatch):
     monkeypatch.setattr(socket, "socket", _blocked)
 
     blocks = _build_minimal_report_blocks()
-    html_text = report._render_html(blocks)
+    html_text = report.render_blocks_html(blocks, title="Test Report")
 
     assert "<html" in html_text
     assert "PL854 Engineering Evidence Report" in html_text

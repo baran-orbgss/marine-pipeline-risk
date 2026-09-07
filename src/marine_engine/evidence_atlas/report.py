@@ -4,8 +4,8 @@ Format-neutral content, two renderers
 --------------------------------------
 `build_report_blocks()` derives every factual statement from already-loaded
 real data (never a hard-coded stale number) into a small format-neutral
-block list (heading/paragraph/list/table/callout). `_render_html`/
-`_render_markdown` turn that SAME block list into the two required output
+block list (heading/paragraph/list/table/callout). `render_blocks_html`/
+`render_blocks_markdown` turn that SAME block list into the two required output
 formats, so the HTML and Markdown reports can never drift apart. No
 external template engine is used (none is installed in this project) --
 plain string building only, offline, no JavaScript.
@@ -349,6 +349,27 @@ def build_report_blocks(
         }
     )
 
+    blocks.append({"type": "heading", "level": 2, "text": "About the OrbGSS Marine POC"})
+    blocks.append(
+        {
+            "type": "list",
+            "items": [
+                "This PL854 analysis is a public-data proof of concept (POC) for the future "
+                "OrbGSS Marine Module, not a production deployment",
+                "Production deployments are designed around operator-supplied, project-grade "
+                "survey and engineering data (MBES, sidescan sonar, sub-bottom/HR seismic, CPT, "
+                "boreholes, grab samples, metocean, pipeline design parameters)",
+                "Public/regional data such as EMODnet regional bathymetry are not intended to "
+                "substitute for project-grade MBES, geophysical, or geotechnical surveys in a "
+                "real deployment",
+                "Primary geological/geophysical interpretation may remain operator- or "
+                "consultant-supplied where appropriate",
+                "OrbGSS provides the software analytics / GIS / engineering-communication "
+                "layer that converts project data into engineering-ready analytics",
+            ],
+        }
+    )
+
     blocks.append({"type": "heading", "level": 2, "text": "2. Pipeline and Study Route"})
     blocks.append(
         {
@@ -499,9 +520,11 @@ def build_report_blocks(
         {
             "type": "list",
             "items": [
-                "8 official 2018 corridor freespan/exposure events are spatially and "
-                "aggregately documented from an authoritative source, with a fully reconciled "
-                "chainage location",
+                f"{facts['observed_event_count']} official 2018 corridor freespan events are "
+                "spatially documented from an authoritative source, with a fully reconciled "
+                "chainage location. Exposure is available only as aggregate corridor evidence: "
+                f"{condition_benchmark['exposed_section_count']} exposed sections / "
+                f"{condition_benchmark['total_exposed_length_m']:.0f} m total",
                 "Contemporaneous (2024-2026) hydrodynamic forcing, noncohesive sediment "
                 "mobility capacity, and scour-onset screening class are available at "
                 "14-section spatial support",
@@ -644,7 +667,7 @@ def build_report_blocks(
     return blocks
 
 
-def _render_html(blocks: list[dict[str, Any]]) -> str:
+def render_blocks_html(blocks: list[dict[str, Any]], *, title: str) -> str:
     def esc(text: str) -> str:
         return html_module.escape(text)
 
@@ -689,12 +712,12 @@ def _render_html(blocks: list[dict[str, Any]]) -> str:
     """
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
-        "<title>PL854 Engineering Evidence Report</title>"
+        f"<title>{esc(title)}</title>"
         f"<style>{style}</style></head><body>{body}</body></html>"
     )
 
 
-def _render_markdown(blocks: list[dict[str, Any]]) -> str:
+def render_blocks_markdown(blocks: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for block in blocks:
         kind = block["type"]
@@ -723,13 +746,15 @@ def _render_markdown(blocks: list[dict[str, Any]]) -> str:
 
 def write_html_report(blocks: list[dict[str, Any]], output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(_render_html(blocks), encoding="utf-8")
+    output_path.write_text(
+        render_blocks_html(blocks, title="PL854 Engineering Evidence Report"), encoding="utf-8"
+    )
     return output_path
 
 
 def write_markdown_report(blocks: list[dict[str, Any]], output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(_render_markdown(blocks), encoding="utf-8")
+    output_path.write_text(render_blocks_markdown(blocks), encoding="utf-8")
     return output_path
 
 

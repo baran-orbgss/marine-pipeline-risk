@@ -79,6 +79,7 @@ uv run marine-engine build-regional-morphology configs/pl854.yaml
 uv run marine-engine build-sediment-evidence configs/pl854.yaml
 uv run marine-engine build-metocean-evidence configs/pl854.yaml
 uv run marine-engine build-engineering-evidence-atlas configs/pl854.yaml
+uv run marine-engine build-marine-poc-review-package configs/pl854.yaml
 ```
 
 `ingest-pipeline`, `discover-bathymetry`, `fetch-bathymetry`,
@@ -1564,5 +1565,58 @@ otherwise, never an interactive credential prompt.
   Python `socket` module itself blocked; MAR-017 analog data never
   reaches a section-evidence column or the `core` module's own source);
   the full offline suite (1056 tests, 25 live/network tests correctly
+  deselected) and repo-wide `ruff format`/`ruff check` pass clean.
+
+- `MAR-019`: the OrbGSS Marine POC v0.1 external-reviewer package -- a
+  product-framing/presentation milestone introducing NO new geohazard
+  physics, NO risk/susceptibility score, and NO scientific recomputation:
+  the new `build-marine-poc-review-package` command REREADS MAR-018's
+  already-persisted `pl854_section_evidence.parquet` and atlas GeoPackage
+  layers directly (never calling `evidence_atlas.core`'s build functions),
+  so the canonical scientific values are provably frozen. Repairs three
+  real, externally-flagged presentation problems in the MAR-018 atlas: (1)
+  a naive 2x2 panel layout with guessed height ratios left large blank
+  margins -- root-caused by direct `ax.get_position()` introspection
+  (`ax.set_aspect("equal")` always shrinks a mismatched box down to the
+  data's own aspect ratio, never the reverse) rather than continued
+  guessing, then fixed by deriving each panel's height from its width and
+  the real content aspect ratio and enlarging the whole figure
+  (16in -> 21in wide, ~30% larger boxes/typography); (2) Panel D's
+  high-resolution-survey hatch visually dominated the route -- fixed by
+  switching from a dense cross-hatch to a sparse, low-alpha single-
+  direction hatch and redrawing the route/support-section structure on
+  top, at higher contrast; (3) the title asserted an unverified physical
+  flow direction (`Anglia A -> LOGGS`) -- replaced with the non-directional
+  `Anglia A-LOGGS corridor` everywhere. The evidence strip gained KP-
+  primary tick labels (chainage metres demoted to a light secondary axis),
+  an independent visibility marker above each true-width 2018 freespan
+  interval (the true width itself is never altered -- confirmed by a test
+  that asserts the source GeoDataFrame's geometry and chainage columns are
+  bit-identical before/after rendering), a compact categorical scour-onset
+  screening band (replacing a full-height line plot of what is, in the
+  real data, a spatially uniform value) explicitly labelled "screening",
+  never "required"/"design" burial, and Folk-class legend descriptions
+  sourced verbatim from BGS's own existing free-text field (`S` -- sand,
+  `gS` -- gravelly sand, `(g)S` -- slightly gravelly sand) rather than an
+  invented mapping. The engineering report gained a corrected Section 9
+  (no longer conflates freespan events with the separate, aggregate-only
+  exposure evidence) and a new "About the OrbGSS Marine POC" section. Two
+  new artifacts frame the product itself for an external georisk reviewer:
+  a 3-5-minute POC overview (measured/interpreted/derived data model,
+  a non-committal future hazard-map concept table using only
+  "demonstrated"/"screening prototype"/"planned" statuses, explicit
+  product negatives -- OrbGSS is not a survey/geophysical/drilling
+  contractor) and an external review guide organized around engineering
+  relevance, data input, scientific interpretation, GIS usability,
+  reporting, workflow, and misinterpretation risk, plus a data-
+  authorization/privacy caveat stating PL854 public data are sufficient
+  for this first review round. An offline `docs/marine_module_poc_
+  architecture.md` records the future generic (Project / Ingestion / QA /
+  Canonical Model / Measured / Interpreted / Derived / Map / KP / Report)
+  architecture as a concept only -- explicitly the next milestone
+  boundary, explicitly not implemented here. 37 new tests (21 in
+  `test_evidence_atlas.py` for the atlas/report changes, 16 in
+  `test_marine_poc.py` for the new POC package) cover the required list;
+  the full offline suite (1072 tests, 25 live/network tests correctly
   deselected) and repo-wide `ruff format`/`ruff check` pass clean. No
   further ticket has started.
