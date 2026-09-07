@@ -1,0 +1,52 @@
+# Study configuration for the Sheringham Shoal 2020 high-resolution seabed terrain POC (MAR-020).
+#
+# This is the FIRST non-PL854 OrbGSS Marine Module benchmark project. It is
+# a public-data operator-style benchmark, not a pipeline route study: there
+# is no pipeline geometry, no chainage, and no KP view (see
+# `marine_engine.terrain` for why -- Section 15 of MAR-020 is explicit that
+# a route/KP view must never be fabricated when no authoritative route
+# vector is supplied).
+#
+# Source: The Crown Estate / Marine Data Exchange, series TCE-1986,
+# "2020, Fugro, Sheringham Shoal, Seabed Monitoring Survey"
+# (see src/marine_engine/providers/bathymetry/sheringham_shoal_2020.py).
+
+study:
+  id: SHERINGHAM_SHOAL_2020
+  name: "Sheringham Shoal 2020 High-Resolution Seabed Terrain POC"
+  description: >
+    Generic high-resolution bathymetry / seabed terrain analytics
+    demonstrator (ORBGSS_MARINE_OPERATOR_DATA_BENCHMARK), benchmarked
+    against the real 2020 Fugro Sheringham Shoal Seabed Monitoring Survey
+    (The Crown Estate Marine Data Exchange, TCE-1986). Public-data
+    development case only -- not PL854 evidence, no geohazard
+    interpretation.
+  design_life_years: null  # not applicable: this is a terrain-analytics POC, not a pipeline study.
+
+crs:
+  # EPSG:32631 (WGS84 / UTM zone 31N) confirmed directly from the real downloaded raster's own
+  # affine/CRS metadata via rasterio -- not assumed from the PL854 config's own use of the same
+  # zone (the two projects merely happen to share a zone, being in the same general region).
+  horizontal: "EPSG:32631"
+  vertical: null  # source vertical datum is LAT (Lowest Astronomical Tide); see terrain_input_contract.json.
+
+area_of_interest:
+  # No buffered AOI polygon is built for this project: the raster's own real extent IS the
+  # working area (Section 15: no pipeline route/corridor concept applies here).
+  bbox_wgs84: null
+  corridor_buffer_m: null
+
+paths:
+  raw_dir: data/raw
+  interim_dir: data/interim
+  processed_dir: data/processed
+
+providers: {}
+preprocessing: {}
+morphology: {}
+sediment: {}
+metocean: {}
+pipeline: {}
+risk: {}
+validation: {}
+export: {}

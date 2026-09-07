@@ -80,6 +80,7 @@ uv run marine-engine build-sediment-evidence configs/pl854.yaml
 uv run marine-engine build-metocean-evidence configs/pl854.yaml
 uv run marine-engine build-engineering-evidence-atlas configs/pl854.yaml
 uv run marine-engine build-marine-poc-review-package configs/pl854.yaml
+uv run marine-engine build-highres-terrain-poc configs/sheringham_shoal_2020.yaml
 ```
 
 `ingest-pipeline`, `discover-bathymetry`, `fetch-bathymetry`,
@@ -1618,5 +1619,61 @@ otherwise, never an interactive credential prompt.
   `test_evidence_atlas.py` for the atlas/report changes, 16 in
   `test_marine_poc.py` for the new POC package) cover the required list;
   the full offline suite (1072 tests, 25 live/network tests correctly
-  deselected) and repo-wide `ruff format`/`ruff check` pass clean. No
-  further ticket has started.
+  deselected) and repo-wide `ruff format`/`ruff check` pass clean.
+
+- `MAR-020`: the first non-PL854 OrbGSS Marine Module benchmark --
+  operator-supplied high-resolution bathymetry to generic terrain
+  analytics, deliberately on a DIFFERENT real project (`sheringham_shoal_
+  2020`, benchmarked against the real 2020 Fugro/Equinor Sheringham Shoal
+  Seabed Monitoring Survey, The Crown Estate Marine Data Exchange series
+  TCE-1986) to prove the engine generalizes beyond PL854, not just a
+  second PL854 feature. The one needed file
+  (`G201193_20210127_SS_MBES_1m_LAT.tif`, 162,924,933 bytes,
+  SHA256 `c5e3ee92...`) was range-fetched out of a ~1.01 GB combined ZIP
+  (reusing MAR-017C's `RemoteZipReader` HTTP-Range pattern) after an
+  explicit user confirmation, never the whole bundle. Direct `rasterio`
+  inspection (never the filename) confirmed single-band float32
+  EPSG:32631 at exactly 1 m, and -- contradicting the ticket's assumed
+  default case -- that the raw values were ALREADY elevation-style
+  (-24.397 to -3.189 m), so the canonical `bed_elevation_m` conversion
+  applies zero sign flip, with both conventions preserved in the record.
+  A brand-new, from-scratch generic windowed-moment terrain engine (8
+  layers: slope/aspect/profile curvature/plan curvature/local relief/
+  terrain std/ruggedness, over the canonical bathymetry) hit a genuine
+  `MemoryError: std::bad_alloc` on the real 252,386,550-pixel raster --
+  root-caused to FFT convolution over a circular footprint padding to
+  large complex-valued intermediate arrays -- and was redesigned around
+  an exact (not approximated) square window computed as two separable 1D
+  `scipy.ndimage.correlate1d` passes per moment, memory-bounded regardless
+  of raster size; re-validated against 12 synthetic cases (planar slope/
+  aspect exact recovery, cardinal aspects, paraboloid curvature sign,
+  nodata non-contamination, physical-window invariance across pixel
+  sizes, and a checkerboard ruggedness case matching an exact closed-form
+  derived for the square window to 1e-9), then confirmed end-to-end on
+  the real raster with no crash (slope/aspect ~140-190s, curvature
+  ~130-140s, relief/std/ruggedness ~25-60s each at two physical scales).
+  Aspect and curvature (Zevenbergen & Thorne 1987) are greenfield -- no
+  prior implementation existed anywhere in the codebase. Three further
+  real bugs were found and fixed from actually running the full CLI
+  against the real raster, not just the synthetic suite: the acquisition
+  function still issued a live HEAD request on every cache hit (fixed
+  with a JSON sidecar, verified via a real second invocation with
+  `already_cached=True` and zero network I/O); the readiness JSON's
+  `crs_present` check carried a hard-coded failure message even when it
+  passed, and two other checks leaked a `numpy.bool_` into the JSON as
+  the string `"True"` instead of a proper boolean (both confirmed against
+  the real output and fixed); and the terrain atlas's fixed 2-column grid
+  left each panel mostly blank for the real survey's narrow ~1:2.7
+  portrait swath, fixed by deriving panel geometry from the content's own
+  aspect ratio (mirroring the MAR-018/019 atlas layout fix). No route/KP
+  view is fabricated in the absence of a supplied route
+  (`NOT_APPLICABLE_NO_AUTHORITATIVE_ROUTE_SUPPLIED`, verified by a
+  source-inspection test). No risk, susceptibility, freespan, or scour
+  score exists anywhere in this module -- terrain analytics only. 35 new
+  tests (`test_terrain_poc.py`) cover the required list, including a
+  fix for one genuinely flaky test (a `socket.socket` monkeypatch that
+  raced real DNS resolution, replaced with a deterministic
+  `requests.Session.head` patch, confirmed clean across 6 consecutive
+  full-suite runs); the full offline suite (1107 tests, 25 live/network
+  tests correctly deselected) and repo-wide `ruff format`/`ruff check`
+  pass clean. No further ticket has started.

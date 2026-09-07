@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,11 @@ from typing import Any
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import rasterio
+import rasterio.features
 import xarray as xr
+from shapely.geometry import box as shapely_box
+from shapely.geometry import shape as shapely_shape
 from shapely.ops import unary_union
 
 from marine_engine import __version__
@@ -53,6 +58,7 @@ from marine_engine.providers.bathymetry import acquisition, bgs, emodnet, invent
 from marine_engine.providers.bathymetry import greater_gabbard_2014 as gg_provider
 from marine_engine.providers.bathymetry import hhw_cend1111 as hhw_provider
 from marine_engine.providers.bathymetry import idr_bnr_cend1111 as idrbnr_provider
+from marine_engine.providers.bathymetry import sheringham_shoal_2020 as sheringham_provider
 from marine_engine.providers.metocean import acquisition as metocean_acquisition
 from marine_engine.providers.metocean import copernicus
 from marine_engine.providers.nsta import (
@@ -81,6 +87,13 @@ from marine_engine.scour import (
     scour_onset_map,
 )
 from marine_engine.sediment import evidence, noncohesive_mobility, noncohesive_mobility_map
+from marine_engine.terrain import canonical as terrain_canonical
+from marine_engine.terrain import contract as terrain_contract
+from marine_engine.terrain import derivatives as terrain_derivatives
+from marine_engine.terrain import maps as terrain_maps
+from marine_engine.terrain import raster_io as terrain_raster_io
+from marine_engine.terrain import readiness as terrain_readiness
+from marine_engine.terrain import report as terrain_report
 from marine_engine.validation import (
     freespan_context_audit,
     freespan_context_audit_map,
@@ -6246,6 +6259,516 @@ def _cmd_build_marine_poc_review_package(args: argparse.Namespace) -> int:
     return 0
 
 
+def _terrain_raster_facts(
+    *,
+    band: np.ndarray,
+    crs,
+    transform,
+    nodata,
+    width: int,
+    height: int,
+    bounds: tuple,
+    band_count: int,
+    dtype: str,
+    color_interp: tuple[str, ...],
+    vertical_datum: str | None,
+    survey_epoch: str | None,
+) -> tuple["terrain_readiness.RasterFacts", np.ndarray]:
+    valid_mask_raw = (
+        np.isfinite(band)
+        if nodata is None
+        else (np.isfinite(band) & ~np.isclose(band, nodata, rtol=0, atol=abs(nodata) * 1e-6 + 1e-6))
+    )
+    valid_values = band[valid_mask_raw]
+    facts = terrain_readiness.RasterFacts(
+        band_count=band_count,
+        dtype=str(dtype),
+        color_interpretations=color_interp,
+        crs_is_present=crs is not None,
+        crs_is_geographic=crs.is_geographic if crs is not None else None,
+        crs_linear_units=crs.linear_units if crs is not None else None,
+        width=width,
+        height=height,
+        pixel_size_x_m=transform.a,
+        pixel_size_y_m=-transform.e,
+        bounds=tuple(bounds),
+        nodata_value=nodata,
+        vertical_datum=vertical_datum,
+        survey_epoch=survey_epoch,
+        data_min=float(valid_values.min()) if valid_values.size else None,
+        data_max=float(valid_values.max()) if valid_values.size else None,
+        data_std=float(valid_values.std()) if valid_values.size else None,
+        valid_cell_fraction=float(valid_mask_raw.mean()) if valid_mask_raw.size else None,
+    )
+    return facts, valid_mask_raw
+
+
+def _build_terrain_footprint_gdf(
+    valid_mask: np.ndarray, transform, working_crs: str, *, stride: int = 20
+):
+    """A lightweight (coarsened, dissolved) survey-footprint polygon from
+    the real valid-data mask -- never the full raster's own bounding box
+    (which would overstate real coverage for a narrow survey swath), and
+    never a per-pixel-precise (potentially huge) vector (Section 12:
+    "lightweight vector products only")."""
+
+    coarse = valid_mask[::stride, ::stride].astype(np.uint8)
+    coarse_transform = transform * rasterio.Affine.scale(stride, stride)
+    shapes = rasterio.features.shapes(coarse, mask=coarse.astype(bool), transform=coarse_transform)
+    polygons = [shapely_shape(geom) for geom, value in shapes if value == 1]
+    if not polygons:
+        return gpd.GeoDataFrame({"footprint": ["survey_coverage"]}, geometry=[], crs=working_crs)
+    dissolved = unary_union(polygons).simplify(stride, preserve_topology=True)
+    return gpd.GeoDataFrame(
+        {"footprint": ["survey_coverage"]}, geometry=[dissolved], crs=working_crs
+    )
+
+
+def _cmd_build_highres_terrain_poc(args: argparse.Namespace) -> int:
+    """MAR-020: generic high-resolution bathymetry / seabed terrain POC,
+    benchmarked against the real 2020 Fugro Sheringham Shoal survey
+    (TCE-1986). ONE live acquisition when the source raster is absent from
+    the cache, then fully offline. No risk score, no geohazard
+    interpretation -- terrain analytics only.
+    """
+
+    config = load_study_config(args.config)
+    project_id = config.study.id.lower()
+    study_dir = config.paths.processed_dir / project_id
+    raw_dir = config.paths.raw_dir / project_id
+    working_crs = config.crs.horizontal
+
+    print("Acquiring Sheringham Shoal bathymetry (Section 4)...")
+    acquisition = sheringham_provider.download_sheringham_shoal_bathymetry(raw_dir)
+    print(
+        f"  {acquisition.target_entry_name}: {acquisition.target_entry_bytes} bytes "
+        f"(bundle total {acquisition.bundle_total_bytes} bytes -- only the needed entry was "
+        f"range-fetched, never the whole bundle), already_cached={acquisition.already_cached}",
+        flush=True,
+    )
+    raster_path = raw_dir / acquisition.target_entry_name
+
+    print("Inspecting raster + running operator-style readiness (Section 5)...", flush=True)
+    with rasterio.open(raster_path) as src:
+        band = src.read(1)
+        crs = src.crs
+        transform = src.transform
+        nodata = src.nodata
+        width, height = src.width, src.height
+        bounds = tuple(src.bounds)
+        band_count = src.count
+        dtype = src.dtypes[0]
+        color_interp = tuple(str(c) for c in src.colorinterp)
+
+    facts, valid_mask = _terrain_raster_facts(
+        band=band,
+        crs=crs,
+        transform=transform,
+        nodata=nodata,
+        width=width,
+        height=height,
+        bounds=bounds,
+        band_count=band_count,
+        dtype=dtype,
+        color_interp=color_interp,
+        vertical_datum=sheringham_provider.SOURCE_VERTICAL_DATUM,
+        survey_epoch=acquisition.survey_period,
+    )
+    readiness_result = terrain_readiness.assess_bathymetry_readiness(facts)
+    print(f"  Readiness: {readiness_result.status}", flush=True)
+    for reason in readiness_result.reasons():
+        print(f"    - {reason}")
+
+    readiness_dir = study_dir / "readiness"
+    readiness_path = readiness_dir / "bathymetry_readiness.json"
+    readiness_dir.mkdir(parents=True, exist_ok=True)
+    readiness_path.write_text(
+        json.dumps(readiness_result.to_dict(), indent=2, default=str), encoding="utf-8"
+    )
+    print(f"  -> {readiness_path}")
+
+    route_kp_status = "NOT_APPLICABLE_NO_AUTHORITATIVE_ROUTE_SUPPLIED"
+
+    if readiness_result.status == terrain_readiness.NOT_READY:
+        print("EARLY STOP (Section 5): source data is NOT_READY -- no terrain analytics computed.")
+        validation = {
+            "scientific_role": "HIGH_RESOLUTION_SEABED_TERRAIN_POC",
+            "question_a_readiness_passed": False,
+            "question_b_derived_layers_valid": False,
+            "question_c_route_kp_view_available": False,
+            "route_kp_status": route_kp_status,
+        }
+        validation_path = study_dir / "terrain_poc_validation.json"
+        validation_path.parent.mkdir(parents=True, exist_ok=True)
+        validation_path.write_text(json.dumps(validation, indent=2, default=str), encoding="utf-8")
+        print(f"  -> {validation_path}")
+        print()
+        print(
+            "IS GENERIC HIGH-RESOLUTION OPERATOR BATHYMETRY -> TERRAIN ANALYTICS DEMONSTRATED? NO"
+        )
+        return 0
+
+    print("Building canonical bed_elevation_m raster (Section 6)...", flush=True)
+    canonical = terrain_canonical.build_canonical_bed_elevation(
+        band,
+        nodata_value=nodata,
+        source_sign_convention=sheringham_provider.SOURCE_SIGN_CONVENTION,
+        source_vertical_datum=sheringham_provider.SOURCE_VERTICAL_DATUM,
+    )
+    print(
+        f"  source convention {canonical.source_sign_convention} -> "
+        f"{terrain_canonical.CANONICAL_SIGN_CONVENTION_NOTE}"
+    )
+
+    cell_size_m = float(transform.a)
+    terrain_dir = study_dir / "terrain"
+    tags_base = {
+        "product": "MAR-020 generic high-resolution seabed terrain POC",
+        "scientific_role": "HIGH_RESOLUTION_SEABED_TERRAIN_POC",
+        "product_role": "ORBGSS_MARINE_OPERATOR_DATA_BENCHMARK",
+        "source_dataset": sheringham_provider.DATASET_TITLE,
+        "source_sha256": acquisition.target_entry_sha256,
+        "source_sign_convention": canonical.source_sign_convention,
+        "source_vertical_datum": canonical.source_vertical_datum,
+    }
+
+    bed_elevation_path = terrain_raster_io.write_terrain_raster(
+        canonical.bed_elevation_m,
+        transform,
+        working_crs,
+        terrain_dir / "canonical_bed_elevation.tif",
+        {**tags_base, "layer": "bed_elevation_m", "units": "m", "convention": "higher=shallower"},
+    )
+    print(f"  -> {bed_elevation_path}")
+
+    # Section 9: scale windows, derived from the real raster's own extent/coverage pattern (a
+    # narrow, branching wind-farm survey swath, not a broad regional AOI), recorded transparently
+    # rather than blindly using every one of the ticket's example values.
+    scales = [("engineering", 10.0), ("intermediate", 50.0)]
+    print(f"Computing derived terrain layers at {scales} metres (Sections 8-9)...", flush=True)
+
+    derived_layer_facts: list[dict] = []
+    gis_ok = True
+
+    def _record_and_write(
+        name: str, array: np.ndarray, units: str, scale_label: str, filename: str
+    ):
+        path = terrain_raster_io.write_terrain_raster(
+            array,
+            transform,
+            working_crs,
+            terrain_dir / filename,
+            {**tags_base, "layer": name, "units": units, "scale": scale_label},
+        )
+        finite = np.isfinite(array)
+        derived_layer_facts.append(
+            {
+                "layer": name,
+                "scale": scale_label,
+                "units": units,
+                "valid_cells": int(finite.sum()),
+                "min": f"{float(np.nanmin(array)):.4f}" if finite.any() else "n/a",
+                "max": f"{float(np.nanmax(array)):.4f}" if finite.any() else "n/a",
+                "mean": f"{float(np.nanmean(array)):.4f}" if finite.any() else "n/a",
+            }
+        )
+        print(f"  -> {path} ({finite.sum():,} valid cells)", flush=True)
+        return finite.any()
+
+    engineering_scale_m = scales[0][1]
+
+    t0 = time.time()
+    slope_deg, aspect_deg, _slope_vf = terrain_derivatives.compute_slope_aspect_deg(
+        canonical.bed_elevation_m, canonical.valid_mask, engineering_scale_m, cell_size_m
+    )
+    print(f"  slope/aspect @ {engineering_scale_m}m: {time.time() - t0:.1f}s", flush=True)
+    gis_ok &= _record_and_write("slope_deg", slope_deg, "deg", "engineering (10 m)", "slope.tif")
+    gis_ok &= _record_and_write(
+        "aspect_deg", aspect_deg, "deg (compass bearing)", "engineering (10 m)", "aspect.tif"
+    )
+
+    t0 = time.time()
+    profile_curv, plan_curv, _curv_vf = terrain_derivatives.compute_profile_plan_curvature(
+        canonical.bed_elevation_m, canonical.valid_mask, engineering_scale_m, cell_size_m
+    )
+    print(f"  curvature @ step={engineering_scale_m}m: {time.time() - t0:.1f}s", flush=True)
+    gis_ok &= _record_and_write(
+        "profile_curvature",
+        profile_curv,
+        "1/m",
+        f"engineering (step={engineering_scale_m} m)",
+        "profile_curvature.tif",
+    )
+    gis_ok &= _record_and_write(
+        "plan_curvature",
+        plan_curv,
+        "1/m",
+        f"engineering (step={engineering_scale_m} m)",
+        "plan_curvature.tif",
+    )
+
+    scale_facts: list[dict] = [
+        {
+            "name": "engineering",
+            "physical_m": engineering_scale_m,
+            "pixel_count": round(engineering_scale_m / cell_size_m),
+            "rationale": "individual-feature / immediate-foundation scale context; also used as "
+            "the curvature finite-difference step (a fine-scale-sensitive second-derivative "
+            "property)",
+        },
+    ]
+
+    for scale_name, radius_m in scales:
+        t0 = time.time()
+        relief, _rvf = terrain_derivatives.compute_local_relief(
+            canonical.bed_elevation_m, canonical.valid_mask, radius_m, cell_size_m
+        )
+        print(f"  local_relief @ {radius_m}m ({scale_name}): {time.time() - t0:.1f}s", flush=True)
+        gis_ok &= _record_and_write(
+            "local_relief",
+            relief,
+            "m",
+            f"{scale_name} ({radius_m:g} m)",
+            f"local_relief_{radius_m:g}m.tif",
+        )
+
+        t0 = time.time()
+        std, _svf = terrain_derivatives.compute_terrain_std(
+            canonical.bed_elevation_m, canonical.valid_mask, radius_m, cell_size_m
+        )
+        print(f"  terrain_std @ {radius_m}m ({scale_name}): {time.time() - t0:.1f}s", flush=True)
+        gis_ok &= _record_and_write(
+            "terrain_std",
+            std,
+            "m",
+            f"{scale_name} ({radius_m:g} m)",
+            f"terrain_std_{radius_m:g}m.tif",
+        )
+
+        t0 = time.time()
+        tri, _tvf = terrain_derivatives.compute_ruggedness(
+            canonical.bed_elevation_m, canonical.valid_mask, radius_m, cell_size_m
+        )
+        print(f"  ruggedness @ {radius_m}m ({scale_name}): {time.time() - t0:.1f}s", flush=True)
+        gis_ok &= _record_and_write(
+            "ruggedness",
+            tri,
+            "m",
+            f"{scale_name} ({radius_m:g} m)",
+            f"ruggedness_{radius_m:g}m.tif",
+        )
+
+        if scale_name != "engineering":
+            scale_facts.append(
+                {
+                    "name": scale_name,
+                    "physical_m": radius_m,
+                    "pixel_count": round(radius_m / cell_size_m),
+                    "rationale": "broader morphological context beyond individual-feature scale, "
+                    "still well within the real survey swath's own narrow width",
+                }
+            )
+        else:
+            scale_facts[0]["rationale"] += (
+                "; local_relief/terrain_std/ruggedness are ALSO computed at this scale"
+            )
+
+    print("Rendering bathymetry QA map (Section 10)...", flush=True)
+    maps_dir = study_dir / "maps"
+    qa_map_path = terrain_maps.render_bathymetry_qa_map(
+        elevation=canonical.bed_elevation_m,
+        valid_mask=canonical.valid_mask,
+        transform=transform,
+        crs_label=working_crs,
+        native_pixel_size_m=cell_size_m,
+        vertical_datum=canonical.source_vertical_datum,
+        survey_epoch=acquisition.survey_period,
+        readiness_status=readiness_result.status,
+        output_path=maps_dir / "sheringham_shoal_2020_bathymetry_qa.png",
+        title="Sheringham Shoal 2020 -- Bathymetry Data Readiness (not a hazard map)",
+    )
+    print(f"  -> {qa_map_path}")
+
+    print("Rendering terrain atlas (Section 11)...", flush=True)
+    atlas_path = terrain_maps.render_terrain_atlas(
+        layers={
+            "A. Bathymetry (bed_elevation_m)": (
+                canonical.bed_elevation_m,
+                "viridis",
+                "m (higher=shallower)",
+            ),
+            "B. Slope (engineering, 10 m)": (slope_deg, "inferno", "deg"),
+            "C. Local Relief (intermediate, 50 m)": (relief, "cividis", "m"),
+            "D. Ruggedness / Terrain Variability (intermediate, 50 m)": (tri, "magma", "m (TRI)"),
+        },
+        transform=transform,
+        output_path=maps_dir / "sheringham_shoal_2020_terrain_atlas.png",
+        title="Sheringham Shoal 2020 -- High-Resolution Seabed Terrain POC",
+        subtitle="Operator-data benchmark / not PL854 evidence -- no risk colours or risk language",
+        footer_note="OBSERVED bathymetry (A); MODELLED generic terrain derivatives (B-D). "
+        "No fused hazard/risk score anywhere in this atlas.",
+    )
+    print(f"  -> {atlas_path}")
+
+    print("Building GIS outputs (Section 12)...", flush=True)
+    gis_dir = study_dir / "gis"
+    footprint_gdf = _build_terrain_footprint_gdf(canonical.valid_mask, transform, working_crs)
+    minx, miny, maxx, maxy = bounds
+    qa_footprint_gdf = gpd.GeoDataFrame(
+        {"footprint": ["raster_bounding_box"]},
+        geometry=[shapely_box(minx, miny, maxx, maxy)],
+        crs=working_crs,
+    )
+    gpkg_path = gis_dir / "seabed_terrain_poc.gpkg"
+    gis_dir.mkdir(parents=True, exist_ok=True)
+    if gpkg_path.exists():
+        gpkg_path.unlink()
+    if not footprint_gdf.empty:
+        footprint_gdf.to_file(gpkg_path, driver="GPKG", layer="survey_footprint")
+    qa_footprint_gdf.to_file(gpkg_path, driver="GPKG", layer="terrain_qa_footprint")
+    print(f"  -> {gpkg_path}")
+
+    print("Writing generic operator-data input contract (Section 14)...", flush=True)
+    contract = terrain_contract.build_terrain_input_contract()
+    contract_path = study_dir / "terrain_input_contract.json"
+    contract_path.write_text(json.dumps(contract, indent=2, default=str), encoding="utf-8")
+    print(f"  -> {contract_path}")
+
+    print("Writing product readiness result (Section 17)...", flush=True)
+    validation = {
+        "scientific_role": "HIGH_RESOLUTION_SEABED_TERRAIN_POC",
+        "question_a_readiness_passed": readiness_result.status != terrain_readiness.NOT_READY,
+        "question_a_readiness_status": readiness_result.status,
+        "question_b_derived_layers_valid": bool(gis_ok),
+        "question_c_route_kp_view_available": False,
+        "route_kp_status": route_kp_status,
+    }
+    validation_path = study_dir / "terrain_poc_validation.json"
+    validation_path.write_text(json.dumps(validation, indent=2, default=str), encoding="utf-8")
+    print(f"  -> {validation_path}")
+
+    print("Building engineering POC report (Section 18)...", flush=True)
+    limitations = [
+        "No route/pipeline geometry was supplied in the acquired package -- KP/route view is "
+        f"{route_kp_status}, never fabricated",
+        "Terrain derivatives are generic geomorphometric statistics only -- no geohazard, "
+        "risk, or susceptibility interpretation is made",
+        "Curvature uses an explicit fine-scale physical step (engineering scale) -- it is not "
+        "computed at the broader intermediate scale, where the second-derivative signal "
+        "becomes physically less meaningful",
+        f"Native resolution ({cell_size_m:g} m) is used as-is throughout -- no upsampling, no "
+        "interpolation of missing regions to create false coverage",
+        f"Valid-cell coverage is {facts.valid_cell_fraction:.1%} of the raster's own bounding "
+        "box -- a real narrow, branching survey swath, not a data defect",
+    ]
+    input_contract_summary = [
+        f"{f['field']}: {f['description']}" for f in contract["required_fields"]
+    ]
+    report_blocks = terrain_report.build_terrain_poc_report_blocks(
+        project_title="Sheringham Shoal 2020 -- High-Resolution Seabed Terrain POC",
+        source_facts={
+            "Source": sheringham_provider.DATASET_TITLE,
+            "Series": sheringham_provider.MDE_SERIES_ID,
+            "File": acquisition.target_entry_name,
+            "File size": f"{acquisition.target_entry_bytes:,} bytes",
+            "SHA256": acquisition.target_entry_sha256,
+            "CRS": working_crs,
+            "Native resolution": f"{cell_size_m:g} m",
+            "Vertical datum": canonical.source_vertical_datum,
+            "Survey epoch": acquisition.survey_period,
+            "Survey organisation": acquisition.survey_organisation,
+            "Licence": acquisition.licence,
+        },
+        readiness_status=readiness_result.status,
+        readiness_reasons=readiness_result.reasons(),
+        bathymetry_stats={
+            "bed_elevation_m range": f"{facts.data_min:.2f} to {facts.data_max:.2f} m"
+            if facts.data_min is not None
+            else "n/a",
+            "Valid cell fraction": f"{facts.valid_cell_fraction:.1%}",
+            "Raster dimensions": f"{width} x {height} px",
+        },
+        derived_layer_facts=derived_layer_facts,
+        scale_facts=scale_facts,
+        gis_outputs=[
+            {
+                "file": "gis/seabed_terrain_poc.gpkg",
+                "type": "GeoPackage",
+                "description": "survey + terrain QA footprints",
+            },
+            {
+                "file": "terrain/canonical_bed_elevation.tif",
+                "type": "GeoTIFF",
+                "description": "canonical bed_elevation_m",
+            },
+            {
+                "file": "terrain/slope.tif / aspect.tif",
+                "type": "GeoTIFF",
+                "description": "engineering-scale slope/aspect",
+            },
+            {
+                "file": "terrain/profile_curvature.tif / plan_curvature.tif",
+                "type": "GeoTIFF",
+                "description": "Zevenbergen-Thorne curvature",
+            },
+            {
+                "file": "terrain/local_relief_*.tif / terrain_std_*.tif / ruggedness_*.tif",
+                "type": "GeoTIFF",
+                "description": "multiscale terrain variability",
+            },
+        ],
+        limitations=limitations,
+        input_contract_summary=input_contract_summary,
+    )
+    report_dir = study_dir / "report"
+    report_path = report_dir / "sheringham_shoal_2020_terrain_poc.html"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        terrain_report.render_blocks_html(
+            report_blocks, title="Sheringham Shoal 2020 -- High-Resolution Seabed Terrain POC"
+        ),
+        encoding="utf-8",
+    )
+    print(f"  -> {report_path}")
+
+    atlas_dims = terrain_maps.read_png_dimensions(atlas_path)
+    qa_dims = terrain_maps.read_png_dimensions(qa_map_path)
+    print()
+    print("=== Sheringham Shoal 2020 High-Resolution Terrain POC (MAR-020) ===")
+    print()
+    print("## Source")
+    print(f"  File: {acquisition.target_entry_name} ({acquisition.target_entry_bytes:,} bytes)")
+    print(
+        f"  Dimensions: {width} x {height} px | CRS: {working_crs} | resolution: {cell_size_m:g} m"
+    )
+    print(
+        f"  Vertical datum: {canonical.source_vertical_datum} | "
+        f"survey epoch: {acquisition.survey_period}"
+    )
+    print(f"  SHA256: {acquisition.target_entry_sha256}")
+    print()
+    print("## Readiness")
+    print(f"  Status: {readiness_result.status}")
+    for reason in readiness_result.reasons():
+        print(f"    - {reason}")
+    print()
+    print("## Terrain")
+    print(f"  bed_elevation_m range: {facts.data_min:.2f} to {facts.data_max:.2f} m")
+    print(f"  scale parameters: {scale_facts}")
+    print()
+    print("## Outputs")
+    print(f"  QA map: {qa_map_path} ({qa_dims[0]}x{qa_dims[1]} px)")
+    print(f"  Terrain atlas: {atlas_path} ({atlas_dims[0]}x{atlas_dims[1]} px)")
+    print(f"  GIS: {gpkg_path}")
+    print(f"  Report: {report_path}")
+    print()
+    print(
+        "IS GENERIC HIGH-RESOLUTION OPERATOR BATHYMETRY -> TERRAIN ANALYTICS DEMONSTRATED? "
+        + ("YES" if gis_ok else "NO")
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -6592,6 +7115,24 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_marine_poc_review_package_parser.set_defaults(func=_cmd_build_marine_poc_review_package)
+
+    build_highres_terrain_poc_parser = subparsers.add_parser(
+        "build-highres-terrain-poc",
+        help=(
+            "MAR-020: generic high-resolution bathymetry / seabed terrain POC, benchmarked "
+            "against the real 2020 Fugro Sheringham Shoal survey (Marine Data Exchange "
+            "TCE-1986) -- the first non-PL854 OrbGSS Marine Module project. Operator-style data "
+            "readiness, canonical bed_elevation_m raster, generic multiscale terrain "
+            "derivatives (slope/aspect/curvature/relief/roughness/ruggedness), QA map, terrain "
+            "atlas, GIS output, and an engineering POC report. No risk/hazard score. One live "
+            "acquisition when the source raster is absent from cache, then fully offline. "
+            "Outputs live under processed/sheringham_shoal_2020/."
+        ),
+    )
+    build_highres_terrain_poc_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_highres_terrain_poc_parser.set_defaults(func=_cmd_build_highres_terrain_poc)
 
     return parser
 
