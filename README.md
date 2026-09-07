@@ -81,6 +81,7 @@ uv run marine-engine build-metocean-evidence configs/pl854.yaml
 uv run marine-engine build-engineering-evidence-atlas configs/pl854.yaml
 uv run marine-engine build-marine-poc-review-package configs/pl854.yaml
 uv run marine-engine build-highres-terrain-poc configs/sheringham_shoal_2020.yaml
+uv run marine-engine build-seabed-change-poc configs/sheringham_shoal_2020.yaml
 ```
 
 `ingest-pipeline`, `discover-bathymetry`, `fetch-bathymetry`,
@@ -1676,4 +1677,86 @@ otherwise, never an interactive credential prompt.
   `requests.Session.head` patch, confirmed clean across 6 consecutive
   full-suite runs); the full offline suite (1107 tests, 25 live/network
   tests correctly deselected) and repo-wide `ruff format`/`ruff check`
-  pass clean. No further ticket has started.
+  pass clean.
+
+- `MAR-021`: the first multi-epoch OrbGSS Marine Module benchmark -- a
+  generic DEM-of-Difference / observed seabed-change engine
+  (`marine_engine.change`: epoch_compatibility, alignment, common_support,
+  dod, uncertainty, comparator, maps, report, contract; zero PL854/
+  Sheringham hard-coding, source-inspection tested), benchmarked against
+  the real 2018 vs 2020 Sheringham Shoal surveys -- observed change only,
+  no future erosion/deposition prediction, no sediment-transport model,
+  no risk/susceptibility/scour/freespan score, no ML. Unlike 2020's ready-
+  made GeoTIFF, the 2018 package's own file browser offers only raw
+  Applanix/Qinsy acquisition folders plus a 3-part ASCII XYZ export inside
+  a genuinely enormous 357.74 GB combined bundle (vs 2020's already-cached
+  1.01 GB) -- range-fetched only the 3 XYZ parts (~2.19 GB decompressed,
+  ~287 MB compressed) via the existing `RemoteZipReader`, then rasterized
+  by DIRECT grid placement (rows already fall on half-integer cell-centre
+  coordinates; the source's own `Range and Interpolation.txt` states "No
+  interpolation was undertaken", matched by never interpolating here
+  either) -- the rasterized min/max (-24.500/-3.690 m) reproduced the
+  source-documented range exactly. Two further real files were acquired
+  from the ALREADY-known 2020 bundle: `MBESDIFF_20v18.tif` (an independent
+  source-produced comparison product, Section 3, never used to compute
+  this project's own DoD) and a candidate uncertainty grid (`MBESHSD`),
+  which direct rasterio inspection showed to be a classified `uint8`
+  (values 0-254, nodata=255, `RepresentationType=THEMATIC`) with no scale/
+  offset/unit metadata -- correctly never used quantitatively, labelled
+  `UNVERIFIED_CLASSIFIED_GRID` rather than assumed to be metres. The
+  mandatory hard vertical-datum gate is satisfied by REAL source evidence,
+  not a shared filename token: the 2020 Comparison Report (fetched and
+  searched directly by extracting `word/document.xml` from its `.docx`
+  sibling -- 13.7 MB compressed vs. the 87 MB PDF's own text-plus-figures
+  bulk) explicitly states "All soundings shall be reduced to Lowest
+  Astronomical Tide (LAT)" and that "The 2013, 2014, 2015, 2018 and 2020
+  surveys also utilised the ... (VORF) geoid model" for LAT referencing;
+  the same report supplied genuine per-epoch precision evidence (+/-0.2 m
+  nominal MBES vertical accuracy; <=0.15 m observed repeatability at a
+  stable 100 m^2 datum square across winter surveys including 2018/2020;
+  Fugro's own ~0.3 m analyst significance threshold) used to derive this
+  project's own transparent threshold (0.283 m = sqrt(0.2^2 + 0.2^2)) --
+  never an invented round number. The two independently-built grids (2020's
+  official GeoTIFF; this project's own from-scratch rasterization of
+  2018's raw XYZ) landed on an exact whole-pixel offset
+  (`INTEGER_PIXEL_OFFSET_ALIGNMENT`, row=-10, col=3) -- pure cropping, zero
+  interpolation -- with 75,918,562 common valid cells (99.3%/99.2% of
+  2018/2020). Real DoD: min=-5.464, median=-0.041, p05=-0.184, p95=0.112,
+  max=5.846 m over an annualized 2.09-year interval (approximate --
+  survey dates are source-stated only at month granularity). Comparing
+  against the official `20v18` product surfaced a striking, honestly-
+  earned finding: neither the GeoTIFF's own sidecars nor the Comparison
+  Report's prose states its numeric sign convention (genuinely searched,
+  not assumed), so this project's comparator reports BOTH interpretations
+  transparently rather than picking the better-fitting one (Section 15 is
+  explicit that fit quality must never be used to resolve an undocumented
+  sign) -- and under the as-is interpretation the residual NMAD is
+  5.66e-7 m (float32-precision noise; i.e. functionally identical),
+  while the sign-flipped interpretation gives a real NMAD of 0.163 m,
+  meaning this project's independently-reprocessed DoD reproduces Fugro's
+  own official comparison product to within floating-point rounding --
+  strong, transparent evidence, formally still reported as
+  `SIGN_UNRESOLVED_FROM_DOCUMENTATION` since no explicit statement was
+  ever found. Three real bugs were found and fixed from actually running
+  the full CLI against real data, not just the synthetic suite: two
+  module-level evidence constants were referenced in the CLI but never
+  defined on the provider module (`AttributeError`, fixed); the DoD's
+  common-support crop was correctly applied to both epochs but NOT to the
+  independently-loaded (full, uncropped) `20v18` comparator array before
+  comparison, raising a real shape-mismatch (`(25600,9855)` vs
+  `(25610,9855)`) -- fixed with a new `crop_array_to_aligned_window`
+  helper, verified by a test that checks spatial correctness (the same
+  real-world coordinate maps to the same value before/after cropping), not
+  just matching shapes; and the primary 4-panel change map's fixed
+  roughly-square layout left most of each panel blank for the real
+  survey's tall/narrow (~2.6:1) footprint -- fixed by deriving panel
+  geometry from the content's own aspect ratio and switching to a single
+  row of 4 panels (mirroring the MAR-018/019/020 atlas layout fix
+  precedent), with a follow-up pass shortening panel titles and widening
+  inter-panel spacing once the narrower panels caused title collisions.
+  No route/KP view is fabricated in the absence of a supplied route
+  (`NOT_APPLICABLE_NO_AUTHORITATIVE_ROUTE_SUPPLIED`, verified by a
+  source-inspection test). 33 new tests (`test_seabed_change_poc.py`)
+  cover the required list; the full offline suite (1140 tests, 25 live/
+  network tests correctly deselected) and repo-wide `ruff format`/
+  `ruff check` pass clean. No further ticket has started.

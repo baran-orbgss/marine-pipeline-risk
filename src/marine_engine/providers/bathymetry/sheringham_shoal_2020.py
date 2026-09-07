@@ -49,6 +49,7 @@ through explicitly rather than assumed from the "LAT" filename token
 alone.
 """
 
+import json
 import zlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -83,6 +84,38 @@ EXPECTED_CRS = "EPSG:32631"  # confirmed by direct rasterio inspection
 # never a positive-down depth -- see `terrain.canonical.ALREADY_ELEVATION_STYLE`.
 SOURCE_SIGN_CONVENTION = "ALREADY_ELEVATION_STYLE"
 SOURCE_VERTICAL_DATUM = "LAT (Lowest Astronomical Tide)"
+
+# Real, source-documented evidence of 2018/2020 vertical-datum compatibility (MAR-021 Section 6's
+# hard gate) -- quoted verbatim from the 2020 Comparison Report
+# (`03_Comparison/Comparison Report/201193-R004(02) Sheringham Shoal 2020 Comparison Report.docx`,
+# inside the `122_1986_Reports.zip` bundle, fetched and searched directly by extracting
+# word/document.xml). NOT an assumption from the shared "LAT" filename token between the two
+# surveys' own bathymetry file names.
+VERTICAL_DATUM_COMPATIBILITY_EVIDENCE = (
+    'Source: "201193-R004(02) Sheringham Shoal 2020 Comparison Report" (Fugro, 15 June 2021), '
+    'Section 1.4 "Vertical Datum" and Section 3.1 "Data Acquisition and Processing": '
+    '"All soundings shall be reduced to Lowest Astronomical Tide (LAT)." and "The 2013, 2014, '
+    "2015, 2018 and 2020 surveys also utilised the United Kingdom hydrographic office (UKHO) "
+    "vertical offshore reference frame (VORF) geoid model; this allowed all heights to be more "
+    'accurately referenced to LAT." This explicitly states the 2018 and 2020 surveys share the '
+    "same VORF-to-LAT vertical referencing methodology."
+)
+
+# Real, source-documented precision evidence (same report) -- a genuine "TVU/precision statement"
+# (MAR-021 Section 12), not invented: nominal per-epoch MBES vertical accuracy, and empirically
+# observed repeatability at a stable reference area spanning multiple epochs including 2018/2020.
+REPORTED_MBES_VERTICAL_ACCURACY_M = 0.2
+REPORTED_DATUM_SQUARE_REPEATABILITY_M = 0.15
+REPORTED_ANALYST_SIGNIFICANCE_THRESHOLD_M = 0.3
+PRECISION_EVIDENCE_SOURCE = (
+    'Source: "201193-R004(02) Sheringham Shoal 2020 Comparison Report" (Fugro, 15 June 2021): '
+    '"The final accuracy of MBES soundings collected during all four surveys was typically less '
+    'than +/-0.5 m horizontally and less than +/-0.2 m vertically." "When depths were compared '
+    "between the three winter surveys conducted in 2013, 2014, 2015, 2018 and 2020 differences "
+    'equal to, or less than 0.15 m were observed" (at a 100 m^2 stable datum square). "changes of '
+    "less than 0.3 m were not considered significant, when assessing areas of erosion or "
+    "accretion\" (Fugro's own analyst-applied significance threshold, not this project's)."
+)
 
 
 class RemoteZipReader:
@@ -210,7 +243,6 @@ def download_sheringham_shoal_bathymetry(
     for the large-file re-download)."""
 
     import hashlib
-    import json
 
     raw_dir.mkdir(parents=True, exist_ok=True)
     local_path = raw_dir / TARGET_ENTRY_NAME
@@ -286,3 +318,82 @@ def download_sheringham_shoal_bathymetry(
         survey_year=SURVEY_YEAR,
         already_cached=False,
     )
+
+
+# --- MAR-021: two additional real entries from the SAME already-known 2020 bundle -------------
+#
+# `G201193_MBESDIFF_20v18.tif` (163,918,539 bytes) -- an independent, SOURCE-PRODUCED bathymetry
+# comparison product (2020 vs 2018), confirmed real via the bundle's own central directory.
+# MAR-021 acquires it as a `SOURCE_PRODUCED_COMPARISON_PRODUCT` -- it must NEVER be used to
+# calculate this project's own DoD, only as an independent comparator (see
+# `marine_engine.change.comparator`). Its numeric sign convention is NOT stated anywhere in the
+# bundle's own sidecars (confirmed by direct inspection of its `.tif.xml`/`.tif.aux.xml`), and the
+# 2020 Comparison Report's prose (fetched and searched directly) never gives an explicit pixel-
+# sign statement for this specific file either -- so callers must treat its sign as UNRESOLVED,
+# never assumed from the "20v18" filename token.
+#
+# `G201193_20210127_SS_MBESHSD_1m_LAT.tif` (34,531,969 bytes) -- a candidate uncertainty/
+# precision product ("HSD"). Its own `.tif.aux.xml` sidecar (inspected directly) shows
+# `RepresentationType=THEMATIC` and a classified 0-254 byte value range, NOT a direct floating-
+# point metres-scale standard deviation -- real evidence that this is likely a classified/scaled
+# confidence grid, not a total-vertical-uncertainty grid. Acquired anyway (cheap, ~34.5 MB) so its
+# real scale/units can be verified directly once opened, per Section 12/13 -- never assumed usable
+# without that verification.
+
+MBESDIFF_20V18_ENTRY_NAME = "G201193_MBESDIFF_20v18.tif"
+MBESHSD_ENTRY_NAME = "G201193_20210127_SS_MBESHSD_1m_LAT.tif"
+
+
+def _download_single_bundle_entry(raw_dir: Path, entry_name: str, *, url: str) -> tuple[Path, bool]:
+    """Generic single-entry range-fetch-and-cache helper, reused for both
+    additional 2020 entries below (and usable for any future one) --
+    returns (local_path, already_cached)."""
+
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    local_path = raw_dir / entry_name
+    sidecar_path = _acquisition_sidecar_path(local_path)
+
+    if local_path.exists() and sidecar_path.exists():
+        cached = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        if local_path.stat().st_size == cached["target_entry_bytes"]:
+            return local_path, True
+
+    entries = list_remote_entries(url)
+    target = next(e for e in entries if e.filename == entry_name)
+    content = fetch_entry_bytes(target, url=url)
+    if len(content) != target.file_size:
+        raise ValueError(
+            f"extracted {len(content)} bytes for {entry_name}, expected {target.file_size}"
+        )
+    local_path.write_bytes(content)
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "target_entry_bytes": target.file_size,
+                "retrieved_at_utc": datetime.now(UTC).isoformat(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return local_path, False
+
+
+def download_sheringham_shoal_2020_comparison_product(
+    raw_dir: Path, *, url: str = BATHYMETRY_BUNDLE_URL
+) -> tuple[Path, bool]:
+    """Range-fetches ONLY `MBESDIFF_20v18.tif` from the already-known 2020
+    bundle -- the independent source-produced comparison product (MAR-021
+    Section 3). Returns (local_path, already_cached)."""
+
+    return _download_single_bundle_entry(raw_dir, MBESDIFF_20V18_ENTRY_NAME, url=url)
+
+
+def download_sheringham_shoal_2020_hsd_grid(
+    raw_dir: Path, *, url: str = BATHYMETRY_BUNDLE_URL
+) -> tuple[Path, bool]:
+    """Range-fetches ONLY the MBESHSD candidate-uncertainty grid from the
+    already-known 2020 bundle (MAR-021 Section 4/12). Returns (local_path,
+    already_cached)."""
+
+    return _download_single_bundle_entry(raw_dir, MBESHSD_ENTRY_NAME, url=url)

@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,15 @@ from marine_engine import __version__
 from marine_engine.analogs import greater_gabbard_2014 as gg_analog
 from marine_engine.analogs import hhw_cend1111 as hhw_analog
 from marine_engine.analogs import idr_bnr_cend1111 as idrbnr_analog
+from marine_engine.change import alignment as change_alignment
+from marine_engine.change import common_support as change_common_support
+from marine_engine.change import comparator as change_comparator
+from marine_engine.change import contract as change_contract
+from marine_engine.change import dod as change_dod
+from marine_engine.change import epoch_compatibility as change_epoch_compatibility
+from marine_engine.change import maps as change_maps
+from marine_engine.change import report as change_report
+from marine_engine.change import uncertainty as change_uncertainty
 from marine_engine.config import load_study_config
 from marine_engine.evidence_atlas import core as evidence_atlas_core
 from marine_engine.evidence_atlas import maps as evidence_atlas_maps
@@ -58,6 +67,7 @@ from marine_engine.providers.bathymetry import acquisition, bgs, emodnet, invent
 from marine_engine.providers.bathymetry import greater_gabbard_2014 as gg_provider
 from marine_engine.providers.bathymetry import hhw_cend1111 as hhw_provider
 from marine_engine.providers.bathymetry import idr_bnr_cend1111 as idrbnr_provider
+from marine_engine.providers.bathymetry import sheringham_shoal_2018 as sheringham_2018_provider
 from marine_engine.providers.bathymetry import sheringham_shoal_2020 as sheringham_provider
 from marine_engine.providers.metocean import acquisition as metocean_acquisition
 from marine_engine.providers.metocean import copernicus
@@ -6769,6 +6779,588 @@ def _cmd_build_highres_terrain_poc(args: argparse.Namespace) -> int:
     return 0
 
 
+def _epoch2018_raster_facts(
+    elevation: np.ndarray, valid_mask: np.ndarray, transform, working_crs: str
+):
+    height, width = elevation.shape
+    minx = transform.c
+    maxy = transform.f
+    bounds = (minx, maxy + transform.e * height, minx + transform.a * width, maxy)
+    valid_values = elevation[valid_mask]
+    return terrain_readiness.RasterFacts(
+        band_count=1,
+        dtype="float64",
+        color_interpretations=("gray",),
+        crs_is_present=True,
+        crs_is_geographic=False,
+        crs_linear_units="metre",
+        width=width,
+        height=height,
+        pixel_size_x_m=transform.a,
+        pixel_size_y_m=-transform.e,
+        bounds=bounds,
+        nodata_value=None,
+        vertical_datum=sheringham_2018_provider.SOURCE_VERTICAL_DATUM,
+        survey_epoch=sheringham_2018_provider.SURVEY_PERIOD,
+        data_min=float(valid_values.min()) if valid_values.size else None,
+        data_max=float(valid_values.max()) if valid_values.size else None,
+        data_std=float(valid_values.std()) if valid_values.size else None,
+        valid_cell_fraction=float(valid_mask.mean()) if valid_mask.size else None,
+    )
+
+
+def _cmd_build_seabed_change_poc(args: argparse.Namespace) -> int:
+    """MAR-021: generic multi-epoch seabed change / DEM-of-Difference POC,
+    benchmarked against the real 2018 vs 2020 Sheringham Shoal surveys.
+    Observed change only -- no future erosion/deposition prediction, no
+    sediment-transport model, no risk/susceptibility score, no ML.
+    """
+
+    config = load_study_config(args.config)
+    project_id = config.study.id.lower()
+    study_dir = config.paths.processed_dir / project_id
+    raw_dir = config.paths.raw_dir / project_id
+    working_crs = config.crs.horizontal
+
+    print("Acquiring epoch sources (Section 4)...", flush=True)
+    acq2020 = sheringham_provider.download_sheringham_shoal_bathymetry(raw_dir)
+    diff_path, diff_cached = sheringham_provider.download_sheringham_shoal_2020_comparison_product(
+        raw_dir
+    )
+    hsd_path, hsd_cached = sheringham_provider.download_sheringham_shoal_2020_hsd_grid(raw_dir)
+    acq2018 = sheringham_2018_provider.download_sheringham_shoal_2018_bathymetry(raw_dir)
+    print(
+        f"  2020 bathymetry: {acq2020.target_entry_name} ({acq2020.target_entry_bytes:,} bytes, "
+        f"already_cached={acq2020.already_cached})",
+        flush=True,
+    )
+    print(f"  2020 comparator: {diff_path.name} (already_cached={diff_cached})", flush=True)
+    print(f"  2020 HSD grid: {hsd_path.name} (already_cached={hsd_cached})", flush=True)
+    print(
+        f"  2018 XYZ parts: {len(acq2018.xyz_entry_names)} files, "
+        f"already_cached={acq2018.already_cached}",
+        flush=True,
+    )
+
+    print("Rasterizing 2018 XYZ export (direct grid placement, no interpolation)...", flush=True)
+    xyz_paths = [raw_dir / Path(n).name for n in sheringham_2018_provider.XYZ_ENTRY_NAMES]
+    raw2018, valid2018_raw, transform2018 = sheringham_2018_provider.rasterize_xyz_points(xyz_paths)
+
+    print("Running per-epoch operator-style readiness (Section 5)...", flush=True)
+    raster_path_2020 = raw_dir / acq2020.target_entry_name
+    with rasterio.open(raster_path_2020) as src:
+        band2020 = src.read(1)
+        crs2020 = src.crs
+        transform2020 = src.transform
+        nodata2020 = src.nodata
+        width2020, height2020 = src.width, src.height
+        bounds2020 = tuple(src.bounds)
+        band_count2020 = src.count
+        dtype2020 = src.dtypes[0]
+        color_interp2020 = tuple(str(c) for c in src.colorinterp)
+
+    facts2020, valid2020_raw = _terrain_raster_facts(
+        band=band2020,
+        crs=crs2020,
+        transform=transform2020,
+        nodata=nodata2020,
+        width=width2020,
+        height=height2020,
+        bounds=bounds2020,
+        band_count=band_count2020,
+        dtype=dtype2020,
+        color_interp=color_interp2020,
+        vertical_datum=sheringham_provider.SOURCE_VERTICAL_DATUM,
+        survey_epoch=acq2020.survey_period,
+    )
+    readiness2020 = terrain_readiness.assess_bathymetry_readiness(facts2020)
+    facts2018 = _epoch2018_raster_facts(raw2018, valid2018_raw, transform2018, working_crs)
+    readiness2018 = terrain_readiness.assess_bathymetry_readiness(facts2018)
+
+    readiness_dir = study_dir / "readiness"
+    readiness_dir.mkdir(parents=True, exist_ok=True)
+    (readiness_dir / "bathymetry_2018_readiness.json").write_text(
+        json.dumps(readiness2018.to_dict(), indent=2, default=str), encoding="utf-8"
+    )
+    (readiness_dir / "bathymetry_2020_readiness.json").write_text(
+        json.dumps(readiness2020.to_dict(), indent=2, default=str), encoding="utf-8"
+    )
+    print(f"  2018 readiness: {readiness2018.status}", flush=True)
+    print(f"  2020 readiness: {readiness2020.status}", flush=True)
+
+    route_kp_status = "NOT_APPLICABLE_NO_AUTHORITATIVE_ROUTE_SUPPLIED"
+    validation_path = study_dir / "seabed_change_poc_validation.json"
+
+    def _early_stop(
+        question_a, question_b, question_c, question_d, question_e, question_f, answer: str
+    ) -> int:
+        validation = {
+            "scientific_role": "MULTI_EPOCH_SEABED_CHANGE_POC",
+            "question_a_both_epochs_data_ready": question_a,
+            "question_b_vertical_datums_compatible": question_b,
+            "question_c_common_support_sufficient": question_c,
+            "question_d_independent_dod_generated": question_d,
+            "question_e_defensible_uncertainty_threshold": question_e,
+            "question_f_source_product_consistent": question_f,
+            "route_kp_status": route_kp_status,
+        }
+        validation_path.parent.mkdir(parents=True, exist_ok=True)
+        validation_path.write_text(json.dumps(validation, indent=2, default=str), encoding="utf-8")
+        print(f"  -> {validation_path}")
+        print()
+        print(
+            "IS GENERIC OPERATOR-SUPPLIED MULTI-EPOCH MBES -> OBSERVED SEABED CHANGE ANALYTICS "
+            f"DEMONSTRATED? {answer}"
+        )
+        return 0
+
+    if (
+        readiness2018.status == terrain_readiness.NOT_READY
+        or readiness2020.status == terrain_readiness.NOT_READY
+    ):
+        print("EARLY STOP (Section 5): one or both epochs are NOT_READY.")
+        return _early_stop(
+            "NO", "NOT_APPLICABLE", "NOT_APPLICABLE", "NO", "NOT_APPLICABLE", "NOT_APPLICABLE", "NO"
+        )
+
+    print("Checking the HARD vertical-datum gate (Section 6)...", flush=True)
+    datum_result = change_epoch_compatibility.assess_vertical_datum_compatibility(
+        sheringham_2018_provider.SOURCE_VERTICAL_DATUM,
+        sheringham_provider.SOURCE_VERTICAL_DATUM,
+        harmonization_evidence=sheringham_provider.VERTICAL_DATUM_COMPATIBILITY_EVIDENCE,
+    )
+    print(f"  {datum_result.status}: {datum_result.reason}", flush=True)
+    if datum_result.status == change_epoch_compatibility.VERTICAL_DATUM_NOT_HARMONIZED:
+        print("EARLY STOP (Section 6): vertical datums are not demonstrably harmonized.")
+        return _early_stop(
+            "YES", "NO", "NOT_APPLICABLE", "NO", "NOT_APPLICABLE", "NOT_APPLICABLE", "NO"
+        )
+
+    print("Building canonical bed_elevation_m for both epochs (Section 7)...", flush=True)
+    canonical2018 = terrain_canonical.build_canonical_bed_elevation(
+        raw2018,
+        nodata_value=None,
+        source_sign_convention=sheringham_2018_provider.SOURCE_SIGN_CONVENTION,
+        source_vertical_datum=sheringham_2018_provider.SOURCE_VERTICAL_DATUM,
+    )
+    canonical2020 = terrain_canonical.build_canonical_bed_elevation(
+        band2020,
+        nodata_value=nodata2020,
+        source_sign_convention=sheringham_provider.SOURCE_SIGN_CONVENTION,
+        source_vertical_datum=sheringham_provider.SOURCE_VERTICAL_DATUM,
+    )
+
+    print("Classifying + executing horizontal/grid alignment (Section 8)...", flush=True)
+    classification = change_epoch_compatibility.classify_grid_alignment(
+        crs1=working_crs,
+        transform1=transform2018,
+        crs2=str(crs2020),
+        transform2=transform2020,
+    )
+    print(f"  {classification.status}: {classification.reason}", flush=True)
+    if classification.status == change_epoch_compatibility.INCOMPATIBLE_HORIZONTAL_REFERENCE:
+        print("EARLY STOP (Section 8): horizontal references are incompatible.")
+        return _early_stop("YES", "YES", "NO", "NO", "NOT_APPLICABLE", "NOT_APPLICABLE", "NO")
+
+    aligned2018, aligned2020 = change_alignment.align_to_common_grid(
+        classification=classification,
+        elevation1=canonical2018.bed_elevation_m,
+        valid1=canonical2018.valid_mask,
+        transform1=transform2018,
+        elevation2=canonical2020.bed_elevation_m,
+        valid2=canonical2020.valid_mask,
+        transform2=transform2020,
+        crs=working_crs,
+    )
+
+    print("Building common valid support (Section 10)...", flush=True)
+    common = change_common_support.build_common_valid_support(
+        aligned2018.valid_mask, aligned2020.valid_mask
+    )
+    print(
+        f"  common valid cells: {common.common_valid_cell_count:,} "
+        f"({common.fraction_of_epoch1_covered:.1%} of 2018, "
+        f"{common.fraction_of_epoch2_covered:.1%} of 2020)",
+        flush=True,
+    )
+
+    change_dir = study_dir / "change"
+    tags_base = {
+        "product": "MAR-021 generic multi-epoch seabed change POC",
+        "scientific_role": "MULTI_EPOCH_SEABED_CHANGE_POC",
+        "definition": change_dod.DoDResult.__dataclass_fields__["definition"].default,
+    }
+
+    if common.common_valid_cell_count < 30:
+        print("EARLY STOP (Section 10): common valid support is not sufficient to compute a DoD.")
+        return _early_stop("YES", "YES", "NO", "NO", "NOT_APPLICABLE", "NOT_APPLICABLE", "NO")
+
+    print("Computing the canonical DoD (Section 11)...", flush=True)
+    dod_result = change_dod.compute_delta_bed_elevation(
+        aligned2018.elevation, aligned2020.elevation, common.common_valid_mask
+    )
+    dod_path = terrain_raster_io.write_terrain_raster(
+        dod_result.delta_bed_elevation_m,
+        aligned2020.transform,
+        working_crs,
+        change_dir / "delta_bed_elevation_2020_minus_2018_m.tif",
+        {**tags_base, "layer": "delta_bed_elevation_m", "units": "m"},
+    )
+    print(f"  -> {dod_path}", flush=True)
+
+    epoch1_date = date(2018, 10, 1)  # approximate: source states "October 2018 - November 2018"
+    epoch2_date = date(2020, 11, 1)  # approximate: source states "November 2020 - December 2020"
+    annualized = change_dod.annualize_change(
+        dod_result.delta_bed_elevation_m, epoch1_date=epoch1_date, epoch2_date=epoch2_date
+    )
+    annualized_path = terrain_raster_io.write_terrain_raster(
+        annualized.annualized_delta_m_per_year,
+        aligned2020.transform,
+        working_crs,
+        change_dir / "annualized_bed_elevation_change_m_per_year.tif",
+        {
+            **tags_base,
+            "layer": "annualized_bed_elevation_change_m_per_year",
+            "units": "m/yr",
+            "disclaimer": change_dod.ANNUALIZATION_DISCLAIMER,
+        },
+    )
+    print(
+        f"  -> {annualized_path} (elapsed years: {annualized.elapsed_years:.2f}, approximate "
+        "representative dates -- source states month-level survey periods only)",
+        flush=True,
+    )
+
+    print("Assessing horizontal misregistration QA (Section 9)...", flush=True)
+    slope_deg, _aspect_deg, _slope_vf = terrain_derivatives.compute_slope_aspect_deg(
+        aligned2020.elevation, aligned2020.valid_mask, 10.0, float(aligned2020.transform.a)
+    )
+    misreg_qa = change_alignment.assess_misregistration_qa(
+        dod_result.delta_bed_elevation_m, common.common_valid_mask, slope_deg
+    )
+    print(
+        f"  slope-dependent |dz| correlation: {misreg_qa.slope_dependent_correlation}", flush=True
+    )
+
+    print("Inventorying uncertainty evidence (Section 12)...", flush=True)
+    uncertainty_items = [
+        change_uncertainty.UncertaintyEvidenceItem(
+            kind=change_uncertainty.EVIDENCE_NOMINAL_ACCURACY,
+            epoch="2018",
+            description="Nominal MBES vertical accuracy: "
+            f"+/-{sheringham_provider.REPORTED_MBES_VERTICAL_ACCURACY_M} m",
+            source_citation=sheringham_provider.PRECISION_EVIDENCE_SOURCE,
+            usable_for_threshold=True,
+        ),
+        change_uncertainty.UncertaintyEvidenceItem(
+            kind=change_uncertainty.EVIDENCE_NOMINAL_ACCURACY,
+            epoch="2020",
+            description="Nominal MBES vertical accuracy: "
+            f"+/-{sheringham_provider.REPORTED_MBES_VERTICAL_ACCURACY_M} m",
+            source_citation=sheringham_provider.PRECISION_EVIDENCE_SOURCE,
+            usable_for_threshold=True,
+        ),
+        change_uncertainty.UncertaintyEvidenceItem(
+            kind=change_uncertainty.EVIDENCE_DATUM_SQUARE_REPEATABILITY,
+            epoch="2018+2020",
+            description="Observed repeatability at a stable 100 m^2 datum square across "
+            "winter surveys including 2018/2020: <= "
+            f"{sheringham_provider.REPORTED_DATUM_SQUARE_REPEATABILITY_M} m",
+            source_citation=sheringham_provider.PRECISION_EVIDENCE_SOURCE,
+            usable_for_threshold=False,
+        ),
+        change_uncertainty.UncertaintyEvidenceItem(
+            kind=change_uncertainty.EVIDENCE_CLASSIFIED_GRID_UNVERIFIED,
+            epoch="2020",
+            description=f"{sheringham_provider.MBESHSD_ENTRY_NAME}: uint8, values 0-254, "
+            "RepresentationType=THEMATIC, no scale/offset/unit metadata found -- NOT verified as "
+            "a direct metres-scale standard deviation.",
+            source_citation=f"direct rasterio inspection of {hsd_path.name}",
+            usable_for_threshold=False,
+        ),
+    ]
+    uncertainty_inventory = change_uncertainty.build_uncertainty_evidence_inventory(
+        uncertainty_items
+    )
+    uncertainty_dir = study_dir / "uncertainty"
+    uncertainty_dir.mkdir(parents=True, exist_ok=True)
+    (uncertainty_dir / "uncertainty_evidence_inventory.json").write_text(
+        json.dumps(uncertainty_inventory, indent=2, default=str), encoding="utf-8"
+    )
+
+    threshold = change_uncertainty.derive_change_threshold(
+        sigma_epoch1_m=sheringham_provider.REPORTED_MBES_VERTICAL_ACCURACY_M,
+        sigma_epoch2_m=sheringham_provider.REPORTED_MBES_VERTICAL_ACCURACY_M,
+        evidence_citation=sheringham_provider.PRECISION_EVIDENCE_SOURCE,
+    )
+    print(
+        f"  threshold status: {threshold.status}"
+        + (f" ({threshold.threshold_m:.3f} m)" if threshold.threshold_m is not None else ""),
+        flush=True,
+    )
+
+    print("Comparing against the source-produced 20v18 product (Section 15)...", flush=True)
+    with rasterio.open(diff_path) as ds:
+        source_diff_raw = ds.read(1)
+        source_diff_nodata = ds.nodata
+    source_diff_valid = (
+        np.isfinite(source_diff_raw)
+        if source_diff_nodata is None
+        else (source_diff_raw != source_diff_nodata) & np.isfinite(source_diff_raw)
+    )
+    source_diff_full = np.where(source_diff_valid, source_diff_raw, np.nan)
+    # source_diff shares epoch2's ORIGINAL (uncropped) grid -- crop it to the SAME window
+    # already used for the DoD, never a fresh/independent crop computation.
+    source_diff = change_alignment.crop_array_to_aligned_window(
+        source_diff_full,
+        original_transform=transform2020,
+        aligned_transform=aligned2020.transform,
+        aligned_shape=dod_result.delta_bed_elevation_m.shape,
+    )
+    comparator_result = change_comparator.compare_dod_to_source_product(
+        dod_result.delta_bed_elevation_m,
+        source_diff,
+        common.common_valid_mask,
+        sign_evidence="Not stated in the source GeoTIFF sidecars (.tif.xml/.tif.aux.xml) or in "
+        "the 2020 Comparison Report's prose (both fetched and searched directly) -- treated as "
+        "unresolved per Section 15, never inferred from correlation quality.",
+    )
+    vertical_bias_qa = change_comparator.assess_vertical_bias_qa(dod_result.delta_bed_elevation_m)
+    print(f"  sign status: {comparator_result.sign_status}", flush=True)
+    print(
+        f"  median DoD (vertical bias QA): {vertical_bias_qa.median_dod_m:.4f} m "
+        "(reported, not auto-corrected)",
+        flush=True,
+    )
+
+    validation_dir = study_dir / "validation"
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    (validation_dir / "dod_vs_source_difference_comparison.json").write_text(
+        json.dumps(comparator_result.to_dict(), indent=2, default=str), encoding="utf-8"
+    )
+
+    print("Rendering primary change map (Section 19)...", flush=True)
+    maps_dir = study_dir / "maps"
+    change_map_path = change_maps.render_seabed_change_map(
+        bed_elevation_epoch1_m=aligned2018.elevation,
+        bed_elevation_epoch2_m=aligned2020.elevation,
+        delta_bed_elevation_m=dod_result.delta_bed_elevation_m,
+        qa_panel_array=np.where(
+            common.common_valid_mask, np.abs(dod_result.delta_bed_elevation_m), np.nan
+        ),
+        qa_panel_label="|Observed change| (m) -- comparison/QA context, not a hazard score",
+        qa_panel_cmap="magma",
+        transform=aligned2020.transform,
+        output_path=maps_dir / "sheringham_shoal_2018_2020_seabed_change.png",
+        title="Sheringham Shoal 2018-2020 -- Observed Seabed Elevation Change POC",
+        epoch1_label="2018",
+        epoch2_label="2020",
+    )
+    print(f"  -> {change_map_path}", flush=True)
+
+    print("Rendering change distribution QA figure (Section 20)...", flush=True)
+    as_is_stats = comparator_result.interpretations.get(
+        "as_is"
+    ) or comparator_result.interpretations.get("confirmed")
+    qa_fig_path = change_maps.render_change_distribution_qa(
+        delta_bed_elevation_m=dod_result.delta_bed_elevation_m,
+        source_residuals_m=None,
+        common_support_summary={
+            "fraction_of_2018_covered": common.fraction_of_epoch1_covered,
+            "fraction_of_2020_covered": common.fraction_of_epoch2_covered,
+        },
+        output_path=maps_dir / "sheringham_shoal_2018_2020_change_qa.png",
+        title="Sheringham Shoal 2018-2020 -- Change Distribution QA",
+    )
+    print(f"  -> {qa_fig_path}", flush=True)
+
+    print("Building GIS outputs (Section 21)...", flush=True)
+    gis_dir = study_dir / "gis"
+    gis_dir.mkdir(parents=True, exist_ok=True)
+    footprint_2018 = _build_terrain_footprint_gdf(
+        aligned2018.valid_mask, aligned2020.transform, working_crs
+    )
+    footprint_2020 = _build_terrain_footprint_gdf(
+        aligned2020.valid_mask, aligned2020.transform, working_crs
+    )
+    footprint_common = _build_terrain_footprint_gdf(
+        common.common_valid_mask, aligned2020.transform, working_crs
+    )
+    gpkg_path = gis_dir / "seabed_change_poc.gpkg"
+    if gpkg_path.exists():
+        gpkg_path.unlink()
+    if not footprint_2018.empty:
+        footprint_2018.to_file(gpkg_path, driver="GPKG", layer="epoch_2018_footprint")
+    if not footprint_2020.empty:
+        footprint_2020.to_file(gpkg_path, driver="GPKG", layer="epoch_2020_footprint")
+    if not footprint_common.empty:
+        footprint_common.to_file(gpkg_path, driver="GPKG", layer="common_support_footprint")
+    print(f"  -> {gpkg_path}", flush=True)
+
+    print("Writing generic operator-data input contract (Section 24)...", flush=True)
+    contract = change_contract.build_seabed_change_input_contract()
+    contract_path = study_dir / "seabed_change_input_contract.json"
+    contract_path.write_text(json.dumps(contract, indent=2, default=str), encoding="utf-8")
+    print(f"  -> {contract_path}", flush=True)
+
+    print("Building engineering POC report (Section 25)...", flush=True)
+    finite_dod = dod_result.delta_bed_elevation_m[np.isfinite(dod_result.delta_bed_elevation_m)]
+    change_facts = {
+        "Definition": "delta_bed_elevation_m = bed_elevation_2020_m - bed_elevation_2018_m",
+        "Min": f"{float(finite_dod.min()):.3f} m" if finite_dod.size else "n/a",
+        "Median": f"{vertical_bias_qa.median_dod_m:.3f} m",
+        "P05": f"{vertical_bias_qa.p05_m:.3f} m",
+        "P95": f"{vertical_bias_qa.p95_m:.3f} m",
+        "Max": f"{float(finite_dod.max()):.3f} m" if finite_dod.size else "n/a",
+        "Annualized period (years)": f"{annualized.elapsed_years:.2f} "
+        "(approximate representative dates)",
+        "Horizontal alignment": classification.status,
+    }
+    input_contract_summary = [
+        f"{f['field']}: {f['description']}" for f in contract["required_fields"]
+    ]
+    report_blocks = change_report.build_seabed_change_report_blocks(
+        project_title="Sheringham Shoal 2018-2020 -- Observed Seabed Elevation Change POC",
+        epoch1_source_facts={
+            "Source": sheringham_2018_provider.DATASET_TITLE,
+            "Series": sheringham_2018_provider.MDE_SERIES_ID,
+            "Files": ", ".join(Path(n).name for n in acq2018.xyz_entry_names),
+            "SHA256": ", ".join(acq2018.xyz_entry_sha256),
+            "Vertical datum": sheringham_2018_provider.SOURCE_VERTICAL_DATUM,
+            "Sign convention": sheringham_2018_provider.SOURCE_SIGN_CONVENTION,
+            "Survey epoch": sheringham_2018_provider.SURVEY_PERIOD,
+        },
+        epoch2_source_facts={
+            "Source": sheringham_provider.DATASET_TITLE,
+            "Series": sheringham_provider.MDE_SERIES_ID,
+            "File": acq2020.target_entry_name,
+            "SHA256": acq2020.target_entry_sha256,
+            "Vertical datum": sheringham_provider.SOURCE_VERTICAL_DATUM,
+            "Sign convention": sheringham_provider.SOURCE_SIGN_CONVENTION,
+            "Survey epoch": acq2020.survey_period,
+        },
+        per_epoch_readiness={
+            "2018": {"status": readiness2018.status, "reasons": readiness2018.reasons()},
+            "2020": {"status": readiness2020.status, "reasons": readiness2020.reasons()},
+        },
+        datum_compatibility=datum_result.to_dict(),
+        grid_compatibility=classification.to_dict(),
+        common_support=common.to_dict(),
+        change_facts=change_facts,
+        uncertainty_facts={
+            "Threshold status": threshold.status,
+            "Threshold (m)": f"{threshold.threshold_m:.3f}"
+            if threshold.threshold_m is not None
+            else "n/a",
+            "Evidence": threshold.reason,
+            "MBESHSD grid": "acquired but NOT used quantitatively -- units/scale unverified "
+            "(see uncertainty_evidence_inventory.json)",
+        },
+        comparator_facts={
+            "Sign status": comparator_result.sign_status,
+            "Sign evidence": comparator_result.sign_evidence,
+            "Comparison cell count": comparator_result.common_comparison_cell_count,
+            "As-is / confirmed NMAD (m)": (
+                as_is_stats["nmad_residual_m"] if as_is_stats else "n/a"
+            ),
+        },
+        anthropogenic_limitation_text="Sheringham Shoal is an operating offshore wind farm. "
+        "Observed change can include foundation scour, cable trenching/exposure/burial, rock "
+        "protection works, jack-up disturbance, or natural sediment migration. This POC does NOT "
+        "automatically infer cause -- cells are labelled OBSERVED_SEABED_RAISING / "
+        "OBSERVED_SEABED_LOWERING only, never 'natural erosion' or any other attributed cause.",
+        input_contract_summary=input_contract_summary,
+        what_this_does_not_predict=[
+            "Future erosion or deposition at any location.",
+            "A sediment-transport model of any kind.",
+            "Scour or freespan susceptibility.",
+            "A risk score or route-suitability score.",
+            "Any anthropogenic-vs-natural attribution of observed change.",
+        ],
+    )
+    report_dir = study_dir / "report"
+    report_path = report_dir / "sheringham_shoal_2018_2020_seabed_change_poc.html"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        change_report.render_blocks_html(
+            report_blocks,
+            title="Sheringham Shoal 2018-2020 -- Observed Seabed Elevation Change POC",
+        ),
+        encoding="utf-8",
+    )
+    print(f"  -> {report_path}", flush=True)
+
+    question_f = "NOT_APPLICABLE"
+    validation = {
+        "scientific_role": "MULTI_EPOCH_SEABED_CHANGE_POC",
+        "question_a_both_epochs_data_ready": "YES",
+        "question_b_vertical_datums_compatible": "YES",
+        "question_c_common_support_sufficient": "YES",
+        "question_d_independent_dod_generated": "YES",
+        "question_e_defensible_uncertainty_threshold": "YES"
+        if threshold.threshold_m is not None
+        else "NO",
+        "question_f_source_product_consistent": question_f,
+        "question_f_reason": "Source difference-product sign convention is unresolved from "
+        "documentation -- a YES/NO consistency verdict would implicitly assume a sign never "
+        "confirmed by the source; see dod_vs_source_difference_comparison.json for both "
+        "interpretations' residual statistics.",
+        "route_kp_status": route_kp_status,
+    }
+    validation_path.write_text(json.dumps(validation, indent=2, default=str), encoding="utf-8")
+    print(f"  -> {validation_path}", flush=True)
+
+    change_map_dims = change_maps.read_png_dimensions(change_map_path)
+    qa_fig_dims = change_maps.read_png_dimensions(qa_fig_path)
+    print()
+    print("=== Sheringham Shoal 2018-2020 Seabed Change POC (MAR-021) ===")
+    print()
+    print("## Source")
+    print(
+        f"  2018: {len(acq2018.xyz_entry_names)} XYZ parts, vertical datum "
+        f"{sheringham_2018_provider.SOURCE_VERTICAL_DATUM}, "
+        f"survey epoch {sheringham_2018_provider.SURVEY_PERIOD}"
+    )
+    print(
+        f"  2020: {acq2020.target_entry_name}, "
+        f"vertical datum {sheringham_provider.SOURCE_VERTICAL_DATUM}, "
+        f"survey epoch {acq2020.survey_period}"
+    )
+    print()
+    print("## Readiness")
+    print(f"  2018: {readiness2018.status} | 2020: {readiness2020.status}")
+    print()
+    print("## Alignment")
+    print(f"  {classification.status}: {classification.reason}")
+    print(f"  common overlap: {common.common_valid_cell_count:,} cells")
+    print()
+    print("## DoD")
+    print(
+        f"  min={float(finite_dod.min()):.3f} median={vertical_bias_qa.median_dod_m:.3f} "
+        f"p05={vertical_bias_qa.p05_m:.3f} p95={vertical_bias_qa.p95_m:.3f} "
+        f"max={float(finite_dod.max()):.3f} m"
+    )
+    print(f"  annualized period: {annualized.elapsed_years:.2f} years")
+    print()
+    print("## Uncertainty")
+    print(f"  threshold status: {threshold.status}")
+    print()
+    print("## Official comparator")
+    print(f"  sign status: {comparator_result.sign_status}")
+    print()
+    print("## Outputs")
+    print(f"  Change map: {change_map_path} ({change_map_dims[0]}x{change_map_dims[1]} px)")
+    print(f"  QA figure: {qa_fig_path} ({qa_fig_dims[0]}x{qa_fig_dims[1]} px)")
+    print(f"  GIS: {gpkg_path}")
+    print(f"  Report: {report_path}")
+    print()
+    print(
+        "IS GENERIC OPERATOR-SUPPLIED MULTI-EPOCH MBES -> OBSERVED SEABED CHANGE ANALYTICS "
+        "DEMONSTRATED? YES"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -7133,6 +7725,25 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_highres_terrain_poc_parser.set_defaults(func=_cmd_build_highres_terrain_poc)
+
+    build_seabed_change_poc_parser = subparsers.add_parser(
+        "build-seabed-change-poc",
+        help=(
+            "MAR-021: generic multi-epoch seabed change / DEM-of-Difference POC, benchmarked "
+            "against the real 2018 vs 2020 Sheringham Shoal surveys -- the first non-single-"
+            "epoch OrbGSS Marine Module project. Hard vertical-datum gate, horizontal/grid "
+            "alignment, common-support masking, canonical DoD, uncertainty evidence inventory, "
+            "comparison against an independent source-produced difference product. No future "
+            "erosion/deposition prediction, no sediment-transport model, no risk score, no ML. "
+            "Reuses the already-cached MAR-020 2020 bathymetry; one live acquisition for the "
+            "2018/comparator/HSD files when absent from cache, then fully offline. Outputs live "
+            "under processed/sheringham_shoal_2020/."
+        ),
+    )
+    build_seabed_change_poc_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_seabed_change_poc_parser.set_defaults(func=_cmd_build_seabed_change_poc)
 
     return parser
 
