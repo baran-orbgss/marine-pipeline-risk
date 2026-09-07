@@ -1,8 +1,9 @@
-"""Offline unit tests for marine_engine.change (MAR-021).
+"""Offline unit tests for marine_engine.change (MAR-021; MAR-021A repairs
+the uncertainty semantics tested by S-U).
 
 Small synthetic arrays/facts only -- never the real Sheringham Shoal
 rasters, never network access. Lettered test names map to MAR-021 Section
-27's required test list (A-R).
+27's required test list (A-R), plus MAR-021A's required test list (S-U).
 """
 
 from __future__ import annotations
@@ -373,20 +374,100 @@ def test_M2_raster_propagation_matches_elementwise():
 # --- N: missing uncertainty does not invent a threshold -----------------------------------------
 
 
-def test_N_missing_evidence_yields_the_not_defensible_status_never_a_number():
+def test_N_missing_evidence_yields_the_not_demonstrated_status_never_a_number():
     result = uncertainty.derive_change_threshold(
         sigma_epoch1_m=None, sigma_epoch2_m=None, evidence_citation=None
     )
-    assert result.status == uncertainty.RAW_DOD_AVAILABLE_UNCERTAINTY_THRESHOLD_NOT_DEFENSIBLE
-    assert result.threshold_m is None
+    assert result.status == uncertainty.GENERIC_DOD_UNCERTAINTY_THRESHOLD_NOT_DEMONSTRATED
+    assert result.generic_threshold_m is None
+    assert result.nominal_accuracy_rss_reference_m is None
 
 
-def test_N2_real_evidence_yields_a_derived_threshold_with_its_formula_recorded():
+def test_N2_real_nominal_accuracy_evidence_still_never_demonstrates_a_generic_threshold():
+    """MAR-021A: this is the core repair. MAR-021 treated a real, well-cited
+    'typically less than +/-0.2 m' NOMINAL accuracy figure as if it were a
+    verified 1-sigma standard uncertainty and called sqrt(0.2^2+0.2^2) a
+    'defensible threshold' -- that overstated the source's own claim. Even
+    with real evidence supplied, the status must stay NOT_DEMONSTRATED, and
+    `generic_threshold_m` must stay None; the RSS arithmetic is still
+    computed but only as a labelled, non-canonical reference number."""
+
     result = uncertainty.derive_change_threshold(
         sigma_epoch1_m=0.2, sigma_epoch2_m=0.2, evidence_citation="a real source citation"
     )
-    assert result.threshold_m == pytest.approx(0.2 * np.sqrt(2))
+    assert result.status == uncertainty.GENERIC_DOD_UNCERTAINTY_THRESHOLD_NOT_DEMONSTRATED
+    assert result.generic_threshold_m is None
+    assert result.nominal_accuracy_rss_reference_m == pytest.approx(0.2 * np.sqrt(2))
     assert "sqrt" in result.formula
+    assert "NOT" in result.formula  # the formula string must itself disclaim canonical status
+
+
+# --- MAR-021A S/T/U: uncertainty semantics repair -----------------------------------------------
+
+
+def test_S_nominal_accuracy_cannot_be_silently_treated_as_sigma_regardless_of_magnitude():
+    """Parametrize-by-hand over a few plausible nominal accuracy pairs --
+    none of them may ever produce a demonstrated generic threshold, since
+    the INPUT KIND (nominal, not verified-1-sigma) is what disqualifies
+    them, not their specific values."""
+
+    for sigma1, sigma2 in ((0.2, 0.2), (0.15, 0.25), (0.5, 0.1)):
+        result = uncertainty.derive_change_threshold(
+            sigma_epoch1_m=sigma1, sigma_epoch2_m=sigma2, evidence_citation="cited"
+        )
+        assert result.status == uncertainty.GENERIC_DOD_UNCERTAINTY_THRESHOLD_NOT_DEMONSTRATED
+        assert result.generic_threshold_m is None
+
+
+def test_T_source_specific_analyst_threshold_is_a_distinct_kind_never_fed_into_rss():
+    """Source-inspection: the 0.3 m Fugro analyst threshold constant is
+    never passed as a sigma_epoch*_m argument anywhere in the CLI (i.e. it
+    never enters the RSS/threshold arithmetic) -- it is wired only into a
+    SOURCE_SPECIFIC_ANALYST_THRESHOLD evidence item and the report's
+    separate 'Source-Specific Analyst Threshold' section."""
+
+    source = inspect.getsource(cli._cmd_build_seabed_change_poc)
+    assert "REPORTED_ANALYST_SIGNIFICANCE_THRESHOLD_M" in source
+    assert "EVIDENCE_SOURCE_SPECIFIC_ANALYST_THRESHOLD" in source
+    # It must appear in the analyst-threshold evidence item / report list, never as a
+    # sigma_epoch1_m/sigma_epoch2_m argument to derive_change_threshold.
+    threshold_call_start = source.index("derive_change_threshold(")
+    threshold_call_end = source.index(")", threshold_call_start)
+    threshold_call_args = source[threshold_call_start:threshold_call_end]
+    assert "REPORTED_ANALYST_SIGNIFICANCE_THRESHOLD_M" not in threshold_call_args
+
+
+def test_U_validation_question_e_is_hardcoded_no_with_the_required_reason():
+    source = inspect.getsource(cli._cmd_build_seabed_change_poc)
+    assert '"question_e_defensible_uncertainty_threshold": "NO"' in source
+    assert '"question_e_defensible_uncertainty_threshold": "YES"' not in source
+    assert "insufficient for" in source and "generic uncertainty propagation" in source
+
+
+def test_U2_no_thresholded_change_classification_is_ever_created():
+    """Neither the CLI nor the change engine ever filters/classifies DoD
+    cells by a significance threshold (MAR-021A Section 8) -- the only
+    per-cell classification available (classify_change_direction) is a
+    raw sign split, never gated by any threshold value."""
+
+    cli_source = inspect.getsource(cli._cmd_build_seabed_change_poc)
+    assert "classify_change_direction" not in cli_source
+    dod_source = inspect.getsource(dod.classify_change_direction)
+    assert "threshold" not in dod_source.lower()
+
+
+def test_U3_dod_computation_block_is_structurally_independent_of_uncertainty():
+    """The DoD-computation code (Section 11) must not reference the
+    uncertainty/threshold machinery at all -- a structural guarantee that
+    the MAR-021A semantics repair cannot have touched the DoD raster
+    itself (requirement 1: DoD raster must be unchanged)."""
+
+    source = inspect.getsource(cli._cmd_build_seabed_change_poc)
+    dod_start = source.index("Computing the canonical DoD")
+    qa_start = source.index("Assessing horizontal misregistration QA")
+    dod_block = source[dod_start:qa_start]
+    assert "threshold" not in dod_block.lower()
+    assert "uncertainty" not in dod_block.lower()
 
 
 # --- O: median vertical bias is reported but not auto-corrected --------------------------------

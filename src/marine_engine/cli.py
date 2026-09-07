@@ -7048,17 +7048,21 @@ def _cmd_build_seabed_change_poc(args: argparse.Namespace) -> int:
             kind=change_uncertainty.EVIDENCE_NOMINAL_ACCURACY,
             epoch="2018",
             description="Nominal MBES vertical accuracy: "
-            f"+/-{sheringham_provider.REPORTED_MBES_VERTICAL_ACCURACY_M} m",
+            f"+/-{sheringham_provider.REPORTED_MBES_VERTICAL_ACCURACY_M} m -- a 'typically less "
+            "than' figure, NOT verified by the source as a 1-sigma standard uncertainty "
+            "(MAR-021A)",
             source_citation=sheringham_provider.PRECISION_EVIDENCE_SOURCE,
-            usable_for_threshold=True,
+            usable_for_threshold=False,
         ),
         change_uncertainty.UncertaintyEvidenceItem(
             kind=change_uncertainty.EVIDENCE_NOMINAL_ACCURACY,
             epoch="2020",
             description="Nominal MBES vertical accuracy: "
-            f"+/-{sheringham_provider.REPORTED_MBES_VERTICAL_ACCURACY_M} m",
+            f"+/-{sheringham_provider.REPORTED_MBES_VERTICAL_ACCURACY_M} m -- a 'typically less "
+            "than' figure, NOT verified by the source as a 1-sigma standard uncertainty "
+            "(MAR-021A)",
             source_citation=sheringham_provider.PRECISION_EVIDENCE_SOURCE,
-            usable_for_threshold=True,
+            usable_for_threshold=False,
         ),
         change_uncertainty.UncertaintyEvidenceItem(
             kind=change_uncertainty.EVIDENCE_DATUM_SQUARE_REPEATABILITY,
@@ -7078,6 +7082,17 @@ def _cmd_build_seabed_change_poc(args: argparse.Namespace) -> int:
             source_citation=f"direct rasterio inspection of {hsd_path.name}",
             usable_for_threshold=False,
         ),
+        change_uncertainty.UncertaintyEvidenceItem(
+            kind=change_uncertainty.EVIDENCE_SOURCE_SPECIFIC_ANALYST_THRESHOLD,
+            epoch="2018+2020",
+            description="Fugro's own analyst-applied significance criterion: 'changes of less "
+            f"than {sheringham_provider.REPORTED_ANALYST_SIGNIFICANCE_THRESHOLD_M} m were not "
+            "considered significant, when assessing areas of erosion or accretion' -- scoped to "
+            "THAT source's own interpretation practice; never repackaged as a generic OrbGSS "
+            "uncertainty formula or threshold (MAR-021A)",
+            source_citation=sheringham_provider.PRECISION_EVIDENCE_SOURCE,
+            usable_for_threshold=False,
+        ),
     ]
     uncertainty_inventory = change_uncertainty.build_uncertainty_evidence_inventory(
         uncertainty_items
@@ -7094,8 +7109,12 @@ def _cmd_build_seabed_change_poc(args: argparse.Namespace) -> int:
         evidence_citation=sheringham_provider.PRECISION_EVIDENCE_SOURCE,
     )
     print(
-        f"  threshold status: {threshold.status}"
-        + (f" ({threshold.threshold_m:.3f} m)" if threshold.threshold_m is not None else ""),
+        f"  threshold status: {threshold.status} "
+        f"(generic_threshold_m={threshold.generic_threshold_m}, "
+        f"nominal_accuracy_rss_reference_m="
+        f"{threshold.nominal_accuracy_rss_reference_m:.3f} -- reference only, not a threshold)"
+        if threshold.nominal_accuracy_rss_reference_m is not None
+        else f"  threshold status: {threshold.status} (generic_threshold_m=None)",
         flush=True,
     )
 
@@ -7247,15 +7266,35 @@ def _cmd_build_seabed_change_poc(args: argparse.Namespace) -> int:
         grid_compatibility=classification.to_dict(),
         common_support=common.to_dict(),
         change_facts=change_facts,
-        uncertainty_facts={
-            "Threshold status": threshold.status,
-            "Threshold (m)": f"{threshold.threshold_m:.3f}"
-            if threshold.threshold_m is not None
-            else "n/a",
-            "Evidence": threshold.reason,
-            "MBESHSD grid": "acquired but NOT used quantitatively -- units/scale unverified "
+        measurement_accuracy_evidence=[
+            f"Nominal MBES vertical accuracy (both epochs): "
+            f"+/-{sheringham_provider.REPORTED_MBES_VERTICAL_ACCURACY_M} m -- a 'typically less "
+            "than' figure, NOT verified by the source as a 1-sigma standard uncertainty",
+            f"Stable datum-square repeatability (2018+2020): "
+            f"<= {sheringham_provider.REPORTED_DATUM_SQUARE_REPEATABILITY_M} m",
+            "MBESHSD grid: acquired but NOT used quantitatively -- units/scale unverified "
             "(see uncertainty_evidence_inventory.json)",
-        },
+            f"Source: {sheringham_provider.PRECISION_EVIDENCE_SOURCE}",
+        ],
+        source_specific_analyst_threshold=[
+            f"Fugro's own analyst-applied significance criterion: changes of less than "
+            f"{sheringham_provider.REPORTED_ANALYST_SIGNIFICANCE_THRESHOLD_M} m were not "
+            "considered significant, when assessing areas of erosion or accretion",
+            "Scoped to THAT source's own interpretation practice -- never repackaged as a "
+            "generic OrbGSS uncertainty formula or threshold",
+        ],
+        generic_propagated_uncertainty=[
+            f"Status: {threshold.status}",
+            f"Generic threshold (m): {threshold.generic_threshold_m}",
+            "Nominal-accuracy RSS reference (m): "
+            + (
+                f"{threshold.nominal_accuracy_rss_reference_m:.3f} -- NOT a propagated 1-sigma "
+                "DoD uncertainty and NOT a canonical significance threshold"
+                if threshold.nominal_accuracy_rss_reference_m is not None
+                else "n/a"
+            ),
+            f"Reason: {threshold.reason}",
+        ],
         comparator_facts={
             "Sign status": comparator_result.sign_status,
             "Sign evidence": comparator_result.sign_evidence,
@@ -7297,9 +7336,11 @@ def _cmd_build_seabed_change_poc(args: argparse.Namespace) -> int:
         "question_b_vertical_datums_compatible": "YES",
         "question_c_common_support_sufficient": "YES",
         "question_d_independent_dod_generated": "YES",
-        "question_e_defensible_uncertainty_threshold": "YES"
-        if threshold.threshold_m is not None
-        else "NO",
+        "question_e_defensible_uncertainty_threshold": "NO",
+        "question_e_reason": "source accuracy confidence semantics are insufficient for "
+        "generic uncertainty propagation (MAR-021A) -- a nominal/typical accuracy figure is "
+        "not necessarily a 1-sigma standard uncertainty, and no source in this project has "
+        "established that it is",
         "question_f_source_product_consistent": question_f,
         "question_f_reason": "Source difference-product sign convention is unresolved from "
         "documentation -- a YES/NO consistency verdict would implicitly assume a sign never "
@@ -7344,6 +7385,11 @@ def _cmd_build_seabed_change_poc(args: argparse.Namespace) -> int:
     print()
     print("## Uncertainty")
     print(f"  threshold status: {threshold.status}")
+    print(f"  generic threshold (m): {threshold.generic_threshold_m}")
+    print(
+        "  nominal-accuracy RSS reference (m, non-canonical): "
+        f"{threshold.nominal_accuracy_rss_reference_m}"
+    )
     print()
     print("## Official comparator")
     print(f"  sign status: {comparator_result.sign_status}")

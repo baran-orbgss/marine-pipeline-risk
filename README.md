@@ -1714,9 +1714,9 @@ otherwise, never an interactive credential prompt.
   the same report supplied genuine per-epoch precision evidence (+/-0.2 m
   nominal MBES vertical accuracy; <=0.15 m observed repeatability at a
   stable 100 m^2 datum square across winter surveys including 2018/2020;
-  Fugro's own ~0.3 m analyst significance threshold) used to derive this
-  project's own transparent threshold (0.283 m = sqrt(0.2^2 + 0.2^2)) --
-  never an invented round number. The two independently-built grids (2020's
+  Fugro's own ~0.3 m analyst significance threshold) -- preserved as
+  measurement-accuracy context (see MAR-021A below for how this project's
+  handling of it was corrected). The two independently-built grids (2020's
   official GeoTIFF; this project's own from-scratch rasterization of
   2018's raw XYZ) landed on an exact whole-pixel offset
   (`INTEGER_PIXEL_OFFSET_ALIGNMENT`, row=-10, col=3) -- pure cropping, zero
@@ -1759,4 +1759,42 @@ otherwise, never an interactive credential prompt.
   source-inspection test). 33 new tests (`test_seabed_change_poc.py`)
   cover the required list; the full offline suite (1140 tests, 25 live/
   network tests correctly deselected) and repo-wide `ruff format`/
-  `ruff check` pass clean. No further ticket has started.
+  `ruff check` pass clean.
+
+- `MAR-021A`: a scientific-honesty correction to MAR-021's uncertainty
+  handling -- semantics only, no change to the canonical rasters,
+  alignment, common support, DoD raster, comparator processing, or
+  annualized raster (all confirmed byte-identical/statistically identical
+  before and after this fix). MAR-021 had computed
+  `sqrt(0.2^2 + 0.2^2) = 0.283 m` from the source's own "typically less
+  than +/-0.2 m" nominal MBES accuracy statement and reported the result
+  as a "defensible uncertainty threshold" -- that overstated the source's
+  own claim: nowhere does the source establish that +/-0.2 m is a 1-sigma
+  (or any other named confidence-level) standard uncertainty, so treating
+  it as an addable-in-quadrature sigma was not defensible. The threshold
+  status is now always `GENERIC_DOD_UNCERTAINTY_THRESHOLD_NOT_DEMONSTRATED`
+  (`change.uncertainty.derive_change_threshold` never returns a
+  demonstrated generic threshold for nominal-accuracy inputs, regardless
+  of their values); the same RSS arithmetic is still computed and exposed
+  as `nominal_accuracy_rss_reference_m`, but explicitly labelled as NOT a
+  propagated 1-sigma DoD uncertainty and NOT a canonical significance
+  threshold. Fugro's own "changes <0.3 m were not considered significant"
+  analyst criterion is now a clearly separate, source-specific evidence
+  item (`SOURCE_SPECIFIC_ANALYST_SIGNIFICANCE_THRESHOLD`) that can never
+  be repackaged as a generic OrbGSS formula. The engineering report's
+  Uncertainty section now structurally separates three categories that
+  MAR-021 had blended into one list: Measurement Accuracy Evidence,
+  Source-Specific Analyst Threshold, and Generic Propagated Uncertainty.
+  `seabed_change_poc_validation.json`'s question E
+  (`question_e_defensible_uncertainty_threshold`) is now hardcoded `NO`
+  with an explicit reason, rather than an indirect null-check that
+  happened to evaluate the same way. 5 new tests
+  (`test_seabed_change_poc.py`, S-U) cover: nominal accuracy can never be
+  silently treated as sigma regardless of its magnitude; the source-
+  specific analyst threshold is structurally never fed into the RSS
+  arithmetic; question E is hardcoded `NO`; no thresholded change
+  classification is ever created; and the DoD-computation code block is
+  structurally independent of the uncertainty/threshold machinery. The
+  full offline suite (1145 tests, 25 live/network tests correctly
+  deselected) and repo-wide `ruff format`/`ruff check` pass clean. No
+  further ticket has started.

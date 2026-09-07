@@ -27,7 +27,9 @@ def build_seabed_change_report_blocks(
     grid_compatibility: dict[str, Any],
     common_support: dict[str, Any],
     change_facts: dict[str, Any],
-    uncertainty_facts: dict[str, Any],
+    measurement_accuracy_evidence: list[str],
+    source_specific_analyst_threshold: list[str],
+    generic_propagated_uncertainty: list[str],
     comparator_facts: dict[str, Any],
     anthropogenic_limitation_text: str,
     input_contract_summary: list[str],
@@ -82,7 +84,22 @@ def build_seabed_change_report_blocks(
     blocks.append({"type": "list", "items": [f"{k}: {v}" for k, v in change_facts.items()]})
 
     blocks.append({"type": "heading", "level": 2, "text": "8. Uncertainty"})
-    blocks.append({"type": "list", "items": [f"{k}: {v}" for k, v in uncertainty_facts.items()]})
+    blocks.append(
+        {
+            "type": "paragraph",
+            "text": "MAR-021A: this section deliberately separates what is REAL, CITED "
+            "measurement-accuracy evidence from what is merely one source's own analyst "
+            "practice, from what this project can actually claim as a generic propagated "
+            "uncertainty -- collapsing these into a single number was the MAR-021 error this "
+            "ticket repairs.",
+        }
+    )
+    blocks.append({"type": "heading", "level": 3, "text": "Measurement Accuracy Evidence"})
+    blocks.append({"type": "list", "items": measurement_accuracy_evidence})
+    blocks.append({"type": "heading", "level": 3, "text": "Source-Specific Analyst Threshold"})
+    blocks.append({"type": "list", "items": source_specific_analyst_threshold})
+    blocks.append({"type": "heading", "level": 3, "text": "Generic Propagated Uncertainty"})
+    blocks.append({"type": "list", "items": generic_propagated_uncertainty})
 
     blocks.append(
         {"type": "heading", "level": 2, "text": "9. Official Source-Difference Comparison"}
@@ -138,6 +155,7 @@ def render_blocks_html(blocks: list[dict[str, Any]], *, title: str) -> str:
            padding: 0 1.5rem; color: #1a1a1a; line-height: 1.55; }
     h1 { font-size: 1.8rem; border-bottom: 3px solid #1a1a1a; padding-bottom: 0.3rem; }
     h2 { font-size: 1.2rem; margin-top: 2rem; color: #2a3d5c; border-bottom: 1px solid #ccc; }
+    h3 { font-size: 1rem; margin-top: 1.2rem; color: #47597a; }
     ul { padding-left: 1.4rem; }
     li { margin-bottom: 0.3rem; }
     table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.88rem; }
