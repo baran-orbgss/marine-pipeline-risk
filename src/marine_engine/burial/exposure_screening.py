@@ -66,20 +66,22 @@ class SeabedLoweringInput:
 
 
 def screen_exposure_susceptibility(
-    measured_burial_m: float | None, lowering_input: SeabedLoweringInput | None
+    cover_above_asset_m: float | None, lowering_input: SeabedLoweringInput | None
 ) -> dict[str, Any]:
-    """Section 14-15: `remaining_cover_after_lowering_m = measured_burial_m -
-    seabed_lowering_m`. Returns `NO_DEFENSIBLE_SEABED_LOWERING_INPUT` whenever no
-    `SeabedLoweringInput` is supplied -- this function never invents one (Section 16's
-    real-run rule is enforced simply by never calling this with a fabricated lowering)."""
+    """Section 14-15 (MAR-024A Section 9): `remaining_cover_after_lowering_m =
+    cover_above_asset_m - seabed_lowering_m`. `cover_above_asset_m` must already be the
+    canonical, sign-and-reference-normalized cover from `burial.cover` -- never a raw source
+    burial value (MAR-024A Section 9). Returns `NO_DEFENSIBLE_SEABED_LOWERING_INPUT` whenever
+    no `SeabedLoweringInput` is supplied -- this function never invents one (Section 16's
+    real-run rule is enforced simply by never calling this with a fabricated lowering).
 
-    if measured_burial_m is None:
-        return {
-            "screening_state": INSUFFICIENT_BURIAL_INPUT,
-            "remaining_cover_after_lowering_m": None,
-            "seabed_lowering_m": None,
-            "lowering_evidence_type": None,
-        }
+    The lowering-input gate is checked before the cover gate: with no lowering scenario at
+    all, "no defensible lowering input" is the single actionable blocker regardless of
+    whether cover happens to be resolved (MAR-024A Section 1: a dataset with an unresolved
+    burial reference AND no lowering input reports `NO_DEFENSIBLE_SEABED_LOWERING_INPUT`, not
+    `INSUFFICIENT_BURIAL_INPUT`). `INSUFFICIENT_BURIAL_INPUT` is reserved for a real lowering
+    scenario with no cover value to apply it to."""
+
     if lowering_input is None:
         return {
             "screening_state": NO_DEFENSIBLE_SEABED_LOWERING_INPUT,
@@ -87,8 +89,15 @@ def screen_exposure_susceptibility(
             "seabed_lowering_m": None,
             "lowering_evidence_type": None,
         }
+    if cover_above_asset_m is None:
+        return {
+            "screening_state": INSUFFICIENT_BURIAL_INPUT,
+            "remaining_cover_after_lowering_m": None,
+            "seabed_lowering_m": None,
+            "lowering_evidence_type": None,
+        }
 
-    remaining = measured_burial_m - lowering_input.seabed_lowering_m
+    remaining = cover_above_asset_m - lowering_input.seabed_lowering_m
     screening_state = (
         POSITIVE_COVER_REMAINS_IN_SCREENING
         if remaining > 0

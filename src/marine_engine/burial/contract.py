@@ -33,6 +33,30 @@ REQUIRED_FIELDS_CURRENT_STATE: tuple[dict[str, str], ...] = (
         "silently assumed.",
     },
     {
+        "field": "source_sign_convention",
+        "description": "What a positive vs. negative raw value means -- resolved to exactly "
+        "one of POSITIVE_VALUE_MEANS_DEEPER_BURIAL, NEGATIVE_VALUE_MEANS_DEEPER_BURIAL, or "
+        "explicitly SIGN_CONVENTION_UNRESOLVED (MAR-024A). A numeric 'depth of burial' column "
+        "is NOT analysis-ready until both its sign and its reference point are resolved -- an "
+        "unresolved sign never bypasses normalization to drive classification.",
+    },
+    {
+        "field": "reference_to_asset_top_offset",
+        "description": "Required only when the burial-measurement reference point is "
+        "CENTRELINE_BURIAL or OTHER_SOURCE_SPECIFIC_REFERENCE: the explicit, never-assumed "
+        "offset converting the source reference depth into cover above the top of the asset. "
+        "May be derived from operator-supplied asset geometry (e.g. diameter / 2 for a "
+        "circular cross-section) but is never itself assumed by the generic engine. "
+        "TOP_OF_ASSET_BURIAL requires no offset.",
+    },
+    {
+        "field": "asset_geometry",
+        "description": "Operator-supplied asset cross-section geometry (e.g. diameter), "
+        "needed only to derive `reference_to_asset_top_offset` for a CENTRELINE_BURIAL "
+        "reference -- never assumed to be circular or of any particular size by the generic "
+        "engine.",
+    },
+    {
         "field": "units",
         "description": "The measurement units for burial values and chainage/KP -- checked "
         "for consistency across every source file used, never assumed equal.",
@@ -101,5 +125,9 @@ def build_burial_exposure_input_contract() -> dict[str, Any]:
             "be produced from real source data alone; future exposure susceptibility requires "
             "a separately-defensible seabed-lowering input and is never inferred from a single "
             "survey epoch.",
+            "A numeric 'depth of burial' column is NOT analysis-ready until both its sign "
+            "convention and its measurement reference point are explicitly resolved (MAR-024A) "
+            "-- an unresolved sign convention or reference point yields no canonical reference "
+            "burial depth and no cover-above-asset value, never a guessed classification.",
         ],
     }

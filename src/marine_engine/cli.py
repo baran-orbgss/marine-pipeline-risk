@@ -9433,14 +9433,18 @@ def _cmd_build_burial_exposure_poc(args: argparse.Namespace) -> int:
         f"distribution (mean {z_exposed_mean:.2f} m) to non-exposure rows (mean "
         f"{z_non_exposed_mean:.2f} m) rather than clustering near 0 m as a true burial-depth "
         "convention would require. Z is retained and reported exactly as provided, never "
-        "relabelled as top-of-cable or centreline burial."
+        "relabelled as top-of-cable or centreline burial. Because the reference point itself "
+        "is unresolved, no sign convention is asserted either (MAR-024A) -- "
+        f"{burial_semantics.SIGN_CONVENTION_UNRESOLVED}."
     )
     burial_semantics_obj = burial_semantics.BurialMeasurementSemantics(
         source_measurement_name=barrow_2016_provider.DOB_Z_COLUMN,
         measurement_reference_point=burial_semantics.SOURCE_BURIAL_REFERENCE_UNRESOLVED,
-        sign_convention=(
+        sign_convention=burial_semantics.SIGN_CONVENTION_UNRESOLVED,
+        source_sign_convention_text=(
             "Negative-down observed empirically "
-            f"({int((dob_z < 0).sum())}/{len(dob_df)} real records < 0); no source-stated datum."
+            f"({int((dob_z < 0).sum())}/{len(dob_df)} real records < 0); no source-stated "
+            "datum -- kept for provenance only, never trusted for classification (MAR-024A)."
         ),
         units="m",
         source_stated_uncertainty_available=True,
@@ -9493,9 +9497,11 @@ def _cmd_build_burial_exposure_poc(args: argparse.Namespace) -> int:
         source_kp_column=barrow_2016_provider.DOB_KP_COLUMN,
         record_id_column="_source_record_id",
         burial_reference_type=burial_semantics.SOURCE_BURIAL_REFERENCE_UNRESOLVED,
-        burial_sign_convention=burial_semantics_obj.sign_convention,
+        sign_convention=burial_semantics_obj.sign_convention,
         survey_epoch=barrow_2016_provider.SURVEY_EPOCH,
         measurement_method=burial_semantics_obj.survey_technique,
+        source_sign_convention_text=burial_semantics_obj.source_sign_convention_text,
+        reference_to_asset_top_offset_m=None,  # no source-stated offset/geometry -- never assumed
         source_uncertainty_column=barrow_2016_provider.DOB_UNCERTAINTY_COLUMN,
         exposure_flag_column="_is_exposed",
         qa_flags_by_index=qa_flags_by_index,
@@ -9654,10 +9660,9 @@ def _cmd_build_burial_exposure_poc(args: argparse.Namespace) -> int:
     # Sections 14-17: generic exposure-susceptibility screening contract (demonstrated
     # generically; Section 16's real-run rule: no lowering magnitude is invented for Barrow)
     # ==========================================================================================
-    median_measured_value = profile_stats["burial_median_m"]
-    real_screening_result = burial_exposure_screening.screen_exposure_susceptibility(
-        median_measured_value, None
-    )
+    # cover_above_asset_m is null for every real Barrow record (burial reference unresolved,
+    # MAR-024A Section 10) -- the raw Z median is never substituted in its place (Section 9).
+    real_screening_result = burial_exposure_screening.screen_exposure_susceptibility(None, None)
     print(
         "Real Barrow exposure-screening result (Section 16): "
         f"{real_screening_result['screening_state']}"
@@ -9719,6 +9724,22 @@ def _cmd_build_burial_exposure_poc(args: argparse.Namespace) -> int:
             "coverage_fraction": coverage_fraction,
             "coverage_gap_count": len(coverage_gaps_m),
         },
+        canonical_cover_semantics_text=(
+            "This profile distinguishes five concepts (MAR-024A): RAW SOURCE MEASUREMENT (the "
+            f"value exactly as {barrow_2016_provider.DOB_Z_COLUMN!r} was reported by the "
+            "source); CANONICAL REFERENCE BURIAL DEPTH (the raw value after its sign "
+            "convention is resolved and normalized -- null here, since "
+            f"{burial_semantics_obj.sign_convention} for every record); TOP-OF-ASSET COVER "
+            "(the canonical reference burial depth converted to cover above the top of the "
+            "asset -- also null here, since "
+            f"{burial_semantics_obj.measurement_reference_point} for every record); "
+            "SOURCE-INTERPRETED EXPOSURE (evidence the source itself explicitly flagged, "
+            "always independent of the numeric measurement); and FUTURE EXPOSURE SCREENING "
+            "(only ever produced given a defensible seabed-lowering input, never inferred "
+            "from a single survey epoch). Barrow demonstrates the valid unresolved-reference "
+            "path: every record is reported as MEASURED_REFERENCE_REQUIRES_REVIEW or the "
+            "source's own explicit SOURCE_INTERPRETED_EXPOSED, never a guessed physical state."
+        ),
         measured_burial_profile_facts=profile_stats,
         source_interpreted_exposure_facts={
             "explicit_exposure_feature_count": len(exposure_df),

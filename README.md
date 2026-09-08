@@ -2169,4 +2169,78 @@ otherwise, never an interactive credential prompt.
   BURIAL -> BURIAL / EXPOSURE STATE ANALYTICS DEMONSTRATED?` YES; `IS
   FUTURE BARROW EXPOSURE SUSCEPTIBILITY DEMONSTRATED FROM THE CURRENT REAL
   DATA?` NO (expected -- no defensible seabed-lowering input exists for
-  this route/epoch). No further ticket has started.
+  this route/epoch).
+- **MAR-024A (canonical burial-cover semantics repair, real Barrow
+  conclusion untouched).** A precise correction to the generic engine, not
+  a rewrite: MAR-024's `burial_sign_convention` was recorded but never
+  actually used in classification (Problem A), and `TOP_OF_ASSET_BURIAL`
+  vs. `CENTRELINE_BURIAL` were interpreted identically (Problem B) --
+  neither is acceptable for generic operator input, where a source's own
+  "depth of burial" number is meaningless until both its sign and its
+  reference point are resolved. Fixed with a new `burial/cover.py`
+  module and an explicit sign vocabulary
+  (`POSITIVE_VALUE_MEANS_DEEPER_BURIAL` / `NEGATIVE_VALUE_MEANS_DEEPER_BURIAL`
+  / `SIGN_CONVENTION_UNRESOLVED` -- free text is no longer accepted for
+  physical classification, though it may still be preserved separately as
+  `source_sign_convention_text`), normalizing a raw value into
+  `canonical_reference_burial_depth_m` exactly once
+  (`normalize_canonical_reference_burial_depth_m`), then into
+  `cover_above_asset_m` exactly once (`compute_cover_above_asset_m`) --
+  `TOP_OF_ASSET_BURIAL` passes through unchanged, `CENTRELINE_BURIAL`/
+  `OTHER_SOURCE_SPECIFIC_REFERENCE` both require an explicit, never-
+  assumed `reference_to_asset_top_offset_m` (never a hard-coded diameter
+  / 2, since not every linear asset is circular). `cover_above_asset_m`
+  is now the ONLY numeric quantity permitted to drive measured burial-
+  state classification: `classify_current_burial_state` was restructured
+  to accept `cover_above_asset_m` plus two booleans and structurally
+  cannot see a raw source value at all, closing off any channel for a raw
+  magnitude/sign to bypass normalization. Measured-state logic is now
+  `cover > tolerance` -> `MEASURED_BURIED`, `|cover| <= tolerance` ->
+  `MEASURED_AT_SEABED_LEVEL`, `cover < -tolerance` -> the new
+  `MEASURED_ABOVE_SEABED` (added to the vocabulary), with
+  `SOURCE_INTERPRETED_EXPOSED` still reachable ONLY via the source's own
+  explicit flag and still checked ahead of the cover-based states, so the
+  two concepts never collapse into one. The profile column carrying this
+  result is renamed `current_burial_state` -> `measured_burial_state`
+  (and the frozenset `CURRENT_BURIAL_STATES` ->
+  `MEASURED_BURIAL_STATES`) to state its semantics explicitly rather than
+  hide the distinction, per the ticket's own preference for the canonical
+  schema. `screen_exposure_susceptibility` now consumes
+  `cover_above_asset_m`, never a raw source burial value; its two guard
+  checks were also reordered (missing-lowering-input checked before
+  missing-cover) so that "no defensible lowering input" -- the single
+  actionable blocker when neither exists -- is reported ahead of
+  "insufficient burial input", which is now reserved for a real lowering
+  scenario with no cover to apply it to. This reordering was required to
+  keep the real Barrow result honest: cover is now genuinely `None` for
+  Barrow (never the raw `Z` median standing in for it, as MAR-024's
+  original wiring did), and the ticket required
+  `NO_DEFENSIBLE_SEABED_LOWERING_INPUT` to remain the preserved real
+  screening result rather than regressing to `INSUFFICIENT_BURIAL_INPUT`.
+  The real Barrow conclusion is completely unchanged end to end, verified
+  by a real offline rerun: `SOURCE_BURIAL_REFERENCE_UNRESOLVED`, the same
+  19,658 `MEASURED_REFERENCE_REQUIRES_REVIEW` / 1,288
+  `SOURCE_INTERPRETED_EXPOSED` split, the same `READY_WITH_LIMITATIONS`
+  readiness and all eight validation answers unchanged -- with the new
+  fields now visibly demonstrating the valid unresolved-reference path:
+  `canonical_reference_burial_depth_available_count: 0` and
+  `cover_above_asset_available_count: 0` for all 20,946 real records,
+  since Barrow's sign convention is honestly asserted
+  `SIGN_CONVENTION_UNRESOLVED` too (the same statistical evidence that
+  makes the reference point unresolvable -- exposure-flagged and
+  non-flagged `Z` values are statistically similar rather than clustering
+  near 0 m -- means no sign convention can be honestly asserted for it
+  either). `contract.py`'s input contract and `report.py`'s HTML report
+  were both updated to name and distinguish all five concepts (raw source
+  measurement, canonical reference burial depth, top-of-asset cover,
+  source-interpreted exposure, future exposure screening) per the ticket.
+  20 new tests cover both sign directions, an unresolved sign yielding no
+  canonical depth regardless of the raw value's own magnitude,
+  top-of-asset vs. centreline producing physically different cover from
+  the same input, a missing centreline offset blocking classification,
+  all three cover-based states plus exposure staying independent of them,
+  the screening function's new signature and reordered precedence, and a
+  synthetic analog of Barrow's exact real split (unresolved reference +
+  unresolved sign together); the full offline suite (1279 tests, up from
+  1259) and repo-wide `ruff format`/`ruff check` pass clean. No further
+  ticket has started.

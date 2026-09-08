@@ -26,6 +26,7 @@ def build_burial_exposure_report_blocks(
     burial_reference_semantics_facts: dict[str, Any],
     data_readiness_facts: dict[str, Any],
     route_and_coverage_facts: dict[str, Any],
+    canonical_cover_semantics_text: str,
     measured_burial_profile_facts: dict[str, Any],
     source_interpreted_exposure_facts: dict[str, Any],
     burial_margin_text: str,
@@ -62,6 +63,7 @@ def build_burial_exposure_report_blocks(
     )
 
     blocks.append({"type": "heading", "level": 2, "text": "6. Measured Burial Profile"})
+    blocks.append({"type": "paragraph", "text": canonical_cover_semantics_text})
     blocks.append(
         {
             "type": "list",
