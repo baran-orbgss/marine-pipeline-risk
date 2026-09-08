@@ -1,0 +1,55 @@
+# Study configuration for the Barrow 2016 generic burial/exposure state POC (MAR-024).
+#
+# This is the FIRST OrbGSS Marine Module POC built around a REAL measured
+# depth-of-burial profile from an operator-style post-construction survey,
+# and the first study case that is neither the PL854 pipeline nor the
+# Sheringham Shoal terrain benchmark. There is no NSTA pipeline registry
+# entry for an export cable, so this study has no `pipeline.pipeline_id`
+# and is not ingested via `marine_engine.providers.nsta` -- see
+# `marine_engine.providers.barrow_2016` for the real acquisition.
+#
+# Source: The Crown Estate / Marine Data Exchange, series TCE-48,
+# "2016, Deep BV, Barrow, Export Cable Geophysical Depth of Burial Survey"
+# (survey contractor Deep BV, collection September-October 2016).
+
+study:
+  id: BARROW_2016
+  name: "Barrow 2016 Export Cable Burial/Exposure State POC"
+  description: >
+    Generic linear-asset burial/exposure state and cover-margin screening
+    demonstrator, benchmarked against the real 2016 Deep BV Barrow Offshore
+    Wind Farm export cable geophysical depth-of-burial survey (The Crown
+    Estate Marine Data Exchange, TCE-48). Public-data development case
+    only -- distinguishes observed/measured burial state from
+    source-interpreted exposure evidence from future exposure
+    susceptibility; the latter is never claimed from a single survey.
+  design_life_years: null  # not applicable: this is a burial/exposure-analytics POC.
+
+crs:
+  # EPSG:25830 (ETRS89 / UTM zone 30N) confirmed directly from BOTH real source packages: the
+  # Depth of Burial Listing's own MEDIN metadata (`urn:ogc:def:crs:EPSG::25830`) and the Route
+  # Position List shapefiles' own .prj file ("ETRS89_UTM_zone_30N") independently agree -- used
+  # directly as the working CRS with no reprojection.
+  horizontal: "EPSG:25830"
+  vertical: null  # source vertical datum for "Z" is not stated by the source; see source_burial_semantics.json.
+
+area_of_interest:
+  # No buffered AOI polygon is built for this project: the real Route Position List line IS the
+  # authoritative asset route (Section 6: never invent a centreline).
+  bbox_wgs84: null
+  corridor_buffer_m: null
+
+paths:
+  raw_dir: data/raw
+  interim_dir: data/interim
+  processed_dir: data/processed
+
+providers: {}
+preprocessing: {}
+morphology: {}
+sediment: {}
+metocean: {}
+pipeline: {}
+risk: {}
+validation: {}
+export: {}

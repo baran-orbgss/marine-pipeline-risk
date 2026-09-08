@@ -2081,4 +2081,92 @@ otherwise, never an interactive credential prompt.
   an exact numeric golden-value regression proving Track A's scenario
   envelope arithmetic is untouched. Full offline suite: 1226 tests, 25
   live/network tests correctly deselected; repo-wide `ruff format`/
-  `ruff check` pass clean. No further ticket has started.
+  `ruff check` pass clean.
+- **MAR-024 (generic linear-asset burial/exposure state POC,
+  `src/marine_engine/burial/` -- `semantics.py`/`readiness.py`/`route.py`/
+  `profile.py`/`margin.py`/`exposure_screening.py`/`maps.py`/`contract.py`/
+  `report.py`, `providers/barrow_2016.py`, `configs/barrow_2016.yaml`,
+  `build-burial-exposure-poc`).** The first POC built around a REAL
+  measured depth-of-burial profile and the first study that is neither
+  PL854 nor Sheringham Shoal: the 2016 Deep BV Barrow Offshore Wind Farm
+  export cable geophysical depth-of-burial survey (The Crown Estate Marine
+  Data Exchange, TCE-48). Three concepts kept separate throughout:
+  observed/measured burial state, source-interpreted exposure evidence,
+  and future exposure susceptibility -- the last is only ever produced
+  given a defensible, explicitly-typed seabed-lowering input
+  (`OBSERVED_MULTI_EPOCH_SEABED_LOWERING` or
+  `OPERATOR_DEFINED_LOWERING_SCENARIO`; a bare float is never accepted).
+  Minimal real acquisition: only the Depth of Burial Listing (a real
+  20,946-record Excel workbook, 2,756,040 bytes -- the package's own
+  "Listing" folder name turned out to mean `.xlsx`, not plain text,
+  confirmed by inspection rather than assumed, requiring a new `openpyxl`
+  dependency) and the Route Position List Files (a real single-LineString
+  26,233.4 m route plus 5,252 real per-station KP/Easting/Northing points,
+  216,571 bytes) -- neither Multibeam Bathymetry, Side-scan Sonar,
+  Sub-bottom Profiler, Cable Tracker Survey, nor Seabed Features were
+  downloaded, since the DoB listing itself already carries a real,
+  explicit exposure flag. The real source's own MEDIN lineage statement
+  says "depth of burial (DoB or 'z')" as a general survey-campaign
+  objective, but before trusting that label this ticket's Section 4 hard
+  gate demanded real evidence: the real `Z` column ranges -28.56 to 2.48 m
+  (mean -14.91 m) across all 20,946 records -- far too large in magnitude
+  for a literal cable-burial depth -- and, decisively, the 1,288 real rows
+  the source itself flags `"Exposure"` in a `Storage Db` column show a
+  statistically SIMILAR `Z` distribution (mean -13.67 m) to the
+  non-exposure rows (mean -14.99 m) rather than clustering near 0 m as a
+  true burial-depth convention would require. This is real, direct,
+  falsifying evidence against reading `Z` as burial depth, so the ticket's
+  own escape hatch is used honestly: `SOURCE_BURIAL_REFERENCE_UNRESOLVED`,
+  recorded with its full statistical justification in
+  `source_burial_semantics.json`, never silently relabelled as top-of-
+  cable burial. Because the reference is unresolved, current burial state
+  for all 19,658 non-exposure-flagged records is honestly
+  `MEASURED_REFERENCE_REQUIRES_REVIEW` (never inferred as buried/exposed
+  from the number's sign) -- the remaining 1,288 records are
+  `SOURCE_INTERPRETED_EXPOSED`, reachable ONLY via the source's own
+  explicit `"Exposure"` flag, structurally never from `Z`'s value.
+  Readiness is real and honest too: `READY_WITH_LIMITATIONS`, correctly
+  flagging a real KP-unit mismatch between the two source packages (DoB KP
+  in metres, RPL KP in kilometres -- converted explicitly, never assumed
+  equal), the unresolved burial reference, and 96.4% route coverage (a
+  real, un-interpolated survey gap). The canonical route's own
+  start-to-end direction against increasing source KP was empirically
+  VERIFIED (not assumed) by comparing real route endpoints against the
+  real min/max-KP route-position points, confirmed to match. `Section 16`'s
+  real-run rule was honoured exactly: no seabed-lowering magnitude was
+  invented for Barrow, so the real screening result is
+  `NO_DEFENSIBLE_SEABED_LOWERING_INPUT`, and question G ("is a real Barrow
+  future exposure susceptibility result defensible?") correctly and
+  structurally (via an asserted pure function, mirroring MAR-022A/023's
+  `_derive_..._validation_questions` pattern) always answers NO -- while
+  the generic engine itself is proven correct via Section 17's exact
+  synthetic demo (1.0 m cover - 0.4 m lowering = 0.6 m remaining, positive;
+  0.2 m - 0.4 m = -0.2 m, zero-or-negative). Unlike MAR-023's session, no
+  real bug was found by running the CLI against real data -- the semantic
+  hard-gate investigation (Section 4) was done evidence-first, before any
+  code was written, and two real defects (a variable-scoping bug that
+  would have crashed on an empty profile, and a redundant geometry
+  reconstruction call) were instead caught by direct code review before
+  the first real run, which then succeeded cleanly both live
+  (`already_cached=False`) and fully offline on rerun
+  (`already_cached=True` for both packages). GIS output carries five real
+  layers (`asset_route` 1, `burial_measurements` 20,946,
+  `source_interpreted_exposure` 1,288, `survey_coverage` 1, `qa_flags`
+  2,171 -- the last from real per-record `Data Quality`/`Uncertainty`
+  outlier flags). 33 new tests cover reference-must-resolve-before-
+  exposure-inference, top-of-asset-vs-centreline distinctness, missing-KP
+  never fabricating a route position, duplicate-KP flagging, no
+  interpolation over profile gaps, measured-state-vs-exposure-evidence
+  independence, trench-scar-never-becomes-exposure, actual-vs-target
+  burial distinctness, null margin with no target, positive margin never
+  SAFE, the exact Section 17 synthetic screening numbers, no lowering
+  input blocking future susceptibility, absence of any probability/risk-
+  score/free-span field, absence of hard-coded Barrow/PL854 coordinates in
+  the generic engine, and offline-cache-hit acquisition tests for both
+  real packages; the full offline suite (1259 tests, 25 live/network tests
+  correctly deselected) and repo-wide `ruff format`/`ruff check` pass
+  clean. Final real answers: `IS GENERIC OPERATOR-SUPPLIED DEPTH-OF-
+  BURIAL -> BURIAL / EXPOSURE STATE ANALYTICS DEMONSTRATED?` YES; `IS
+  FUTURE BARROW EXPOSURE SUSCEPTIBILITY DEMONSTRATED FROM THE CURRENT REAL
+  DATA?` NO (expected -- no defensible seabed-lowering input exists for
+  this route/epoch). No further ticket has started.

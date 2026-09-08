@@ -17,6 +17,7 @@ import xarray as xr
 from shapely.geometry import LineString as shapely_linestring
 from shapely.geometry import box as shapely_box
 from shapely.geometry import shape as shapely_shape
+from shapely.ops import substring as shapely_substring
 from shapely.ops import unary_union
 
 from marine_engine import __version__
@@ -30,6 +31,14 @@ from marine_engine.bedforms import maps as bedform_maps
 from marine_engine.bedforms import matching as bedform_matching
 from marine_engine.bedforms import natural_context as bedform_natural_context
 from marine_engine.bedforms import report as bedform_report
+from marine_engine.burial import contract as burial_contract
+from marine_engine.burial import exposure_screening as burial_exposure_screening
+from marine_engine.burial import maps as burial_maps
+from marine_engine.burial import profile as burial_profile
+from marine_engine.burial import readiness as burial_readiness
+from marine_engine.burial import report as burial_report
+from marine_engine.burial import route as burial_route
+from marine_engine.burial import semantics as burial_semantics
 from marine_engine.change import alignment as change_alignment
 from marine_engine.change import common_support as change_common_support
 from marine_engine.change import comparator as change_comparator
@@ -70,6 +79,7 @@ from marine_engine.preprocessing.chainage import (
     load_pipeline_route,
     print_chainage_report,
 )
+from marine_engine.providers import barrow_2016 as barrow_2016_provider
 from marine_engine.providers import bgs_offshore_surveys, nsta_freespan
 from marine_engine.providers.bathymetry import acquisition, bgs, emodnet, inventory, ukho
 from marine_engine.providers.bathymetry import greater_gabbard_2014 as gg_provider
@@ -9257,6 +9267,556 @@ def _cmd_build_bedform_morphodynamics_poc(args: argparse.Namespace) -> int:
     return 0
 
 
+_BARROW_ASSET_ID = "BARROW_EXPORT_CABLE"
+_BARROW_COORD_MATCH_TOLERANCE_M = 1.0
+
+
+def _derive_burial_exposure_poc_validation_questions(
+    *,
+    real_dob_dataset_ingested: bool,
+    burial_reference_resolved: bool,
+    authoritative_route_recovered: bool,
+    measured_burial_profile_produced: bool,
+    explicit_exposure_evidence_present: bool,
+    generic_exposure_screening_computable: bool,
+) -> dict[str, str]:
+    """MAR-024 Section 22: a pure function so G/H's mandated NO answers are structurally
+    enforced (asserted) -- this POC never claims a real Barrow future exposure susceptibility
+    result and never produces an exposure probability, regardless of what upstream facts say."""
+
+    barrow_future_susceptibility_defensible = False
+    exposure_probability_produced = False
+    assert barrow_future_susceptibility_defensible is False
+    assert exposure_probability_produced is False
+
+    return {
+        "question_a_real_operator_style_dob_dataset_ingested": (
+            "YES" if real_dob_dataset_ingested else "NO"
+        ),
+        "question_b_source_burial_measurement_reference_resolved": (
+            "YES" if burial_reference_resolved else "NO"
+        ),
+        "question_c_authoritative_route_kp_model_recovered": (
+            "YES" if authoritative_route_recovered else "NO"
+        ),
+        "question_d_real_measured_burial_profile_produced": (
+            "YES" if measured_burial_profile_produced else "NO"
+        ),
+        "question_e_explicit_source_interpreted_exposure_evidence_present": (
+            "YES" if explicit_exposure_evidence_present else "NO"
+        ),
+        "question_f_generic_cover_depletion_exposure_screening_computable": (
+            "YES" if generic_exposure_screening_computable else "NO"
+        ),
+        "question_g_real_barrow_future_exposure_susceptibility_defensible": (
+            "YES" if barrow_future_susceptibility_defensible else "NO"
+        ),
+        "question_h_exposure_probability_produced": (
+            "YES" if exposure_probability_produced else "NO"
+        ),
+    }
+
+
+def _cmd_build_burial_exposure_poc(args: argparse.Namespace) -> int:
+    """MAR-024: generic linear-asset burial/exposure state and cover-margin screening POC,
+    benchmarked against the real 2016 Deep BV Barrow Offshore Wind Farm export cable
+    geophysical depth-of-burial survey (TCE-48). Three concepts kept separate throughout:
+    observed/measured burial state (A), source-interpreted exposure evidence (B), and future
+    exposure susceptibility (C) -- C is only ever produced given a defensible seabed-lowering
+    input, which the real Barrow package does not provide (Section 16).
+
+    Performs at most two minimal live acquisitions (Depth of Burial Listing, Route Position
+    List Files) if not already cached, then is fully offline.
+    """
+
+    config = load_study_config(args.config)
+    study_id = config.study.id.lower()
+    study_dir = config.paths.processed_dir / study_id
+    raw_dir = config.paths.raw_dir / study_id
+    burial_dir = study_dir / "burial"
+    readiness_dir = study_dir / "readiness"
+    maps_dir = study_dir / "maps"
+    report_dir = study_dir / "report"
+    working_crs = config.crs.horizontal
+
+    # ==========================================================================================
+    # Section 3: minimal acquisition
+    # ==========================================================================================
+    print("Acquiring the 2016 Barrow Depth of Burial Listing (Section 3)...")
+    dob_acquisition = barrow_2016_provider.download_depth_of_burial_listing(raw_dir)
+    print(
+        f"  {dob_acquisition.package_bytes:,} bytes, "
+        f"sha256={dob_acquisition.package_sha256[:12]}..., "
+        f"already_cached={dob_acquisition.already_cached}"
+    )
+    print("Acquiring the 2016 Barrow Route Position List Files (Section 3)...")
+    rpl_acquisition = barrow_2016_provider.download_route_position_list(raw_dir)
+    print(
+        f"  {rpl_acquisition.package_bytes:,} bytes, "
+        f"sha256={rpl_acquisition.package_sha256[:12]}..., "
+        f"already_cached={rpl_acquisition.already_cached}"
+    )
+
+    dob_df = barrow_2016_provider.load_dob_listing_raw(dob_acquisition.extracted_dir)
+    line_gdf, points_gdf = barrow_2016_provider.load_route_position_list(
+        rpl_acquisition.extracted_dir
+    )
+    print(f"  {len(dob_df)} real DoB record(s) loaded")
+    print(f"  {len(points_gdf)} real route-position point(s) loaded")
+
+    # ==========================================================================================
+    # Section 6: canonical route -- the real source route/route-position line, never invented
+    # ==========================================================================================
+    try:
+        route = burial_route.resolve_route_linestring(line_gdf.geometry.iloc[0])
+    except burial_route.InvalidAssetRouteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    start_point = route.interpolate(0.0)
+    end_point = route.interpolate(route.length)
+    min_kp_point = points_gdf.loc[points_gdf[barrow_2016_provider.RPL_KP_COLUMN].idxmin()].geometry
+    max_kp_point = points_gdf.loc[points_gdf[barrow_2016_provider.RPL_KP_COLUMN].idxmax()].geometry
+    start_matches_min_kp = start_point.distance(min_kp_point) < _BARROW_COORD_MATCH_TOLERANCE_M
+    end_matches_max_kp = end_point.distance(max_kp_point) < _BARROW_COORD_MATCH_TOLERANCE_M
+    if start_matches_min_kp and end_matches_max_kp:
+        geometry_direction_semantics = (
+            "GEOMETRY_START_TO_END_MATCHES_INCREASING_SOURCE_KP "
+            "(verified against the real route-position-list points, not assumed)"
+        )
+    elif start_point.distance(max_kp_point) < _BARROW_COORD_MATCH_TOLERANCE_M and (
+        end_point.distance(min_kp_point) < _BARROW_COORD_MATCH_TOLERANCE_M
+    ):
+        geometry_direction_semantics = (
+            "GEOMETRY_START_TO_END_MATCHES_DECREASING_SOURCE_KP "
+            "(verified against the real route-position-list points, not assumed)"
+        )
+    else:
+        geometry_direction_semantics = (
+            "GEOMETRY_DIRECTION_VS_SOURCE_KP_UNRESOLVED "
+            "(could not verify against route-position-list points within tolerance)"
+        )
+    print(f"  Route direction semantics: {geometry_direction_semantics}")
+
+    canonical_route_gdf = burial_route.build_canonical_asset_route(
+        route=route,
+        asset_id=_BARROW_ASSET_ID,
+        source_route_name=barrow_2016_provider.RPL_LINE_FILENAME,
+        source_crs=working_crs,
+        geometry_direction_semantics=geometry_direction_semantics,
+    )
+    canonical_route_path = burial_route.write_canonical_asset_route_gpkg(
+        canonical_route_gdf, burial_dir / "canonical_asset_route.gpkg"
+    )
+    print(f"  Canonical asset route ({route.length:.1f} m) -> {canonical_route_path}")
+
+    # ==========================================================================================
+    # Section 4: source burial-measurement semantics -- a hard gate, resolved from real evidence
+    # ==========================================================================================
+    print("Resolving source burial-measurement semantics (Section 4)...")
+    dob_z = dob_df[barrow_2016_provider.DOB_Z_COLUMN]
+    exposure_mask = (
+        dob_df[barrow_2016_provider.DOB_STORAGE_DB_COLUMN]
+        == barrow_2016_provider.SOURCE_EXPOSURE_FLAG_VALUE
+    )
+    z_exposed_mean = float(dob_z[exposure_mask].mean())
+    z_non_exposed_mean = float(dob_z[~exposure_mask].mean())
+    resolution_evidence = (
+        "Source MEDIN lineage states 'depth of burial (DoB or \"z\")' as a general survey- "
+        "campaign objective, but the real data is inconsistent with a literal burial-depth- "
+        f"below-seabed reading: {barrow_2016_provider.DOB_Z_COLUMN!r} ranges "
+        f"{float(dob_z.min()):.2f} to {float(dob_z.max()):.2f} m "
+        f"(mean {float(dob_z.mean()):.2f} m) across {len(dob_df)} real records, and the "
+        f"{int(exposure_mask.sum())} rows the source "
+        f"itself flags {barrow_2016_provider.SOURCE_EXPOSURE_FLAG_VALUE!r} in "
+        f"{barrow_2016_provider.DOB_STORAGE_DB_COLUMN!r} show a statistically similar Z "
+        f"distribution (mean {z_exposed_mean:.2f} m) to non-exposure rows (mean "
+        f"{z_non_exposed_mean:.2f} m) rather than clustering near 0 m as a true burial-depth "
+        "convention would require. Z is retained and reported exactly as provided, never "
+        "relabelled as top-of-cable or centreline burial."
+    )
+    burial_semantics_obj = burial_semantics.BurialMeasurementSemantics(
+        source_measurement_name=barrow_2016_provider.DOB_Z_COLUMN,
+        measurement_reference_point=burial_semantics.SOURCE_BURIAL_REFERENCE_UNRESOLVED,
+        sign_convention=(
+            "Negative-down observed empirically "
+            f"({int((dob_z < 0).sum())}/{len(dob_df)} real records < 0); no source-stated datum."
+        ),
+        units="m",
+        source_stated_uncertainty_available=True,
+        survey_technique=(
+            "Innomar sub-bottom profiler cross-referenced against an acoustic cable tracker "
+            "(source-titled 'DoB listing correlated with acoustics')"
+        ),
+        unknown_fields=(
+            "vertical datum for Z",
+            "whether Z is below-seabed or below-chart-datum",
+            "DepthSD Value definition",
+            "Decibel / Frequency Value / Current Value definitions",
+        ),
+        resolution_evidence=resolution_evidence,
+    )
+    burial_semantics_dict = burial_semantics.build_source_burial_semantics(burial_semantics_obj)
+    semantics_path = burial_dir / "source_burial_semantics.json"
+    semantics_path.parent.mkdir(parents=True, exist_ok=True)
+    semantics_path.write_text(
+        json.dumps(burial_semantics_dict, indent=2, default=str), encoding="utf-8"
+    )
+    print(f"  {burial_semantics_obj.measurement_reference_point} -> {semantics_path}")
+
+    # ==========================================================================================
+    # Section 7: canonical burial profile
+    # ==========================================================================================
+    print("Building the canonical burial profile (Section 7)...")
+    dob_df = dob_df.reset_index(drop=True)
+    dob_df["_source_record_id"] = dob_df.index.astype(str)
+    dob_df["_is_exposed"] = exposure_mask.to_numpy()
+
+    uncertainty_p95 = dob_df[barrow_2016_provider.DOB_UNCERTAINTY_COLUMN].quantile(0.95)
+    qa_flags_by_index: dict[Any, list[str]] = {}
+    for idx, row in dob_df.iterrows():
+        flags = []
+        if row.get(barrow_2016_provider.DOB_DATA_QUALITY_COLUMN) == 2:
+            flags.append("SOURCE_DATA_QUALITY_FLAG_2")
+        if row[barrow_2016_provider.DOB_UNCERTAINTY_COLUMN] > uncertainty_p95:
+            flags.append("HIGH_UNCERTAINTY_TOP_5_PERCENT")
+        if flags:
+            qa_flags_by_index[idx] = flags
+
+    profile_df = burial_profile.build_canonical_burial_profile(
+        records_df=dob_df,
+        asset_id=_BARROW_ASSET_ID,
+        route=route,
+        x_column=barrow_2016_provider.DOB_EASTING_COLUMN,
+        y_column=barrow_2016_provider.DOB_NORTHING_COLUMN,
+        measured_value_column=barrow_2016_provider.DOB_Z_COLUMN,
+        source_kp_column=barrow_2016_provider.DOB_KP_COLUMN,
+        record_id_column="_source_record_id",
+        burial_reference_type=burial_semantics.SOURCE_BURIAL_REFERENCE_UNRESOLVED,
+        burial_sign_convention=burial_semantics_obj.sign_convention,
+        survey_epoch=barrow_2016_provider.SURVEY_EPOCH,
+        measurement_method=burial_semantics_obj.survey_technique,
+        source_uncertainty_column=barrow_2016_provider.DOB_UNCERTAINTY_COLUMN,
+        exposure_flag_column="_is_exposed",
+        qa_flags_by_index=qa_flags_by_index,
+    )
+    profile_path = metocean_evidence.write_parquet(
+        profile_df, burial_dir / "canonical_burial_profile.parquet"
+    )
+    print(f"  {len(profile_df)} canonical profile row(s) -> {profile_path}")
+
+    profile_stats = burial_profile.compute_profile_statistics(profile_df)
+    for key, value in profile_stats.items():
+        print(f"  {key}: {value}")
+
+    # ==========================================================================================
+    # Section 5: burial-profile data readiness
+    # ==========================================================================================
+    print("Assessing burial-profile data readiness (Section 5)...")
+    source_kp = dob_df[barrow_2016_provider.DOB_KP_COLUMN]
+    coverage_fraction = (
+        (float(source_kp.max()) - float(source_kp.min())) / route.length if route.length else None
+    )
+    facts = burial_readiness.BurialProfileFacts(
+        source_file_readable=True,
+        record_count=len(dob_df),
+        route_identifier_available=True,
+        kp_available=True,
+        kp_is_monotonic=bool(source_kp.is_monotonic_increasing),
+        duplicate_kp_count=int(source_kp.duplicated().sum()),
+        coordinate_support=True,
+        crs_available=True,
+        units_available=True,
+        units_consistent_across_sources=(
+            barrow_2016_provider.DOB_KP_UNITS == barrow_2016_provider.RPL_KP_UNITS
+        ),
+        burial_reference_known=False,
+        missing_value_fraction=float(dob_z.isna().mean()),
+        coverage_fraction=coverage_fraction,
+        suspicious_spike_count=0,
+        negative_value_count=int((dob_z < 0).sum()),
+        zero_value_count=int((dob_z == 0).sum()),
+        source_uncertainty_available=True,
+        survey_epoch_known=True,
+    )
+    readiness_result = burial_readiness.assess_burial_profile_readiness(facts)
+    print(f"  Readiness: {readiness_result.status}")
+    for reason in readiness_result.reasons():
+        print(f"    - {reason}")
+    readiness_path = readiness_dir / "burial_profile_readiness.json"
+    readiness_path.parent.mkdir(parents=True, exist_ok=True)
+    readiness_path.write_text(
+        json.dumps(readiness_result.to_dict(), indent=2, default=str), encoding="utf-8"
+    )
+    print(f"  Readiness written -> {readiness_path}")
+
+    # ==========================================================================================
+    # Section 9: source-interpreted exposure evidence
+    # ==========================================================================================
+    exposure_df = burial_profile.extract_source_interpreted_exposure(profile_df)
+    print(f"Source-interpreted exposure evidence (Section 9): {len(exposure_df)} record(s)")
+
+    # ==========================================================================================
+    # Sections 12-13: target / required burial + burial margin -- none stated by this source
+    # ==========================================================================================
+    target_burial_m = None  # no source-stated target/design burial depth found in the DoB listing
+    print(
+        "Target/required burial (Sections 12-13): no source-stated reference found -- "
+        "burial_margin_m is null for every record (never invented)."
+    )
+
+    # ==========================================================================================
+    # Sections 10-11: maps
+    # ==========================================================================================
+    value_label = "Measured value, Z (m) -- burial reference unresolved"
+    profile_gdf_for_map = profile_df
+    state_map_path = burial_maps.render_observed_burial_state_map(
+        route=route,
+        profile_df=profile_gdf_for_map,
+        output_path=maps_dir / "barrow_2016_observed_burial_state.png",
+        value_label=value_label,
+    )
+    print(f"  Observed burial state map -> {state_map_path}")
+
+    gap_threshold_m = 200.0
+    coverage_gaps_m: list[tuple[float, float]] = []
+    if not profile_df.empty:
+        ordered_chainage = profile_df["chainage_m"].sort_values().to_numpy()
+        gaps = np.diff(ordered_chainage)
+        for i, gap in enumerate(gaps):
+            if gap > gap_threshold_m:
+                coverage_gaps_m.append((float(ordered_chainage[i]), float(ordered_chainage[i + 1])))
+
+    kp_profile_path = burial_maps.render_burial_kp_profile(
+        profile_df=profile_df,
+        output_path=maps_dir / "barrow_2016_burial_kp_profile.png",
+        value_label=value_label,
+        target_burial_m=target_burial_m,
+        coverage_gaps_m=coverage_gaps_m,
+    )
+    print(
+        f"  Burial KP profile -> {kp_profile_path} ({len(coverage_gaps_m)} gap(s) > "
+        f"{gap_threshold_m:.0f} m flagged)"
+    )
+
+    # ==========================================================================================
+    # Section 19: GIS
+    # ==========================================================================================
+    print("Writing GIS outputs (Section 19)...")
+    gpkg_path = burial_dir / "burial_exposure_poc.gpkg"
+    if gpkg_path.exists():
+        gpkg_path.unlink()
+    canonical_route_gdf.to_file(gpkg_path, driver="GPKG", layer="asset_route")
+
+    measurements_gdf = gpd.GeoDataFrame(
+        profile_df,
+        geometry=gpd.points_from_xy(profile_df["x_m"], profile_df["y_m"]),
+        crs=working_crs,
+    )
+    measurements_gdf.to_file(gpkg_path, driver="GPKG", layer="burial_measurements")
+
+    if not exposure_df.empty:
+        exposure_gdf = gpd.GeoDataFrame(
+            exposure_df,
+            geometry=gpd.points_from_xy(exposure_df["x_m"], exposure_df["y_m"]),
+            crs=working_crs,
+        )
+        exposure_gdf.to_file(gpkg_path, driver="GPKG", layer="source_interpreted_exposure")
+
+    if not profile_df.empty:
+        coverage_geom = shapely_substring(
+            route, float(profile_df["chainage_m"].min()), float(profile_df["chainage_m"].max())
+        )
+        coverage_gdf = gpd.GeoDataFrame(
+            [{"asset_id": _BARROW_ASSET_ID, "coverage_length_m": coverage_geom.length}],
+            geometry=[coverage_geom],
+            crs=working_crs,
+        )
+        coverage_gdf.to_file(gpkg_path, driver="GPKG", layer="survey_coverage")
+
+    qa_df = profile_df[profile_df["qa_flags"].notna()]
+    if not qa_df.empty:
+        qa_gdf = gpd.GeoDataFrame(
+            qa_df, geometry=gpd.points_from_xy(qa_df["x_m"], qa_df["y_m"]), crs=working_crs
+        )
+        qa_gdf.to_file(gpkg_path, driver="GPKG", layer="qa_flags")
+    print(f"  GIS: {gpkg_path}")
+
+    # ==========================================================================================
+    # Section 20: generic input contract
+    # ==========================================================================================
+    contract_dict = burial_contract.build_burial_exposure_input_contract()
+    contract_path = burial_dir / "burial_exposure_input_contract.json"
+    contract_path.write_text(json.dumps(contract_dict, indent=2, default=str), encoding="utf-8")
+    print(f"  Input contract -> {contract_path}")
+
+    # ==========================================================================================
+    # Sections 14-17: generic exposure-susceptibility screening contract (demonstrated
+    # generically; Section 16's real-run rule: no lowering magnitude is invented for Barrow)
+    # ==========================================================================================
+    median_measured_value = profile_stats["burial_median_m"]
+    real_screening_result = burial_exposure_screening.screen_exposure_susceptibility(
+        median_measured_value, None
+    )
+    print(
+        "Real Barrow exposure-screening result (Section 16): "
+        f"{real_screening_result['screening_state']}"
+    )
+
+    # ==========================================================================================
+    # Section 21-22: report + validation
+    # ==========================================================================================
+    print("Building the generic burial/exposure POC report (Section 21)...")
+
+    validation = _derive_burial_exposure_poc_validation_questions(
+        real_dob_dataset_ingested=len(dob_df) > 0,
+        burial_reference_resolved=(
+            burial_semantics_obj.measurement_reference_point
+            != burial_semantics.SOURCE_BURIAL_REFERENCE_UNRESOLVED
+        ),
+        authoritative_route_recovered=route.length > 0,
+        measured_burial_profile_produced=len(profile_df) > 0,
+        explicit_exposure_evidence_present=len(exposure_df) > 0,
+        generic_exposure_screening_computable=(
+            burial_exposure_screening.screen_exposure_susceptibility(
+                1.0,
+                burial_exposure_screening.SeabedLoweringInput(
+                    0.4, burial_exposure_screening.OPERATOR_DEFINED_LOWERING_SCENARIO
+                ),
+            )["screening_state"]
+            == burial_exposure_screening.POSITIVE_COVER_REMAINS_IN_SCREENING
+        ),
+    )
+
+    blocks = burial_report.build_burial_exposure_report_blocks(
+        project_title="Generic Linear-Asset Burial/Exposure State POC",
+        purpose_text=(
+            "Demonstrates the future OrbGSS workflow: operator route + measured depth of "
+            "burial + source-interpreted exposure/seabed features -> data QA/readiness -> "
+            "canonical burial profile -> current burial/exposure state -> cover-margin "
+            "screening -> map + KP view + GIS + report. Observed/measured burial state and "
+            "source-interpreted exposure evidence can be demonstrated from real source data "
+            "alone; future exposure susceptibility may only be produced when defensible "
+            "seabed-lowering input is supplied."
+        ),
+        source_survey_facts={
+            "source_page": barrow_2016_provider.MDE_SOURCE_PAGE_URL,
+            "dob_listing_package_url": barrow_2016_provider.DOB_LISTING_URL,
+            "dob_listing_bytes": dob_acquisition.package_bytes,
+            "dob_listing_sha256": dob_acquisition.package_sha256,
+            "route_position_list_package_url": barrow_2016_provider.ROUTE_POSITION_LIST_URL,
+            "route_position_list_bytes": rpl_acquisition.package_bytes,
+            "route_position_list_sha256": rpl_acquisition.package_sha256,
+            "survey_epoch": barrow_2016_provider.SURVEY_EPOCH,
+            "survey_contractor": barrow_2016_provider.SURVEY_CONTRACTOR,
+            "crs": working_crs,
+        },
+        burial_reference_semantics_facts=burial_semantics_dict,
+        data_readiness_facts=readiness_result.to_dict(),
+        route_and_coverage_facts={
+            "route_length_m": route.length,
+            "geometry_direction_semantics": geometry_direction_semantics,
+            "coverage_fraction": coverage_fraction,
+            "coverage_gap_count": len(coverage_gaps_m),
+        },
+        measured_burial_profile_facts=profile_stats,
+        source_interpreted_exposure_facts={
+            "explicit_exposure_feature_count": len(exposure_df),
+            "source_flag_column": barrow_2016_provider.DOB_STORAGE_DB_COLUMN,
+            "source_flag_value": barrow_2016_provider.SOURCE_EXPOSURE_FLAG_VALUE,
+        },
+        burial_margin_text=(
+            "No source-stated or operator-supplied target/reference burial depth was found in "
+            "the real Barrow DoB listing, so burial_margin_m is null for every record -- never "
+            "invented (Section 13)."
+        ),
+        exposure_screening_contract_facts={
+            "allowed_lowering_evidence_types": sorted(
+                burial_exposure_screening.ALLOWED_LOWERING_EVIDENCE_TYPES
+            ),
+            "screening_states": sorted(burial_exposure_screening.EXPOSURE_SCREENING_STATES),
+            "real_barrow_screening_result": real_screening_result["screening_state"],
+        },
+        future_susceptibility_text=(
+            "The acquired Barrow 2016 source package provides a single survey epoch with no "
+            "co-registered multi-epoch seabed-change product and no operator-defined lowering "
+            "scenario, so no defensible seabed-lowering input exists for this route/epoch. "
+            "Future exposure susceptibility is therefore NOT DEMONSTRATED from this single "
+            "survey -- this is an accepted, honestly-reported POC outcome (Section 16), not a "
+            "failure of the generic engine, which Section 17's synthetic tests demonstrate "
+            "works correctly once a defensible lowering input is supplied."
+        ),
+        gis_outputs=[
+            f"asset_route: {gpkg_path}",
+            f"burial_measurements: {gpkg_path}",
+            f"source_interpreted_exposure: {gpkg_path}"
+            if not exposure_df.empty
+            else "source_interpreted_exposure: absent (see explicit_exposure_feature_count)",
+            f"survey_coverage: {gpkg_path}",
+            f"qa_flags: {gpkg_path}"
+            if not qa_df.empty
+            else "qa_flags: absent (no flagged records)",
+        ],
+        production_transfer_contract_summary=[
+            f"{f['field']}: {f['description']}" for f in burial_contract.STRONGLY_PREFERRED_FIELDS
+        ],
+    )
+    report_html = burial_report.render_blocks_html(
+        blocks, title="Generic Linear-Asset Burial/Exposure State POC"
+    )
+    report_path = report_dir / "barrow_2016_burial_exposure_poc.html"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(report_html, encoding="utf-8")
+    print(f"  Report -> {report_path}")
+
+    validation_path = burial_dir / "burial_exposure_poc_validation.json"
+    validation_path.write_text(json.dumps(validation, indent=2, default=str), encoding="utf-8")
+    print(f"  Validation -> {validation_path}")
+
+    # ==========================================================================================
+    # Section 25: final report
+    # ==========================================================================================
+    print()
+    print("=== Generic Linear-Asset Burial/Exposure State POC (MAR-024) ===")
+    print()
+    print("## Source")
+    print(
+        f"  DoB Listing: {dob_acquisition.package_bytes:,} bytes, "
+        f"sha256={dob_acquisition.package_sha256}"
+    )
+    print(
+        f"  Route Position List: {rpl_acquisition.package_bytes:,} bytes, "
+        f"sha256={rpl_acquisition.package_sha256}"
+    )
+    print(f"  survey_epoch: {barrow_2016_provider.SURVEY_EPOCH}")
+    print(f"  CRS: {working_crs}")
+    print(f"  route_semantics: {geometry_direction_semantics}")
+    print(f"  burial_measurement_reference: {burial_semantics_obj.measurement_reference_point}")
+    print()
+    print("## Profile")
+    for key, value in profile_stats.items():
+        print(f"  {key}: {value}")
+    print(f"  coverage_fraction: {coverage_fraction}")
+    print(f"  coverage_gap_count (> {gap_threshold_m:.0f} m): {len(coverage_gaps_m)}")
+    print()
+    print("## Product")
+    print(f"  map: {state_map_path}")
+    print(f"  KP view: {kp_profile_path}")
+    print(f"  GIS: {gpkg_path}")
+    print(f"  report: {report_path}")
+    print(f"  input contract: {contract_path}")
+    print()
+    print(
+        "IS GENERIC OPERATOR-SUPPLIED DEPTH-OF-BURIAL -> BURIAL / EXPOSURE STATE ANALYTICS "
+        f"DEMONSTRATED? {'YES' if len(profile_df) > 0 else 'NO'}"
+    )
+    print(
+        "IS FUTURE BARROW EXPOSURE SUSCEPTIBILITY DEMONSTRATED FROM THE CURRENT REAL DATA? "
+        f"{validation['question_g_real_barrow_future_exposure_susceptibility_defensible']}"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -9676,6 +10236,26 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_scour_susceptibility_poc_parser.set_defaults(func=_cmd_build_scour_susceptibility_poc)
+
+    build_burial_exposure_poc_parser = subparsers.add_parser(
+        "build-burial-exposure-poc",
+        help=(
+            "MAR-024: generic linear-asset burial/exposure state and cover-margin screening "
+            "POC, benchmarked against the real 2016 Deep BV Barrow Offshore Wind Farm export "
+            "cable geophysical depth-of-burial survey (TCE-48) -- the first POC built around a "
+            "real measured depth-of-burial profile. Observed/measured burial state and "
+            "source-interpreted exposure evidence are kept strictly separate from future "
+            "exposure susceptibility, which is only ever produced given a defensible "
+            "seabed-lowering input. No free-span prediction, no exposure probability, no "
+            "scour-depth prediction, no risk score, no route suitability score, no ML. At "
+            "most two minimal live acquisitions (Depth of Burial Listing, Route Position List "
+            "Files) when absent from cache, then fully offline."
+        ),
+    )
+    build_burial_exposure_poc_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_burial_exposure_poc_parser.set_defaults(func=_cmd_build_burial_exposure_poc)
 
     return parser
 
