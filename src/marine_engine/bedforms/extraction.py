@@ -30,6 +30,15 @@ MIN_TRANSECT_VALID_FRACTION = 0.90
 SANDBED_SAND_WAVE_SCALE = "SANDBED_SAND_WAVE_SCALE"
 SANDBED_SMALL_BEDFORM = "SANDBED_SMALL_BEDFORM"
 
+# MAR-022A Section 8: every row this module produces is ONE profile crossing of ONE transect --
+# never an independent, uniquely-identified physical crest line, and never implied to be one by
+# its own naming. A single real 2D crest can (and typically does) generate up to 3 separate
+# `TRANSECT_DERIVED_BEDFORM_OBSERVATION` rows (one per offset transect), and a bedform count is
+# therefore an OBSERVATION count, not a unique-feature count, until true 2D crest-line
+# reconstruction exists (explicitly out of scope here).
+TRANSECT_DERIVED_BEDFORM_OBSERVATION = "TRANSECT_DERIVED_BEDFORM_OBSERVATION"
+TRANSECT_DERIVED_CREST_OBSERVATION = "TRANSECT_DERIVED_CREST_OBSERVATION"
+
 
 def sample_transect_from_array(
     elevation: np.ndarray,
@@ -165,6 +174,7 @@ def extract_tile_bedforms(
             bedform_rows.append(
                 {
                     "bedform_id": bedform_id,
+                    "record_type": TRANSECT_DERIVED_BEDFORM_OBSERVATION,
                     "transect_id": transect_id,
                     "tile_id": tile_id,
                     "epoch": epoch,
@@ -179,6 +189,7 @@ def extract_tile_bedforms(
             crest_points.append(
                 {
                     "point_id": f"{bedform_id}_crest",
+                    "record_type": TRANSECT_DERIVED_CREST_OBSERVATION,
                     "bedform_id": bedform_id,
                     "tile_id": tile_id,
                     "epoch": epoch,

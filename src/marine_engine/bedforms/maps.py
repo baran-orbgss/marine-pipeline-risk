@@ -51,6 +51,7 @@ def render_bedform_morphometry_map(
     transect_endpoints: list[tuple[tuple[float, float], tuple[float, float]]],
     output_path: Path,
     title: str,
+    unavailable_message: str | None = None,
     dpi: int = 150,
 ) -> Path:
     """A. 2020 bathymetry. B. natural-bedform context (natural-eligible
@@ -59,7 +60,10 @@ def render_bedform_morphometry_map(
     transects. `canonical_tiles_df` must provide `center_x_m`/
     `center_y_m`/`tile_size_m`/`natural_bedform_validation_status`/
     `dominant_wavelength_m`/`dominant_crest_azimuth_deg` -- may be empty
-    (a real, valid outcome when canonical support is zero)."""
+    (a real, valid outcome when canonical support is zero). MAR-022A
+    Section 15: when `canonical_tiles_df` is empty, `unavailable_message`
+    must be set and is displayed prominently -- never silently rendering
+    an empty-looking figure as if it were a normal result."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     height, width = background_elevation.shape
@@ -137,7 +141,18 @@ def render_bedform_morphometry_map(
         style="italic",
         color="0.25",
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    if unavailable_message:
+        fig.text(
+            0.5,
+            0.935,
+            unavailable_message,
+            ha="center",
+            va="top",
+            fontsize=11,
+            color="tab:red",
+            fontweight="bold",
+        )
+    fig.tight_layout(rect=(0, 0, 1, 0.90 if unavailable_message else 0.93))
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return output_path
@@ -158,6 +173,8 @@ def render_bedform_change_map(
     output_path: Path,
     title: str,
     vector_exaggeration: float = 15.0,
+    subdued: bool = False,
+    unavailable_message: str | None = None,
     dpi: int = 150,
 ) -> Path:
     """Section 20: independently-detected crest positions for both
@@ -167,7 +184,14 @@ def render_bedform_change_map(
     `vector_exaggeration`x real scale (stated explicitly in the legend --
     real crest displacements are metres against a kilometre-scale map,
     invisible at true scale) -- never implying every visible crest was
-    successfully tracked (Section 20's explicit caution)."""
+    successfully tracked (Section 20's explicit caution).
+
+    MAR-022A Section 15: `subdued=True` (for a NONCANONICAL diagnostic
+    call) renders every marker/arrow in muted gray, visually subordinate
+    to a primary canonical figure -- the caller must still give this a
+    visibly different, explicitly noncanonical `title`.
+    `unavailable_message` (for a canonical call with zero stable matches)
+    is displayed prominently instead of a silently near-empty figure."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     height, width = background_delta_bed_elevation_m.shape
@@ -204,27 +228,41 @@ def render_bedform_change_map(
     cbar = fig.colorbar(im, ax=ax, shrink=0.7)
     cbar.set_label("MAR-021 DoD (m) -- subdued context only", fontsize=8)
 
+    epoch1_color = "0.6" if subdued else "tab:blue"
+    epoch2_color = "0.5" if subdued else "tab:orange"
+    arrow_color = "0.65" if subdued else "black"
+    arrow_alpha = 0.5 if subdued else 1.0
+
     if crests_epoch1_xy:
         xs, ys = zip(*crests_epoch1_xy, strict=True)
         ax.scatter(
-            xs, ys, s=22, color="tab:blue", marker="o", label=f"{epoch1_label} crest", zorder=4
+            xs, ys, s=22, color=epoch1_color, marker="o", label=f"{epoch1_label} crest", zorder=4
         )
     if crests_epoch2_xy:
         xs, ys = zip(*crests_epoch2_xy, strict=True)
         ax.scatter(
-            xs, ys, s=22, color="tab:orange", marker="^", label=f"{epoch2_label} crest", zorder=4
+            xs, ys, s=22, color=epoch2_color, marker="^", label=f"{epoch2_label} crest", zorder=4
         )
 
     for pair in matched_pairs:
         x1, y1 = pair["epoch1_x_m"], pair["epoch1_y_m"]
         dx = (pair["epoch2_x_m"] - x1) * vector_exaggeration
         dy = (pair["epoch2_y_m"] - y1) * vector_exaggeration
-        color = "black" if pair["match_status"] == "MATCHED_HIGH_SUPPORT" else "0.4"
+        color = (
+            arrow_color
+            if subdued
+            else ("black" if pair["match_status"] == "MATCHED_HIGH_SUPPORT" else "0.4")
+        )
         ax.annotate(
             "",
             xy=(x1 + dx, y1 + dy),
             xytext=(x1, y1),
-            arrowprops={"arrowstyle": "-|>", "color": color, "linewidth": 1.6},
+            arrowprops={
+                "arrowstyle": "-|>",
+                "color": color,
+                "linewidth": 1.6,
+                "alpha": arrow_alpha,
+            },
             zorder=6,
         )
 
@@ -233,6 +271,20 @@ def render_bedform_change_map(
     handles, labels = ax.get_legend_handles_labels()
     by_label = dict(zip(labels, handles, strict=False))
     ax.legend(by_label.values(), by_label.keys(), loc="lower right", fontsize=8)
+
+    if unavailable_message:
+        fig.text(
+            0.5,
+            0.5,
+            unavailable_message,
+            ha="center",
+            va="center",
+            fontsize=13,
+            color="tab:red",
+            fontweight="bold",
+            transform=fig.transFigure,
+            wrap=True,
+        )
 
     fig.suptitle(title, fontsize=15, fontweight="bold", y=0.995)
     fig.text(

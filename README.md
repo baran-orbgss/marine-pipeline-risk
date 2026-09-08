@@ -1875,4 +1875,83 @@ otherwise, never an interactive credential prompt.
   25 new tests (`test_bedform_morphodynamics_poc.py`) cover the required
   list; the full offline suite (1170 tests, 25 live/network tests
   correctly deselected) and repo-wide `ruff format`/`ruff check` pass
-  clean. No further ticket has started.
+  clean.
+
+- `MAR-022A`: a scientific-integrity correction to MAR-022's canonical
+  natural-bedform selection -- MAR-022's own real result (48 qualifying
+  2000 m tiles, but the tile-ranking metric never natural-context-gated,
+  so its top-5 fallback landed on 5 anthropogenically disturbed tiles
+  every time) was provisionally accepted but explicitly NOT accepted as a
+  canonical natural-bedform validation or a defensible displacement
+  claim. The canonical selection hierarchy is now strict and ordered:
+  assess `NATURAL_SEABED_ELIGIBLE` vs `ANTHROPOGENIC_DISTURBANCE_PRESENT`
+  vs `INFRASTRUCTURE_CONTEXT_INSUFFICIENT` for EVERY qualifying support
+  tile BEFORE any spectral ranking (never after), try 2000 m first, only
+  fall through to 1000 m if 2000 m yields zero natural+spectrally-
+  eligible tiles, and select via `select_spatially_independent_eligible_
+  tiles` only -- the non-independent `rank_and_select_top_tiles` fallback
+  is now reserved exclusively for the explicitly-noncanonical diagnostic
+  path. A new `canonical_band_dominant_wavelength_m` diagnostic
+  (`sandwave_morphometry.analyze_tile_dual_band`, a pure additive extension of
+  the MAR-017 engine -- `max_wavelength_m` defaults to `None`, preserving
+  every existing caller's behaviour exactly, covered by 4 new engine-level
+  regression tests) restricts the existing tile-level 2D spectral
+  diagnostic to `30 m <= wavelength <= tile_size_m/3`, directly enforcing
+  the already-accepted >=3-wavelengths-across-tile rule rather than
+  trusting the unbounded-above "global" peak, which a real run confirmed
+  DOES repeatedly lock onto the tile size itself. On the real data: the
+  2000 m pass still found 0 natural-eligible tiles (0/48 -- Sheringham's
+  real anthropogenic infrastructure turned out to be distributed widely
+  enough that no full 2000 m canonical square avoided it), but the 1000 m
+  pass found 37 natural-eligible AND canonical-band-spectrally-eligible
+  tiles out of 277 real qualifying candidates, from which 5 genuinely
+  spatially-independent tiles were selected -- a real, positive canonical
+  result MAR-022 itself never actually tested. Multi-epoch crest matching
+  now runs three independently-parameterised, pre-registered tolerance
+  sets (`CONSERVATIVE`/`NOMINAL`/`PERMISSIVE` -- search radius,
+  along-crest offset, orientation and wavelength-ratio tolerance,
+  ambiguity margin, all bundled in one `MatchingTolerances` dataclass so
+  no single value can be varied in isolation) and labels every NOMINAL
+  canonical match `STABLE_ACROSS_TESTED_TOLERANCES` / `TOLERANCE_
+  SENSITIVE` / `AMBIGUOUS` depending on whether the SAME counterpart also
+  resolves under both alternate tolerance sets -- of 63 real nominal
+  canonical matches, 45 proved stable, and ONLY those 45 feed the primary
+  observed-displacement statistics (median absolute displacement 4.0 m,
+  p95 17.4 m, max 29.0 m -- materially smaller and more defensible than
+  MAR-022's own disqualified 6.0/31.0/54.0 m). Outputs are now split
+  unambiguously: `canonical_natural_tile_spectral_morphometry_2018/2020.
+  parquet` and `canonical_natural_bedform_observations_2018/2020.parquet`
+  may only originate from tiles passing every canonical gate; MAR-022's
+  original disturbed-tile finding is preserved, never deleted, as
+  `noncanonical_disturbed_tile_diagnostics.parquet` (325 rows spanning
+  both support scales) plus separate noncanonical bedform/matching
+  parquet files and two visually-subordinate, explicitly-`NONCANONICAL`-
+  titled diagnostic figures. Every individual bedform/crest record is now
+  labelled `TRANSECT_DERIVED_BEDFORM_OBSERVATION`/`TRANSECT_DERIVED_
+  CREST_OBSERVATION` -- an observation count, never implied to be a count
+  of unique physical crest lines. The source-interpretation comparator now
+  reports median/p95 nearest distance and the fraction of canonical
+  detections within 25/50/100 m rather than a single bare distance
+  number, and the real result (median 714.7 m, 14.5% within 100 m)
+  correctly earns `POOR_SPATIAL_CORRESPONDENCE_WITH_SOURCE_INTERPRETATION`
+  -- reported as the real, valid negative result it is, never described
+  as agreement. Validation question causality is now enforced structurally
+  (`_derive_bedform_validation_questions`, a pure function so it is
+  directly unit-testable): E (defensible displacement) can be YES only if
+  A, C, and D are ALL YES and >=1 stable match exists, F can be YES only
+  if E is YES, both asserted, never merely hoped for. A real bug was found
+  and fixed from actually running the CLI: canonical tiles' transect
+  orientation was initially still driven by each epoch's GLOBAL (potentially
+  tile-scale-locked) spectral diagnostic rather than its own independent
+  canonical-band-restricted one, silently undermining the very fix this
+  ticket exists to make -- corrected so every canonical tile's transects
+  use its own per-epoch band-restricted crest azimuth, diagnostic/legacy
+  tiles unchanged. 17 new tests (13 in `test_bedform_morphodynamics_poc.py`
+  covering Section 16's required list A-L, plus 4 new
+  `test_sandwave_morphometry.py` engine-level regression tests) cover the
+  required list; the full offline suite (1187 tests, 25
+  live/network tests correctly deselected) and repo-wide `ruff format`/
+  `ruff check` pass clean. Final real answers: `IS CANONICAL NATURAL
+  SANDBED MORPHOMETRY DEMONSTRATED ON REAL PROJECT-GRADE MBES?` YES;
+  `IS DEFENSIBLE OBSERVED 2018-2020 CREST DISPLACEMENT DEMONSTRATED?` YES.
+  No further ticket has started.

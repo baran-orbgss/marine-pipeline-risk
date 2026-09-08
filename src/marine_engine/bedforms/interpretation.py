@@ -232,3 +232,67 @@ def compare_detected_crests_to_interpretation(
         )
 
     return SOURCE_BEDFORM_COMPARATOR_AVAILABLE, pd.DataFrame(rows)
+
+
+POOR_SPATIAL_CORRESPONDENCE_WITH_SOURCE_INTERPRETATION = (
+    "POOR_SPATIAL_CORRESPONDENCE_WITH_SOURCE_INTERPRETATION"
+)
+# A real, defensible negative result (Section 12) -- set BEFORE looking at this project's own
+# real comparator numbers, never tuned after the fact to avoid the label.
+_POOR_CORRESPONDENCE_FRACTION_WITHIN_100M_THRESHOLD = 0.5
+PROXIMAL_ORIENTATION_COMPARISON_THRESHOLD_M = 100.0
+
+
+def summarize_comparator_results(
+    result_df: pd.DataFrame,
+    *,
+    proximal_threshold_m: float = PROXIMAL_ORIENTATION_COMPARISON_THRESHOLD_M,
+) -> dict[str, Any]:
+    """MAR-022A Section 12: median/p95 nearest distance, fraction within
+    25/50/100 m, and an orientation-difference summary restricted to
+    'spatially proximal' rows only (`nearest_distance_m <=
+    proximal_threshold_m`) -- comparing orientation for a detection
+    ~500 m from the nearest mapped interpretation feature would not be a
+    meaningful agreement/disagreement statement either way. NEVER
+    describes a large median distance as agreement; flags
+    `POOR_SPATIAL_CORRESPONDENCE_WITH_SOURCE_INTERPRETATION` (a real,
+    valid negative result) when fewer than half of detections fall
+    within 100 m of the nearest mapped feature."""
+
+    if result_df.empty:
+        return {
+            "compared_count": 0,
+            "median_nearest_distance_m": None,
+            "p95_nearest_distance_m": None,
+            "fraction_within_25m": None,
+            "fraction_within_50m": None,
+            "fraction_within_100m": None,
+            "proximal_comparison_count": 0,
+            "median_orientation_difference_deg_proximal_only": None,
+            "correspondence_status": POOR_SPATIAL_CORRESPONDENCE_WITH_SOURCE_INTERPRETATION,
+        }
+
+    distances = result_df["nearest_distance_m"]
+    fraction_within_100m = float((distances <= 100.0).mean())
+    proximal = result_df[result_df["nearest_distance_m"] <= proximal_threshold_m]
+    proximal_orientation = proximal["orientation_difference_deg"].dropna()
+
+    correspondence_status = (
+        POOR_SPATIAL_CORRESPONDENCE_WITH_SOURCE_INTERPRETATION
+        if fraction_within_100m < _POOR_CORRESPONDENCE_FRACTION_WITHIN_100M_THRESHOLD
+        else None
+    )
+
+    return {
+        "compared_count": int(len(result_df)),
+        "median_nearest_distance_m": float(distances.median()),
+        "p95_nearest_distance_m": float(distances.quantile(0.95)),
+        "fraction_within_25m": float((distances <= 25.0).mean()),
+        "fraction_within_50m": float((distances <= 50.0).mean()),
+        "fraction_within_100m": fraction_within_100m,
+        "proximal_comparison_count": int(len(proximal)),
+        "median_orientation_difference_deg_proximal_only": (
+            float(proximal_orientation.median()) if len(proximal_orientation) else None
+        ),
+        "correspondence_status": correspondence_status,
+    }

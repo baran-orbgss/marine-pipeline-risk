@@ -462,6 +462,71 @@ def test_mar017b_G_the_30m_wavelength_gate_remains_active_for_a_second_analog():
     assert rejected_count == 2
 
 
+# --- MAR-022A Section 5: band-restricted spectral diagnostics ------------------------------
+
+
+def test_mar022a_A_max_wavelength_none_preserves_original_behaviour_exactly():
+    tile = _make_sinusoidal_tile(1000, wavelength_m=150.0, amplitude_m=2.0, azimuth_deg=30.0)
+    valid = np.ones_like(tile, dtype=bool)
+    residual, _trend, _coeffs = swm.remove_planar_trend(tile, valid, PIXEL_SIZE_M)
+    windowed = swm.apply_hann_window_2d(residual)
+    power, freq_x, freq_y = swm.compute_2d_power_spectrum(windowed, PIXEL_SIZE_M)
+
+    baseline = swm.compute_spectral_diagnostics(power, freq_x, freq_y, 30.0)
+    explicit_none = swm.compute_spectral_diagnostics(
+        power, freq_x, freq_y, 30.0, max_wavelength_m=None
+    )
+    assert baseline == explicit_none
+
+
+def test_mar022a_B_band_restriction_finds_the_true_peak_under_a_dominant_long_wavelength_trend():
+    """A synthetic tile with a WEAK ~150 m sand wave riding on top of a
+    much STRONGER ~1900 m (near-tile-scale) undulation the linear
+    detrend cannot remove -- the global (unbounded-above) diagnostic
+    must lock onto the long-wavelength artefact, while the canonical-
+    band-restricted diagnostic (30-667 m, i.e. tile_size/3 for a 2000 m
+    tile) must recover the real ~150 m sand wave instead."""
+
+    size_px = 2000
+    y, x = np.indices((size_px, size_px)).astype(np.float64) * PIXEL_SIZE_M
+    long_wavelength_m = 1900.0
+    sand_wave = 1.0 * np.sin(2 * np.pi * x / 150.0)
+    long_trend = 20.0 * np.sin(2 * np.pi * x / long_wavelength_m)
+    tile = sand_wave + long_trend
+    valid = np.ones_like(tile, dtype=bool)
+
+    global_diag, band_diag = swm.analyze_tile_dual_band(
+        tile, valid, PIXEL_SIZE_M, max_wavelength_m=2000.0 / 3.0
+    )
+    assert global_diag is not None
+    assert band_diag is not None
+    assert global_diag["dominant_wavelength_m"] > 667.0
+    assert abs(band_diag["dominant_wavelength_m"] - 150.0) < 20.0
+
+
+def test_mar022a_C_empty_band_returns_none_never_the_global_peak():
+    tile = _make_sinusoidal_tile(1000, wavelength_m=800.0, amplitude_m=2.0, azimuth_deg=0.0)
+    valid = np.ones_like(tile, dtype=bool)
+    # A band with max_wavelength_m below cutoff_wavelength_m is deliberately empty.
+    global_diag, band_diag = swm.analyze_tile_dual_band(
+        tile, valid, PIXEL_SIZE_M, max_wavelength_m=10.0
+    )
+    assert global_diag is not None
+    assert band_diag is None
+
+
+def test_mar022a_D_dual_band_matches_two_separate_calls():
+    tile = _make_sinusoidal_tile(600, wavelength_m=90.0, amplitude_m=1.2, azimuth_deg=15.0)
+    valid = np.ones_like(tile, dtype=bool)
+    global_diag, band_diag = swm.analyze_tile_dual_band(
+        tile, valid, PIXEL_SIZE_M, max_wavelength_m=200.0
+    )
+    separate_global = swm.analyze_tile(tile, valid, PIXEL_SIZE_M)
+    separate_band = swm.analyze_tile(tile, valid, PIXEL_SIZE_M, max_wavelength_m=200.0)
+    assert global_diag == separate_global
+    assert band_diag == separate_band
+
+
 # --- Shared: no forbidden downstream-modelling terms in this module's own vocabulary -------
 
 

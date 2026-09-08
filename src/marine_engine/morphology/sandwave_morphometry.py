@@ -171,19 +171,35 @@ def compute_spectral_diagnostics(
     freq_y: np.ndarray,
     cutoff_wavelength_m: float = CANONICAL_SHORT_WAVELENGTH_CUTOFF_M,
     band_half_width_octaves: float = 0.5,
+    max_wavelength_m: float | None = None,
 ) -> dict[str, Any] | None:
     """Section 12's descriptive spectral diagnostics -- never a fixed
     "sand wave present = true" threshold. Excludes the zero-frequency
     component and every wavelength shorter than `cutoff_wavelength_m`.
     Azimuth convention throughout: degrees clockwise from north (0-360
     for the wavevector, 0-180 for the (undirected) crest orientation --
-    the crest is always perpendicular to the wavevector, Section 12)."""
+    the crest is always perpendicular to the wavevector, Section 12).
+
+    `max_wavelength_m` (MAR-022A Section 5) optionally ALSO excludes
+    every wavelength longer than this -- an additive, backward-compatible
+    upper bound (default `None` preserves the original unbounded-above
+    behaviour exactly). This directly operationalizes an existing rule
+    rather than adding a new one: a canonical tile must fit >=3
+    wavelengths across it (Section 3's `meets_wavelengths_across_tile`,
+    `tile_size_m / wavelength_m >= 3`), i.e. `wavelength_m <= tile_size_m
+    / 3` -- passing that value here means the reported dominant peak is
+    NEVER a tile-scale artefact a caller would then have to separately
+    reject. Returns `None` when nothing survives inside the (possibly
+    two-sided) band -- a real, valid result, never a fallback to the
+    unbounded peak."""
 
     fx, fy = np.meshgrid(freq_x, freq_y)
     freq_mag = np.sqrt(fx**2 + fy**2)
     with np.errstate(divide="ignore", invalid="ignore"):
         wavelength = np.where(freq_mag > 0, 1.0 / freq_mag, np.inf)
     band_mask = (freq_mag > 0) & (wavelength >= cutoff_wavelength_m)
+    if max_wavelength_m is not None:
+        band_mask = band_mask & (wavelength <= max_wavelength_m)
     if not band_mask.any():
         return None
 
@@ -242,9 +258,13 @@ def analyze_tile(
     pixel_size_m: float,
     *,
     cutoff_wavelength_m: float = CANONICAL_SHORT_WAVELENGTH_CUTOFF_M,
+    max_wavelength_m: float | None = None,
 ) -> dict[str, Any] | None:
     """Section 9-12 end-to-end for one tile: detrend -> gap-fill (small
-    gaps only) -> Hann window -> 2D FFT -> descriptive diagnostics."""
+    gaps only) -> Hann window -> 2D FFT -> descriptive diagnostics.
+    `max_wavelength_m` (MAR-022A) is passed straight through to
+    `compute_spectral_diagnostics` -- see its docstring; default `None`
+    preserves the original unbounded-above behaviour exactly."""
 
     if valid.mean() <= 0:
         return None
@@ -252,7 +272,47 @@ def analyze_tile(
     residual_filled = fill_small_gaps(residual, valid)
     windowed = apply_hann_window_2d(residual_filled)
     power, freq_x, freq_y = compute_2d_power_spectrum(windowed, pixel_size_m)
-    return compute_spectral_diagnostics(power, freq_x, freq_y, cutoff_wavelength_m)
+    return compute_spectral_diagnostics(
+        power, freq_x, freq_y, cutoff_wavelength_m, max_wavelength_m=max_wavelength_m
+    )
+
+
+def analyze_tile_dual_band(
+    elevation: np.ndarray,
+    valid: np.ndarray,
+    pixel_size_m: float,
+    *,
+    cutoff_wavelength_m: float = CANONICAL_SHORT_WAVELENGTH_CUTOFF_M,
+    max_wavelength_m: float,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """MAR-022A Section 5: computes the detrend/gap-fill/window/FFT
+    pipeline ONCE and derives BOTH diagnostics from the SAME power
+    spectrum -- never a second, redundant FFT. Returns
+    `(global_diagnostics, canonical_band_diagnostics)`:
+
+    - `global_diagnostics`: the ORIGINAL unbounded-above (only
+      `cutoff_wavelength_m` applied) diagnostic -- QA/context only. A
+      real 2000 m tile can legitimately have its strongest non-DC peak
+      sitting at or near the tile's own size (residual long-wavelength
+      content a first-order planar detrend cannot fully remove), which
+      is real information but NEVER a canonical sand-wave wavelength.
+    - `canonical_band_diagnostics`: the SAME computation restricted to
+      `cutoff_wavelength_m <= wavelength_m <= max_wavelength_m` -- the
+      only one of the two ever usable for canonical tile eligibility.
+      `None` when no real spectral peak exists inside that band; callers
+      must never substitute `global_diagnostics` in that case."""
+
+    if valid.mean() <= 0:
+        return None, None
+    residual, _trend, _coeffs = remove_planar_trend(elevation, valid, pixel_size_m)
+    residual_filled = fill_small_gaps(residual, valid)
+    windowed = apply_hann_window_2d(residual_filled)
+    power, freq_x, freq_y = compute_2d_power_spectrum(windowed, pixel_size_m)
+    global_diagnostics = compute_spectral_diagnostics(power, freq_x, freq_y, cutoff_wavelength_m)
+    band_diagnostics = compute_spectral_diagnostics(
+        power, freq_x, freq_y, cutoff_wavelength_m, max_wavelength_m=max_wavelength_m
+    )
+    return global_diagnostics, band_diagnostics
 
 
 # --- Section 11: tile design (fixed physical size, cascading down when the real data ------

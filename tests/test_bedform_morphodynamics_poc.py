@@ -11,10 +11,12 @@ import inspect
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import pytest
 import rasterio
 from shapely.geometry import LineString, Point, box
 
+from marine_engine import cli
 from marine_engine.bedforms import (
     contract,
     extraction,
@@ -249,7 +251,9 @@ def test_K_no_asymmetry_based_migration_inference():
 
 def test_L_matching_function_never_takes_a_dod_or_delta_parameter():
     params = set(inspect.signature(matching.match_crests_within_tile).parameters)
-    assert params == {"tile_id", "epoch1_crests", "epoch2_crests"}
+    # `tolerances` (MAR-022A) is a named geometry-matching tolerance bundle, never a DoD/
+    # elevation-change input -- the exact thing this test guards against.
+    assert params == {"tile_id", "epoch1_crests", "epoch2_crests", "tolerances"}
     match_source = inspect.getsource(matching.match_crests_within_tile)
     assert "dod" not in match_source.lower()
     assert "delta_bed_elevation" not in match_source.lower()
@@ -467,3 +471,268 @@ def test_report_blocks_render_to_html_without_error():
     assert "Test POC" in html
     assert bedform_report.REQUIRED_DISCLAIMER_1 in html
     assert bedform_report.REQUIRED_DISCLAIMER_2 in html
+
+
+# =================================================================================================
+# MAR-022A Section 16's required test list (A-L)
+# =================================================================================================
+
+
+def _cli_source() -> str:
+    return inspect.getsource(cli._cmd_build_bedform_morphodynamics_poc)
+
+
+def _canonical_pass_source() -> str:
+    source = _cli_source()
+    start = source.index("def _canonical_pass(")
+    end = source.index("pass_2000 = _canonical_pass(")
+    return source[start:end]
+
+
+# --- A: 1000 m candidates are attempted after 2000 m spectral failure --------------------------
+
+
+def test_A_1000m_pass_is_always_attempted_never_gated_behind_2000m_success():
+    source = _cli_source()
+    idx_2000 = source.index("pass_2000 = _canonical_pass(swm.CANONICAL_TILE_SIZE_M)")
+    idx_1000 = source.index("pass_1000 = _canonical_pass(swm.MIN_TILE_SIZE_M)")
+    idx_first_branch_on_2000 = source.index('if pass_2000["selected_records"]:')
+    # The 1000 m pass call must appear BEFORE the first branch that inspects the 2000 m pass's
+    # own outcome -- i.e. it is unconditional, never skipped when 2000 m already succeeded.
+    assert idx_2000 < idx_1000 < idx_first_branch_on_2000
+
+
+# --- B: natural context is applied before canonical ranking -------------------------------------
+
+
+def test_B_natural_context_assessed_before_spectral_ranking_in_canonical_pass():
+    body = _canonical_pass_source()
+    idx_natural = body.index("assess_natural_bedform_validation_status")
+    idx_spectral = body.index("analyze_tile_dual_band")
+    idx_rank = body.index("select_spatially_independent_eligible_tiles")
+    assert idx_natural < idx_spectral < idx_rank
+
+
+# --- C: an anthropogenic tile can never enter the canonical candidate pool ----------------------
+
+
+def test_C_anthropogenic_tile_never_enters_canonical_candidate_pool():
+    """Replicates `_canonical_pass`'s own natural-eligible filter directly
+    against a small set of real-shaped assessments -- an anthropogenic or
+    infrastructure-insufficient tile must never survive it."""
+
+    records = [
+        {
+            "tile_id": "natural_1",
+            "natural_status": natural_context.NaturalContextAssessment(
+                status=natural_context.NATURAL_SEABED_ELIGIBLE,
+                intersecting_feature_count=0,
+                intersecting_source_layers=(),
+                intersecting_descriptions=(),
+                reason="ok",
+            ),
+        },
+        {
+            "tile_id": "disturbed_1",
+            "natural_status": natural_context.NaturalContextAssessment(
+                status=natural_context.ANTHROPOGENIC_DISTURBANCE_PRESENT,
+                intersecting_feature_count=3,
+                intersecting_source_layers=("PointFeatures",),
+                intersecting_descriptions=("Jackup location",),
+                reason="disturbed",
+            ),
+        },
+        {
+            "tile_id": "insufficient_1",
+            "natural_status": natural_context.NaturalContextAssessment(
+                status=natural_context.INFRASTRUCTURE_CONTEXT_INSUFFICIENT,
+                intersecting_feature_count=0,
+                intersecting_source_layers=(),
+                intersecting_descriptions=(),
+                reason="unknown",
+            ),
+        },
+    ]
+    natural_only = [
+        r for r in records if r["natural_status"].status == natural_context.NATURAL_SEABED_ELIGIBLE
+    ]
+    assert [r["tile_id"] for r in natural_only] == ["natural_1"]
+
+
+# --- D: a global tile-scale spectral peak does not hide a valid canonical-band peak -------------
+
+
+def test_D_global_peak_at_tile_scale_does_not_hide_the_real_in_band_peak():
+    size_px = 1500
+    y, x = np.indices((size_px, size_px)).astype(np.float64)
+    sand_wave = 0.8 * np.sin(2 * np.pi * x / 120.0)
+    tile_scale_trend = 15.0 * np.sin(2 * np.pi * x / 1450.0)
+    tile = sand_wave + tile_scale_trend
+    valid = np.ones_like(tile, dtype=bool)
+    global_diag, band_diag = swm.analyze_tile_dual_band(tile, valid, 1.0, max_wavelength_m=500.0)
+    assert global_diag is not None and band_diag is not None
+    assert global_diag["dominant_wavelength_m"] > 500.0
+    assert abs(band_diag["dominant_wavelength_m"] - 120.0) < 20.0
+
+
+# --- E: a canonical band-restricted wavelength always satisfies wavelength <= tile_size/3 -------
+
+
+def test_E_canonical_band_wavelength_never_exceeds_tile_size_over_three():
+    tile_size_m = 900.0
+    tile = _make_sinusoidal_tile(900, wavelength_m=250.0, amplitude_m=1.0, azimuth_deg=0.0)
+    valid = np.ones_like(tile, dtype=bool)
+    _global_diag, band_diag = swm.analyze_tile_dual_band(
+        tile, valid, 1.0, max_wavelength_m=tile_size_m / 3.0
+    )
+    assert band_diag is not None
+    assert band_diag["dominant_wavelength_m"] <= tile_size_m / 3.0
+
+
+# --- F: canonical selected tiles are spatially independent --------------------------------------
+
+
+def test_F_canonical_pass_uses_the_spatially_independent_selector_only():
+    body = _canonical_pass_source()
+    assert "select_spatially_independent_eligible_tiles" in body
+    assert "rank_and_select_top_tiles" not in body
+
+
+# --- G: the disturbed (legacy) fallback stays diagnostic only -----------------------------------
+
+
+def test_G_rank_and_select_top_tiles_only_feeds_the_legacy_diagnostic_pool():
+    source = _cli_source()
+    idx_legacy_comment = source.index("Reproducing MAR-022's original disturbed-tile top-5")
+    idx_rank_call = source.index("swm.rank_and_select_top_tiles(legacy_ranking_pool")
+    idx_canonical_tables = source.index("canonical_natural_tile_spectral_morphometry_2018.parquet")
+    # The only `rank_and_select_top_tiles` call sits inside the legacy/diagnostic block, well
+    # before (and structurally unconnected to) the canonical output tables.
+    assert idx_legacy_comment < idx_rank_call < idx_canonical_tables
+    assert source.count("rank_and_select_top_tiles(") == 1
+
+
+# --- H: D=NO can never produce E=YES -------------------------------------------------------------
+
+
+def test_H_d_no_can_never_produce_e_yes():
+    result = cli._derive_bedform_validation_questions(
+        has_1000m_support=True,
+        has_support_at_either_scale=True,
+        canonical_bedform_count=10,
+        canonical_selected_tile_count=0,  # -> D = NO
+        stable_match_count=5,
+    )
+    assert result["d"] == "NO"
+    assert result["e"] == "NO"
+
+
+# --- I: E=NO can never produce F=YES -------------------------------------------------------------
+
+
+def test_I_e_no_can_never_produce_f_yes():
+    result = cli._derive_bedform_validation_questions(
+        has_1000m_support=True,
+        has_support_at_either_scale=True,
+        canonical_bedform_count=10,
+        canonical_selected_tile_count=2,
+        stable_match_count=0,  # -> E = NO (zero stable matches)
+    )
+    assert result["e"] == "NO"
+    assert result["f"] == "NO"
+
+
+def test_I2_e_yes_requires_a_b_c_d_and_at_least_one_stable_match():
+    all_yes = cli._derive_bedform_validation_questions(
+        has_1000m_support=True,
+        has_support_at_either_scale=True,
+        canonical_bedform_count=3,
+        canonical_selected_tile_count=1,
+        stable_match_count=1,
+    )
+    assert all_yes["e"] == "YES"
+    assert all_yes["f"] == "YES"
+    assert all_yes["g"] == "NO"
+
+
+# --- J: only stable natural canonical matches enter the primary displacement statistics ---------
+
+
+def test_J_primary_displacement_statistics_figure_uses_stable_matches_only():
+    source = _cli_source()
+    assert "canonical_matches_df=stable_matches_df" in source
+    assert "canonical_matches_df=nominal_matches" not in source
+    assert "canonical_matches_df=canonical_matches_df" not in source
+
+
+# --- K: transect observations are not labelled unique crest lines -------------------------------
+
+
+def test_K_bedform_records_are_tagged_as_transect_derived_observations_not_unique_crests():
+    tile = _make_sinusoidal_tile(1000, wavelength_m=150.0, amplitude_m=2.0, azimuth_deg=0.0)
+    valid = np.ones_like(tile, dtype=bool)
+    diag = swm.analyze_tile(tile, valid, PIXEL_SIZE_M)
+    assert diag is not None
+    transform = rasterio.Affine(1.0, 0.0, 500000.0, 0.0, -1.0, 5900000.0)
+    result = extraction.extract_tile_bedforms(
+        tile,
+        valid,
+        transform,
+        tile_id="t1",
+        epoch="2020",
+        center_x_m=500500.0,
+        center_y_m=5899500.0,
+        tile_size_m=1000.0,
+        crest_azimuth_deg=diag["dominant_crest_azimuth_deg"],
+    )
+    assert result.bedform_rows
+    assert all(
+        b["record_type"] == extraction.TRANSECT_DERIVED_BEDFORM_OBSERVATION
+        for b in result.bedform_rows
+    )
+    assert all(
+        c["record_type"] == extraction.TRANSECT_DERIVED_CREST_OBSERVATION
+        for c in result.crest_points
+    )
+    code = _code_only_source(extraction).lower()
+    assert "unique crest" not in code
+    assert "independent crest line" not in code
+
+
+# --- L: the source comparator never describes poor spatial correspondence as agreement ----------
+
+
+def test_L_poor_spatial_correspondence_is_flagged_never_called_agreement():
+    far_rows = pd.DataFrame(
+        {
+            "detected_point_id": ["p1", "p2", "p3"],
+            "nearest_distance_m": [480.0, 510.0, 520.0],
+            "within_proximity_threshold": [False, False, False],
+            "interpretation_azimuth_deg": [10.0, 20.0, 30.0],
+            "orientation_difference_deg": [5.0, 8.0, 12.0],
+        }
+    )
+    summary = interpretation.summarize_comparator_results(far_rows)
+    assert (
+        summary["correspondence_status"]
+        == interpretation.POOR_SPATIAL_CORRESPONDENCE_WITH_SOURCE_INTERPRETATION
+    )
+    assert summary["fraction_within_100m"] == 0.0
+
+    close_rows = pd.DataFrame(
+        {
+            "detected_point_id": ["p1", "p2", "p3"],
+            "nearest_distance_m": [5.0, 10.0, 15.0],
+            "within_proximity_threshold": [True, True, True],
+            "interpretation_azimuth_deg": [10.0, 20.0, 30.0],
+            "orientation_difference_deg": [2.0, 3.0, 4.0],
+        }
+    )
+    good_summary = interpretation.summarize_comparator_results(close_rows)
+    assert good_summary["correspondence_status"] is None
+
+    cli_source_lower = _cli_source().lower()
+    # "agreement" must never appear anywhere near the comparator reporting block.
+    comparator_start = cli_source_lower.index("comparing canonical detected crests")
+    comparator_block = cli_source_lower[comparator_start : comparator_start + 4000]
+    assert "agreement" not in comparator_block

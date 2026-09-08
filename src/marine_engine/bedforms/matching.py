@@ -51,19 +51,93 @@ APPARENT_RATE_DISCLAIMER = (
     "a future migration rate, NOT a Knaapen predictor output, and NOT a long-term trend."
 )
 
+
+@dataclass(frozen=True)
+class MatchingTolerances:
+    """MAR-022A Section 10: every matching tolerance, named and bundled --
+    never a bare module-level constant a caller could silently vary one
+    of without the others. `NOMINAL_TOLERANCES` carries the exact values
+    this module used before MAR-022A (a pure backward-compatible
+    refactor); `CONSERVATIVE_TOLERANCES`/`PERMISSIVE_TOLERANCES` are
+    transparent, symmetric-ish widenings/narrowings around it -- picked
+    BEFORE any real matching run and never adjusted afterward to change
+    which crests end up 'stable' (Section 10: 'Do NOT optimize these
+    settings against the answer')."""
+
+    name: str
+    max_search_radius_m: float
+    max_along_crest_offset_m: float
+    orientation_tolerance_deg: float
+    wavelength_ratio_tolerance: tuple[float, float]
+    ambiguity_margin_m: float
+    high_support_orientation_deg: float
+    high_support_wavelength_ratio: tuple[float, float]
+    high_support_distance_fraction: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "max_search_radius_m": self.max_search_radius_m,
+            "max_along_crest_offset_m": self.max_along_crest_offset_m,
+            "orientation_tolerance_deg": self.orientation_tolerance_deg,
+            "wavelength_ratio_tolerance": list(self.wavelength_ratio_tolerance),
+            "ambiguity_margin_m": self.ambiguity_margin_m,
+            "high_support_orientation_deg": self.high_support_orientation_deg,
+            "high_support_wavelength_ratio": list(self.high_support_wavelength_ratio),
+            "high_support_distance_fraction": self.high_support_distance_fraction,
+        }
+
+
 # Named, documented tolerances -- never magic numbers scattered through the matching logic.
 # Deliberately generous relative to the ~10 m/2-year historical context noted for this site
 # (Section 17) -- that number is external historical context only and must never be used to
 # calibrate these tolerances; they are set wide enough to admit a real match without presupposing
 # any particular migration rate.
-MAX_SEARCH_RADIUS_M = 60.0
-MAX_ALONG_CREST_OFFSET_M = 60.0
-ORIENTATION_TOLERANCE_DEG = 30.0
-WAVELENGTH_RATIO_TOLERANCE = (0.5, 2.0)
-AMBIGUITY_MARGIN_M = 5.0
-HIGH_SUPPORT_ORIENTATION_DEG = 10.0
-HIGH_SUPPORT_WAVELENGTH_RATIO = (0.8, 1.25)
-HIGH_SUPPORT_DISTANCE_FRACTION = 0.5
+NOMINAL_TOLERANCES = MatchingTolerances(
+    name="NOMINAL",
+    max_search_radius_m=60.0,
+    max_along_crest_offset_m=60.0,
+    orientation_tolerance_deg=30.0,
+    wavelength_ratio_tolerance=(0.5, 2.0),
+    ambiguity_margin_m=5.0,
+    high_support_orientation_deg=10.0,
+    high_support_wavelength_ratio=(0.8, 1.25),
+    high_support_distance_fraction=0.5,
+)
+# CONSERVATIVE: roughly half the nominal spatial/ambiguity tolerances, half the orientation/
+# wavelength-ratio slack -- a tighter, more skeptical read of the same geometry.
+CONSERVATIVE_TOLERANCES = MatchingTolerances(
+    name="CONSERVATIVE",
+    max_search_radius_m=30.0,
+    max_along_crest_offset_m=30.0,
+    orientation_tolerance_deg=15.0,
+    wavelength_ratio_tolerance=(0.67, 1.5),
+    ambiguity_margin_m=2.5,
+    high_support_orientation_deg=5.0,
+    high_support_wavelength_ratio=(0.9, 1.11),
+    high_support_distance_fraction=0.4,
+)
+# PERMISSIVE: roughly 1.5-2x the nominal spatial/ambiguity tolerances, wider orientation/
+# wavelength-ratio slack -- a looser, more admitting read of the same geometry.
+PERMISSIVE_TOLERANCES = MatchingTolerances(
+    name="PERMISSIVE",
+    max_search_radius_m=100.0,
+    max_along_crest_offset_m=100.0,
+    orientation_tolerance_deg=45.0,
+    wavelength_ratio_tolerance=(0.33, 3.0),
+    ambiguity_margin_m=8.0,
+    high_support_orientation_deg=15.0,
+    high_support_wavelength_ratio=(0.7, 1.4),
+    high_support_distance_fraction=0.6,
+)
+TOLERANCE_SETS = (CONSERVATIVE_TOLERANCES, NOMINAL_TOLERANCES, PERMISSIVE_TOLERANCES)
+
+STABILITY_STABLE = "STABLE_ACROSS_TESTED_TOLERANCES"
+STABILITY_TOLERANCE_SENSITIVE = "TOLERANCE_SENSITIVE"
+STABILITY_AMBIGUOUS = "AMBIGUOUS"
+MATCHING_STABILITY_STATUSES = frozenset(
+    {STABILITY_STABLE, STABILITY_TOLERANCE_SENSITIVE, STABILITY_AMBIGUOUS}
+)
 
 
 def _angular_difference_undirected(a_deg: float, b_deg: float) -> float:
@@ -133,54 +207,61 @@ def evaluate_candidate_pair(crest1: dict[str, Any], crest2: dict[str, Any]) -> d
     }
 
 
-def _passes_base_gates(pair: dict[str, Any]) -> str | None:
+def _passes_base_gates(pair: dict[str, Any], tolerances: MatchingTolerances) -> str | None:
     """Returns None if the pair passes every base gate, else the single
     rejection reason (checked in a fixed order so it is reproducible)."""
 
-    if pair["straight_distance_m"] > MAX_SEARCH_RADIUS_M:
+    if pair["straight_distance_m"] > tolerances.max_search_radius_m:
         return REJECTED_OUTSIDE_SEARCH_RADIUS
-    if abs(pair["along_crest_displacement_m"]) > MAX_ALONG_CREST_OFFSET_M:
+    if abs(pair["along_crest_displacement_m"]) > tolerances.max_along_crest_offset_m:
         return REJECTED_ALONG_CREST_OFFSET_TOO_LARGE
-    if pair["orientation_difference_deg"] > ORIENTATION_TOLERANCE_DEG:
+    if pair["orientation_difference_deg"] > tolerances.orientation_tolerance_deg:
         return REJECTED_ORIENTATION_INCOMPATIBLE
-    lo, hi = WAVELENGTH_RATIO_TOLERANCE
+    lo, hi = tolerances.wavelength_ratio_tolerance
     if not (lo <= pair["wavelength_ratio"] <= hi):
         return REJECTED_WAVELENGTH_SCALE_INCONSISTENT
     return None
 
 
-def _classify_support(pair: dict[str, Any]) -> str:
-    lo, hi = HIGH_SUPPORT_WAVELENGTH_RATIO
+def _classify_support(pair: dict[str, Any], tolerances: MatchingTolerances) -> str:
+    lo, hi = tolerances.high_support_wavelength_ratio
     high_support = (
-        pair["orientation_difference_deg"] <= HIGH_SUPPORT_ORIENTATION_DEG
+        pair["orientation_difference_deg"] <= tolerances.high_support_orientation_deg
         and lo <= pair["wavelength_ratio"] <= hi
-        and pair["straight_distance_m"] <= MAX_SEARCH_RADIUS_M * HIGH_SUPPORT_DISTANCE_FRACTION
+        and pair["straight_distance_m"]
+        <= tolerances.max_search_radius_m * tolerances.high_support_distance_fraction
     )
     return MATCHED_HIGH_SUPPORT if high_support else MATCHED_WITH_LIMITATIONS
 
 
 def match_crests_within_tile(
-    tile_id: str, epoch1_crests: list[dict[str, Any]], epoch2_crests: list[dict[str, Any]]
+    tile_id: str,
+    epoch1_crests: list[dict[str, Any]],
+    epoch2_crests: list[dict[str, Any]],
+    *,
+    tolerances: MatchingTolerances = NOMINAL_TOLERANCES,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Section 12-14: matches crests already scoped to ONE tile. Returns
-    (all_candidates, canonical_matches). `all_candidates` records every
-    pair within `MAX_SEARCH_RADIUS_M` regardless of outcome (Section 13:
-    every proposed pair carries a match_status/rejection_reason).
-    `canonical_matches` holds only the accepted MATCHED_HIGH_SUPPORT /
-    MATCHED_WITH_LIMITATIONS rows.
+    """Section 12-14: matches crests already scoped to ONE tile, under ONE
+    named `tolerances` set (MAR-022A Section 10; defaults to `NOMINAL_
+    TOLERANCES`, the exact values this module used before MAR-022A).
+    Returns (all_candidates, canonical_matches). `all_candidates` records
+    every pair within `tolerances.max_search_radius_m` regardless of
+    outcome (Section 13: every proposed pair carries a match_status/
+    rejection_reason). `canonical_matches` holds only the accepted
+    MATCHED_HIGH_SUPPORT / MATCHED_WITH_LIMITATIONS rows.
 
     Assignment is global, not a per-epoch1-crest independent nearest-
     neighbour pick (which could silently double-claim one epoch2 crest for
     two different epoch1 crests): the globally closest still-available
     gate-passing pair is considered first. If any OTHER still-available
-    pair sharing either of its endpoints lies within `AMBIGUITY_MARGIN_M`,
-    the entire cluster is rejected and BOTH endpoints are retired
-    entirely from further matching in this tile (`AMBIGUOUS_NO_CANONICAL_
-    MATCH`) -- a crest is never given a later 'second chance' at a more
-    distant candidate once its closest option was ambiguous, since that
-    would mean silently preferring a worse-supported pair over a
-    contested closer one. Otherwise the pair is accepted and both
-    endpoints are likewise retired (claimed)."""
+    pair sharing either of its endpoints lies within `tolerances.
+    ambiguity_margin_m`, the entire cluster is rejected and BOTH endpoints
+    are retired entirely from further matching in this tile
+    (`AMBIGUOUS_NO_CANONICAL_MATCH`) -- a crest is never given a later
+    'second chance' at a more distant candidate once its closest option
+    was ambiguous, since that would mean silently preferring a worse-
+    supported pair over a contested closer one. Otherwise the pair is
+    accepted and both endpoints are likewise retired (claimed)."""
 
     all_pairs: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
@@ -188,12 +269,12 @@ def match_crests_within_tile(
         for c2 in epoch2_crests:
             pair = evaluate_candidate_pair(c1, c2)
             pair["tile_id"] = tile_id
-            if pair["straight_distance_m"] > MAX_SEARCH_RADIUS_M:
+            if pair["straight_distance_m"] > tolerances.max_search_radius_m:
                 pair["match_status"] = None
                 pair["rejection_reason"] = REJECTED_OUTSIDE_SEARCH_RADIUS
                 all_pairs.append(pair)
                 continue
-            reason = _passes_base_gates(pair)
+            reason = _passes_base_gates(pair, tolerances)
             if reason is not None:
                 pair["match_status"] = None
                 pair["rejection_reason"] = reason
@@ -211,7 +292,8 @@ def match_crests_within_tile(
             p
             for p in remaining.values()
             if (p["epoch1_crest_id"] == e1 or p["epoch2_crest_id"] == e2)
-            and p["straight_distance_m"] - best["straight_distance_m"] <= AMBIGUITY_MARGIN_M
+            and p["straight_distance_m"] - best["straight_distance_m"]
+            <= tolerances.ambiguity_margin_m
         ]
         # Every remaining pair whose endpoint is about to be retired (whether accepted or
         # thrown out as ambiguous) -- accepting `best` also removes any OTHER pair competing
@@ -228,7 +310,7 @@ def match_crests_within_tile(
                 del remaining[id(pair)]
             continue
 
-        resolved[id(best)] = (_classify_support(best), None)
+        resolved[id(best)] = (_classify_support(best, tolerances), None)
         del remaining[id(best)]
         for pair in same_endpoint:
             if id(pair) in remaining:
@@ -245,6 +327,58 @@ def match_crests_within_tile(
             canonical_matches.append(pair)
 
     return all_pairs, canonical_matches
+
+
+def _resolution_by_epoch1(all_pairs: list[dict[str, Any]]) -> dict[Any, tuple[str, Any]]:
+    """For one tolerance run's full `all_pairs` list, the per-epoch1-crest
+    outcome: `(status, epoch2_crest_id)` where `status` is 'MATCHED' or
+    'AMBIGUOUS' -- an epoch1 crest with neither is simply absent (never
+    even a candidate, or gate-rejected, under that tolerance set)."""
+
+    result: dict[Any, tuple[str, Any]] = {}
+    for pair in all_pairs:
+        e1 = pair["epoch1_crest_id"]
+        if pair["match_status"] in (MATCHED_HIGH_SUPPORT, MATCHED_WITH_LIMITATIONS):
+            result[e1] = ("MATCHED", pair["epoch2_crest_id"])
+        elif (
+            pair["match_status"] == AMBIGUOUS_NO_CANONICAL_MATCH
+            and result.get(e1, (None, None))[0] != "MATCHED"
+        ):
+            result[e1] = ("AMBIGUOUS", None)
+    return result
+
+
+def assess_matching_stability(
+    nominal_match: dict[str, Any],
+    *,
+    conservative_all_pairs: list[dict[str, Any]],
+    permissive_all_pairs: list[dict[str, Any]],
+) -> str:
+    """MAR-022A Section 10: a NOMINAL canonical match is `STABILITY_
+    STABLE` only if the SAME counterpart is ALSO its resolution under
+    BOTH the conservative and permissive tolerance sets (three
+    independent re-runs of `match_crests_within_tile` on the SAME crest
+    sets, never re-tuned against this match specifically).
+    `STABILITY_AMBIGUOUS` when either alternate run instead resolves this
+    crest's endpoint into an ambiguous cluster; `STABILITY_TOLERANCE_
+    SENSITIVE` for every other outcome (matched to a different
+    counterpart, or not matched at all under a stricter/looser setting).
+    Never a numeric confidence score."""
+
+    e1 = nominal_match["epoch1_crest_id"]
+    e2 = nominal_match["epoch2_crest_id"]
+    cons_status, cons_partner = _resolution_by_epoch1(conservative_all_pairs).get(e1, (None, None))
+    perm_status, perm_partner = _resolution_by_epoch1(permissive_all_pairs).get(e1, (None, None))
+    if (
+        cons_status == "MATCHED"
+        and cons_partner == e2
+        and perm_status == "MATCHED"
+        and perm_partner == e2
+    ):
+        return STABILITY_STABLE
+    if cons_status == "AMBIGUOUS" or perm_status == "AMBIGUOUS":
+        return STABILITY_AMBIGUOUS
+    return STABILITY_TOLERANCE_SENSITIVE
 
 
 def compute_apparent_displacement_rate(normal_displacement_m: float, elapsed_years: float) -> float:

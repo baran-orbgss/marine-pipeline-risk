@@ -7446,6 +7446,70 @@ def _tile_window(
     ]
 
 
+def _tile_box(tile):
+    half = tile.tile_size_m / 2.0
+    return shapely_box(
+        tile.center_x_m - half,
+        tile.center_y_m - half,
+        tile.center_x_m + half,
+        tile.center_y_m + half,
+    )
+
+
+def _derive_bedform_validation_questions(
+    *,
+    has_1000m_support: bool,
+    has_support_at_either_scale: bool,
+    canonical_bedform_count: int,
+    canonical_selected_tile_count: int,
+    stable_match_count: int,
+) -> dict[str, str]:
+    """MAR-022A Section 13: the causal validation-question rule, pulled
+    out as a pure function so it is testable independent of the real
+    CLI/real data. Question E may be YES only when A, C, and D are ALL
+    YES AND at least one match is stable across every tested tolerance
+    set; F may be YES only when E is YES; G is always NO. `D=NO ->
+    E=YES` is asserted structurally impossible, never merely hoped for."""
+
+    question_a = "YES" if has_1000m_support else "NO"
+    question_b = "YES" if has_support_at_either_scale else "NO"
+    question_c = "YES" if canonical_bedform_count >= 3 else "NO"
+    question_d = "YES" if canonical_selected_tile_count >= 1 else "NO"
+    question_e = (
+        "YES"
+        if (
+            question_a == "YES"
+            and question_c == "YES"
+            and question_d == "YES"
+            and stable_match_count >= 1
+        )
+        else "NO"
+    )
+    question_f = "YES" if question_e == "YES" else "NO"
+    question_g = "NO"
+    assert not (question_d == "NO" and question_e == "YES"), "D=NO can never produce E=YES"
+    assert not (question_e == "NO" and question_f == "YES"), "E=NO can never produce F=YES"
+    return {
+        "a": question_a,
+        "b": question_b,
+        "c": question_c,
+        "d": question_d,
+        "e": question_e,
+        "f": question_f,
+        "g": question_g,
+    }
+
+
+def _tile_box_from_row(row):
+    half = row["tile_size_m"] / 2.0
+    return shapely_box(
+        row["center_x_m"] - half,
+        row["center_y_m"] - half,
+        row["center_x_m"] + half,
+        row["center_y_m"] + half,
+    )
+
+
 def _cmd_build_bedform_morphodynamics_poc(args: argparse.Namespace) -> int:
     """MAR-022: generic sand-wave/bedform morphodynamics POC. Reuses the
     ACCEPTED MAR-020/021 canonical bathymetry pipeline (re-derived here
@@ -7602,230 +7666,288 @@ def _cmd_build_bedform_morphodynamics_poc(args: argparse.Namespace) -> int:
         flush=True,
     )
 
-    # --- Section 4-5: canonical support audit ---------------------------------------------------
-    print("Running canonical support audit (Section 4-5)...", flush=True)
-    tiles_2000, meta_2000 = swm.find_valid_tiles(
-        common.common_valid_mask,
-        pixel_size_m,
-        transform=aligned2020.transform,
-        tile_size_m=swm.CANONICAL_TILE_SIZE_M,
-        min_tile_size_m=swm.CANONICAL_TILE_SIZE_M,
-    )
-    tiles_1000, meta_1000 = swm.find_valid_tiles(
-        common.common_valid_mask,
-        pixel_size_m,
-        transform=aligned2020.transform,
-        tile_size_m=swm.MIN_TILE_SIZE_M,
-        min_tile_size_m=swm.MIN_TILE_SIZE_M,
-    )
-    best_valid_fraction = max(
-        [t.valid_fraction for t in tiles_2000] + [t.valid_fraction for t in tiles_1000] + [0.0]
-    )
-    print(f"  qualifying 2000 m tiles: {len(tiles_2000)}", flush=True)
-    for entry in meta_2000["cascade_log"]:
-        print(f"    2000m search: {entry}", flush=True)
-    print(f"  qualifying 1000 m tiles: {len(tiles_1000)}", flush=True)
-    for entry in meta_1000["cascade_log"]:
-        print(f"    1000m search: {entry}", flush=True)
-    print(f"  best valid fraction achieved: {best_valid_fraction:.4f}", flush=True)
+    # =============================================================================================
+    # MAR-022A: canonical natural-bedform selection MUST apply natural-vs-anthropogenic context to
+    # EVERY qualifying support tile BEFORE any spectral ranking (Section 3), at 2000 m first and
+    # only then 1000 m (Section 2/4), and only ever select spatially-independent, spectrally-band-
+    # eligible, NATURAL tiles (Section 6) -- never the non-independent `rank_and_select_top_tiles`
+    # fallback used for MAR-022's original (defective) selection. That original selection -- and
+    # everything it found -- is preserved below as explicit, clearly-labelled diagnostics (Section
+    # 1), never deleted, never called canonical.
+    # =============================================================================================
 
-    support_status_path = study_dir / "canonical_support_audit.json"
-    support_status_path.write_text(
-        json.dumps(
-            {
-                "qualifying_2000m_tile_count": len(tiles_2000),
-                "qualifying_1000m_tile_count": len(tiles_1000),
-                "best_valid_fraction": best_valid_fraction,
-                "cascade_log_2000m": meta_2000["cascade_log"],
-                "cascade_log_1000m": meta_1000["cascade_log"],
-                "spatial_distribution_2000m": [
-                    {"tile_id": t.tile_id, "center_x_m": t.center_x_m, "center_y_m": t.center_y_m}
-                    for t in tiles_2000
-                ],
-                "spatial_distribution_1000m": [
-                    {"tile_id": t.tile_id, "center_x_m": t.center_x_m, "center_y_m": t.center_y_m}
-                    for t in tiles_1000
-                ],
-            },
-            indent=2,
-            default=str,
-        ),
-        encoding="utf-8",
+    def _canonical_pass(tile_size_m: float) -> dict[str, Any]:
+        """Sections 2-6 at ONE support scale: find every qualifying tile ->
+        assess natural-vs-anthropogenic context for ALL of them (never
+        just the eventually-ranked ones) -> canonical-band spectral
+        eligibility (30 m <= wavelength <= tile_size_m/3) computed ONLY
+        for the natural-eligible subset -> spatially-independent
+        selection (max 5) from the natural+spectrally-eligible pool
+        only."""
+
+        all_tiles, meta = swm.find_valid_tiles(
+            common.common_valid_mask,
+            pixel_size_m,
+            transform=aligned2020.transform,
+            tile_size_m=tile_size_m,
+            min_tile_size_m=tile_size_m,
+        )
+        records = []
+        for tile in all_tiles:
+            natural_status = bedform_natural_context.assess_natural_bedform_validation_status(
+                _tile_box(tile),
+                anthropogenic_context_gdf=anthropogenic_interp,
+                interpretation_available=True,
+            )
+            records.append({"tile": tile, "natural_status": natural_status})
+        natural_records = [
+            r
+            for r in records
+            if r["natural_status"].status == bedform_natural_context.NATURAL_SEABED_ELIGIBLE
+        ]
+        excluded_records = [
+            r
+            for r in records
+            if r["natural_status"].status != bedform_natural_context.NATURAL_SEABED_ELIGIBLE
+        ]
+
+        analysis_pool = natural_records
+        capped = len(analysis_pool) > _BEDFORM_MAX_TILES_TO_RANK
+        if capped:
+            idx = sorted(
+                set(np.linspace(0, len(analysis_pool) - 1, _BEDFORM_MAX_TILES_TO_RANK).astype(int))
+            )
+            print(
+                f"    capping canonical-band spectral analysis to {len(idx)} evenly-sampled "
+                f"natural candidates out of {len(analysis_pool)} (logged, not silent)",
+                flush=True,
+            )
+            analysis_pool = [analysis_pool[i] for i in idx]
+
+        max_wavelength_m = tile_size_m / 3.0
+        spectral_pool = []
+        spectrally_eligible_count = 0
+        for r in analysis_pool:
+            tile = r["tile"]
+            tile_elev, tile_valid = _tile_window(
+                aligned2020.elevation, aligned2020.valid_mask, tile
+            )
+            global_diag, band_diag = swm.analyze_tile_dual_band(
+                tile_elev, tile_valid, pixel_size_m, max_wavelength_m=max_wavelength_m
+            )
+            r["global_diag"] = global_diag
+            r["band_diag"] = band_diag
+            if band_diag is not None:
+                spectrally_eligible_count += 1
+                spectral_pool.append(
+                    {
+                        "tile_id": tile.tile_id,
+                        "tile_size_m": tile.tile_size_m,
+                        "center_x_m": tile.center_x_m,
+                        "center_y_m": tile.center_y_m,
+                        "diagnostics": band_diag,
+                        "_record": r,
+                    }
+                )
+
+        selected_entries = swm.select_spatially_independent_eligible_tiles(
+            spectral_pool, max_tiles=5
+        )
+        selected_records = [e["_record"] for e in selected_entries]
+
+        return {
+            "tile_size_m": tile_size_m,
+            "support_tile_count": len(all_tiles),
+            "records": records,
+            "natural_records": natural_records,
+            "excluded_records": excluded_records,
+            "analysis_pool_size": len(analysis_pool),
+            "capped": capped,
+            "spectrally_eligible_count": spectrally_eligible_count,
+            "selected_records": selected_records,
+            "cascade_meta": meta,
+        }
+
+    print("Running the 2000 m canonical natural-bedform pass (Section 2-6)...", flush=True)
+    pass_2000 = _canonical_pass(swm.CANONICAL_TILE_SIZE_M)
+    print(
+        f"  support={pass_2000['support_tile_count']} "
+        f"natural_eligible={len(pass_2000['natural_records'])} "
+        f"spectrally_eligible={pass_2000['spectrally_eligible_count']} "
+        f"selected={len(pass_2000['selected_records'])}",
+        flush=True,
     )
 
-    exploratory_only = False
-    if tiles_2000:
-        candidate_pool, tile_size_used_m = tiles_2000, swm.CANONICAL_TILE_SIZE_M
-    elif tiles_1000:
-        candidate_pool, tile_size_used_m = tiles_1000, swm.MIN_TILE_SIZE_M
+    print("Running the 1000 m canonical natural-bedform pass (Section 4)...", flush=True)
+    pass_1000 = _canonical_pass(swm.MIN_TILE_SIZE_M)
+    print(
+        f"  support={pass_1000['support_tile_count']} "
+        f"natural_eligible={len(pass_1000['natural_records'])} "
+        f"spectrally_eligible={pass_1000['spectrally_eligible_count']} "
+        f"selected={len(pass_1000['selected_records'])}",
+        flush=True,
+    )
+
+    if pass_2000["selected_records"]:
+        canonical_pass, canonical_scale_used_m = pass_2000, swm.CANONICAL_TILE_SIZE_M
+    elif pass_1000["selected_records"]:
+        canonical_pass, canonical_scale_used_m = pass_1000, swm.MIN_TILE_SIZE_M
     else:
-        print(
-            "  zero canonical (>=1000 m) tiles -- Section 5: continuing only with clearly-"
-            "labelled noncanonical corridor diagnostics, never called canonical validation.",
-            flush=True,
-        )
-        candidate_pool, _exploratory_meta = swm.find_exploratory_small_support_tiles(
-            common.common_valid_mask, pixel_size_m, transform=aligned2020.transform
-        )
-        tile_size_used_m = candidate_pool[0].tile_size_m if candidate_pool else None
-        exploratory_only = True
+        canonical_pass, canonical_scale_used_m = None, None
+    canonical_available = canonical_pass is not None
+    print(
+        f"Canonical natural-bedform tile scale used: "
+        f"{canonical_scale_used_m if canonical_available else 'NONE (unavailable)'}",
+        flush=True,
+    )
 
-    if not candidate_pool:
-        print("EARLY STOP: zero tiles at any spatial-support scale, canonical or exploratory.")
-        _write_validation("NO", "NO", "NOT_APPLICABLE", "NOT_APPLICABLE", "NO", "NO", "NO")
-        print("IS GENERIC HIGH-RESOLUTION MBES -> SANDBED BEDFORM MORPHOMETRY DEMONSTRATED? NO")
-        print("IS DEFENSIBLE OBSERVED 2018-2020 CREST DISPLACEMENT DEMONSTRATED? NO")
-        return 0
-
-    if len(candidate_pool) > _BEDFORM_MAX_TILES_TO_RANK:
-        idx = sorted(
-            set(np.linspace(0, len(candidate_pool) - 1, _BEDFORM_MAX_TILES_TO_RANK).astype(int))
-        )
-        print(
-            f"  capping spectral ranking to {len(idx)} evenly-sampled candidates out of "
-            f"{len(candidate_pool)} qualifying tiles (logged, not silent)",
-            flush=True,
-        )
-        candidate_pool = [candidate_pool[i] for i in idx]
-
-    # --- Section 10 (ranking pass): rank candidates using epoch2 (2020) spectral diagnostics ---
-    print("Ranking candidate tiles (2020 reference pass)...", flush=True)
-    ranking_pool = []
-    for tile in candidate_pool:
+    # --- Section 1: preserve MAR-022's ORIGINAL (pre-MAR-022A) top-5 selection, unchanged, as an
+    # explicit, clearly noncanonical diagnostic -- natural context is deliberately NOT applied
+    # before ranking here (reproducing exactly what MAR-022 did), and the non-spatially-
+    # independent `rank_and_select_top_tiles` fallback is used exactly as before.
+    print(
+        "Reproducing MAR-022's original disturbed-tile top-5 selection as a diagnostic...",
+        flush=True,
+    )
+    legacy_ranking_pool = []
+    for r in pass_2000["records"]:
+        tile = r["tile"]
         tile_elev, tile_valid = _tile_window(aligned2020.elevation, aligned2020.valid_mask, tile)
         diag = swm.analyze_tile(tile_elev, tile_valid, pixel_size_m)
         if diag is None:
             continue
-        ranking_pool.append(
+        legacy_ranking_pool.append(
             {
                 "tile_id": tile.tile_id,
                 "tile_size_m": tile.tile_size_m,
                 "center_x_m": tile.center_x_m,
                 "center_y_m": tile.center_y_m,
-                "valid_fraction": tile.valid_fraction,
                 "diagnostics": diag,
-                "_tile": tile,
+                "_record": r,
             }
         )
-    selected = swm.select_spatially_independent_eligible_tiles(ranking_pool, max_tiles=5)
-    if not selected and ranking_pool:
-        # No tile met the strict >=3-wavelengths eligibility rule -- a real, observed outcome on
-        # this dataset: the tile-LEVEL 2D spectral diagnostic's dominant wavelength repeatedly
-        # locks onto a wavelength at/near the full 2000 m tile size itself (residual long-
-        # wavelength content a first-order planar detrend cannot remove over such a large real
-        # window), which the strict `tile_size/wavelength >= 3` rule then always fails --
-        # observed directly across the real qualifying-tile pool, never assumed. This is never
-        # relaxed (the rule itself, and the >=30 m canonical wavelength gate used for the actual
-        # bedform statistics via `classify_bedform_scale`, both stay strict). Falling back to the
-        # top-5 best-ranked candidates instead of forcing just one gives the natural-context
-        # classification below a real chance to find an undisturbed tile among the abundant real
-        # qualifying pool, rather than being reliant on a single arbitrary pick.
-        selected = swm.rank_and_select_top_tiles(ranking_pool, top_n=5)
-    print(f"  {len(selected)} tile(s) selected for detailed analysis", flush=True)
-
-    # --- Section 8: natural-vs-anthropogenic context per selected tile -------------------------
-    tile_summaries: list[dict[str, Any]] = []
-    tile_rows_2018: list[dict[str, Any]] = []
-    tile_rows_2020: list[dict[str, Any]] = []
-    bedform_rows_2018: list[dict[str, Any]] = []
-    bedform_rows_2020: list[dict[str, Any]] = []
-    crest_points_2018: list[dict[str, Any]] = []
-    crest_points_2020: list[dict[str, Any]] = []
-    trough_points_2018: list[dict[str, Any]] = []
-    trough_points_2020: list[dict[str, Any]] = []
-    all_candidate_pairs: list[dict[str, Any]] = []
-    all_canonical_matches: list[dict[str, Any]] = []
-    representative_transects: list[tuple[tuple[float, float], tuple[float, float]]] = []
-
+    legacy_selected = swm.select_spatially_independent_eligible_tiles(
+        legacy_ranking_pool, max_tiles=5
+    )
+    if not legacy_selected and legacy_ranking_pool:
+        legacy_selected = swm.rank_and_select_top_tiles(legacy_ranking_pool, top_n=5)
+    legacy_records = [e["_record"] for e in legacy_selected]
+    legacy_global_diag_by_tile_id = {e["tile_id"]: e["diagnostics"] for e in legacy_selected}
+    legacy_natural_count = sum(
+        1
+        for r in legacy_records
+        if r["natural_status"].status == bedform_natural_context.NATURAL_SEABED_ELIGIBLE
+    )
     print(
-        "Assessing natural-vs-anthropogenic context + per-epoch morphometry (Section 8-11)...",
+        f"  {len(legacy_records)} legacy tile(s) selected, {legacy_natural_count} natural-eligible "
+        f"(MAR-022 originally found all 5 anthropogenically disturbed -- reproduced here, not "
+        "assumed)",
         flush=True,
     )
-    for entry in selected:
-        tile = entry["_tile"]
-        half = tile.tile_size_m / 2.0
-        tile_box = shapely_box(
-            tile.center_x_m - half,
-            tile.center_y_m - half,
-            tile.center_x_m + half,
-            tile.center_y_m + half,
-        )
-        natural_status = bedform_natural_context.assess_natural_bedform_validation_status(
-            tile_box, anthropogenic_context_gdf=anthropogenic_interp, interpretation_available=True
-        )
 
-        per_epoch_diag: dict[str, Any] = {}
-        per_epoch_extraction: dict[str, Any] = {}
-        for epoch_label, elevation, valid_mask in (
-            ("2018", aligned2018.elevation, aligned2018.valid_mask),
-            ("2020", aligned2020.elevation, aligned2020.valid_mask),
-        ):
-            tile_elev, tile_valid = _tile_window(elevation, valid_mask, tile)
-            diag = swm.analyze_tile(tile_elev, tile_valid, pixel_size_m)
-            per_epoch_diag[epoch_label] = diag
-            if diag is None:
-                continue
-            (tile_rows_2018 if epoch_label == "2018" else tile_rows_2020).append(
+    # --- Shared per-tile extraction + multi-tolerance matching (Sections 7-11) -----------------
+    def _extract_and_match(
+        tile_records: list[dict[str, Any]], *, tolerance_sets: tuple, is_canonical: bool
+    ) -> dict[str, Any]:
+        tile_rows = {"2018": [], "2020": []}
+        bedform_rows = {"2018": [], "2020": []}
+        crest_points = {"2018": [], "2020": []}
+        trough_points = {"2018": [], "2020": []}
+        tile_summaries: list[dict[str, Any]] = []
+        representative_transects: list[tuple] = []
+        pairs_by_tolerance = {tol.name: [] for tol in tolerance_sets}
+        matches_by_tolerance = {tol.name: [] for tol in tolerance_sets}
+
+        for record in tile_records:
+            tile = record["tile"]
+            natural_status = record["natural_status"]
+            max_wavelength_m = tile.tile_size_m / 3.0
+            per_epoch_diag: dict[str, Any] = {}
+            per_epoch_effective_diag: dict[str, Any] = {}
+            per_epoch_extraction: dict[str, Any] = {}
+            for epoch_label, elevation, valid_mask in (
+                ("2018", aligned2018.elevation, aligned2018.valid_mask),
+                ("2020", aligned2020.elevation, aligned2020.valid_mask),
+            ):
+                tile_elev, tile_valid = _tile_window(elevation, valid_mask, tile)
+                # A canonical candidate already passed the natural-context + canonical-band
+                # eligibility gate on ITS OWN band-restricted 2020 diagnostic (`_canonical_pass`)
+                # -- for driving the ACTUAL transect orientation/extraction, every epoch
+                # independently prefers ITS OWN band-restricted diagnostic (Section 5's whole
+                # point: the global, unbounded-above peak can legitimately BE the tile-scale
+                # artefact, never a real sand-wave orientation) over the global one. Diagnostic/
+                # legacy (disturbed) tiles were never subjected to that gate at all, so they keep
+                # using the plain global diagnostic, exactly reproducing MAR-022's own behaviour.
+                if is_canonical:
+                    diag, band_diag = swm.analyze_tile_dual_band(
+                        tile_elev, tile_valid, pixel_size_m, max_wavelength_m=max_wavelength_m
+                    )
+                else:
+                    diag = swm.analyze_tile(tile_elev, tile_valid, pixel_size_m)
+                    band_diag = None
+                per_epoch_diag[epoch_label] = diag
+                if diag is None:
+                    continue
+                effective_diag = band_diag if band_diag is not None else diag
+                per_epoch_effective_diag[epoch_label] = effective_diag
+                tile_rows[epoch_label].append(
+                    {
+                        "tile_id": tile.tile_id,
+                        "epoch": epoch_label,
+                        "center_x_m": tile.center_x_m,
+                        "center_y_m": tile.center_y_m,
+                        "tile_size_m": tile.tile_size_m,
+                        "valid_fraction": tile.valid_fraction,
+                        "natural_bedform_validation_status": natural_status.status,
+                        "global_dominant_wavelength_m": diag["dominant_wavelength_m"],
+                        "canonical_band_dominant_wavelength_m": (
+                            band_diag["dominant_wavelength_m"] if band_diag else None
+                        ),
+                        **effective_diag,
+                    }
+                )
+                extraction = bedform_extraction.extract_tile_bedforms(
+                    elevation,
+                    valid_mask,
+                    aligned2020.transform,
+                    tile_id=tile.tile_id,
+                    epoch=epoch_label,
+                    center_x_m=tile.center_x_m,
+                    center_y_m=tile.center_y_m,
+                    tile_size_m=tile.tile_size_m,
+                    crest_azimuth_deg=effective_diag["dominant_crest_azimuth_deg"],
+                )
+                per_epoch_extraction[epoch_label] = extraction
+                bedform_rows[epoch_label].extend(extraction.bedform_rows)
+                crest_points[epoch_label].extend(extraction.crest_points)
+                trough_points[epoch_label].extend(extraction.trough_points)
+                if epoch_label == "2020" and not representative_transects:
+                    representative_transects = swm.generate_cross_crest_transects(
+                        tile.center_x_m,
+                        tile.center_y_m,
+                        tile.tile_size_m,
+                        effective_diag["dominant_crest_azimuth_deg"],
+                    )
+
+            tile_summaries.append(
                 {
                     "tile_id": tile.tile_id,
-                    "epoch": epoch_label,
                     "center_x_m": tile.center_x_m,
                     "center_y_m": tile.center_y_m,
                     "tile_size_m": tile.tile_size_m,
                     "valid_fraction": tile.valid_fraction,
                     "natural_bedform_validation_status": natural_status.status,
-                    **diag,
+                    "dominant_wavelength_m": (per_epoch_effective_diag.get("2020") or {}).get(
+                        "dominant_wavelength_m"
+                    ),
+                    "dominant_crest_azimuth_deg": (per_epoch_effective_diag.get("2020") or {}).get(
+                        "dominant_crest_azimuth_deg"
+                    ),
                 }
             )
-            extraction = bedform_extraction.extract_tile_bedforms(
-                elevation,
-                valid_mask,
-                aligned2020.transform,
-                tile_id=tile.tile_id,
-                epoch=epoch_label,
-                center_x_m=tile.center_x_m,
-                center_y_m=tile.center_y_m,
-                tile_size_m=tile.tile_size_m,
-                crest_azimuth_deg=diag["dominant_crest_azimuth_deg"],
-            )
-            per_epoch_extraction[epoch_label] = extraction
-            (bedform_rows_2018 if epoch_label == "2018" else bedform_rows_2020).extend(
-                extraction.bedform_rows
-            )
-            (crest_points_2018 if epoch_label == "2018" else crest_points_2020).extend(
-                extraction.crest_points
-            )
-            (trough_points_2018 if epoch_label == "2018" else trough_points_2020).extend(
-                extraction.trough_points
-            )
-            if epoch_label == "2020" and not representative_transects:
-                representative_transects = swm.generate_cross_crest_transects(
-                    tile.center_x_m,
-                    tile.center_y_m,
-                    tile.tile_size_m,
-                    diag["dominant_crest_azimuth_deg"],
-                )
 
-        tile_summaries.append(
-            {
-                "tile_id": tile.tile_id,
-                "center_x_m": tile.center_x_m,
-                "center_y_m": tile.center_y_m,
-                "tile_size_m": tile.tile_size_m,
-                "valid_fraction": tile.valid_fraction,
-                "natural_bedform_validation_status": natural_status.status,
-                "natural_context_evidence": json.dumps(natural_status.to_dict()),
-                "dominant_wavelength_m": (per_epoch_diag.get("2020") or {}).get(
-                    "dominant_wavelength_m"
-                ),
-                "dominant_crest_azimuth_deg": (per_epoch_diag.get("2020") or {}).get(
-                    "dominant_crest_azimuth_deg"
-                ),
-            }
-        )
-
-        # --- Section 12-16: independent multi-epoch crest matching, this tile only -------------
-        if "2018" in per_epoch_extraction and "2020" in per_epoch_extraction:
+            if "2018" not in per_epoch_extraction or "2020" not in per_epoch_extraction:
+                continue
             crests1 = [
                 c
                 for c in per_epoch_extraction["2018"].crest_points
@@ -7838,182 +7960,430 @@ def _cmd_build_bedform_morphodynamics_poc(args: argparse.Namespace) -> int:
             ]
             crests1_by_id = {c["bedform_id"]: c for c in crests1}
             crests2_by_id = {c["bedform_id"]: c for c in crests2}
-            candidates, canonical_matches = bedform_matching.match_crests_within_tile(
-                tile.tile_id, crests1, crests2
-            )
-            for pair in candidates:
-                c1 = crests1_by_id.get(pair["epoch1_crest_id"])
-                c2 = crests2_by_id.get(pair["epoch2_crest_id"])
-                pair["epoch1_x_m"], pair["epoch1_y_m"] = (c1["x"], c1["y"]) if c1 else (None, None)
-                pair["epoch2_x_m"], pair["epoch2_y_m"] = (c2["x"], c2["y"]) if c2 else (None, None)
-            for pair in canonical_matches:
-                pair["apparent_rate_m_per_year"] = (
-                    bedform_matching.compute_apparent_displacement_rate(
-                        pair["normal_displacement_m"], elapsed_years
+            for tolerances in tolerance_sets:
+                all_pairs, canonical_matches = bedform_matching.match_crests_within_tile(
+                    tile.tile_id, crests1, crests2, tolerances=tolerances
+                )
+                for pair in all_pairs:
+                    c1 = crests1_by_id.get(pair["epoch1_crest_id"])
+                    c2 = crests2_by_id.get(pair["epoch2_crest_id"])
+                    pair["epoch1_x_m"], pair["epoch1_y_m"] = (
+                        (c1["x"], c1["y"]) if c1 else (None, None)
                     )
-                )
-                pair["elapsed_years"] = elapsed_years
-                dod_evidence = bedform_matching.sample_dod_around_matched_crest(
-                    dod_array,
-                    dod_transform,
-                    x_m=pair["epoch1_x_m"],
-                    y_m=pair["epoch1_y_m"],
-                    normal_azimuth_deg=pair["normal_azimuth_deg"],
-                )
-                pair.update(dod_evidence)
-            all_candidate_pairs.extend(candidates)
-            all_canonical_matches.extend(canonical_matches)
+                    pair["epoch2_x_m"], pair["epoch2_y_m"] = (
+                        (c2["x"], c2["y"]) if c2 else (None, None)
+                    )
+                    pair["tolerance_set"] = tolerances.name
+                for pair in canonical_matches:
+                    pair["apparent_rate_m_per_year"] = (
+                        bedform_matching.compute_apparent_displacement_rate(
+                            pair["normal_displacement_m"], elapsed_years
+                        )
+                    )
+                    pair["elapsed_years"] = elapsed_years
+                    dod_evidence = bedform_matching.sample_dod_around_matched_crest(
+                        dod_array,
+                        dod_transform,
+                        x_m=pair["epoch1_x_m"],
+                        y_m=pair["epoch1_y_m"],
+                        normal_azimuth_deg=pair["normal_azimuth_deg"],
+                    )
+                    pair.update(dod_evidence)
+                pairs_by_tolerance[tolerances.name].extend(all_pairs)
+                matches_by_tolerance[tolerances.name].extend(canonical_matches)
 
-    natural_eligible_count = sum(
-        1
-        for t in tile_summaries
-        if t["natural_bedform_validation_status"] == bedform_natural_context.NATURAL_SEABED_ELIGIBLE
-    )
-    anthropogenic_excluded_count = sum(
-        1
-        for t in tile_summaries
-        if t["natural_bedform_validation_status"]
-        == bedform_natural_context.ANTHROPOGENIC_DISTURBANCE_PRESENT
-    )
-    natural_context_caveat = (
-        None
-        if natural_eligible_count > 0
-        else "Real, observed finding: the tile-level 2D ranking metrics (directional_"
-        "concentration, spectral_peak_to_median_power_ratio) are themselves dominated by "
-        "residual long-wavelength content a first-order planar detrend cannot remove over a "
-        "2000 m window, and this project's real anthropogenic infrastructure (cable routes, "
-        "rock dump) is itself strongly LINEAR -- empirically, the tiles this metric ranks "
-        "highest are anthropogenically disturbed ones, not necessarily natural seabed. Reported "
-        f"honestly rather than engineered around; canonical spatial support itself is abundant "
-        f"({len(tiles_2000)} qualifying 2000 m tiles)."
-    )
+        return {
+            "tile_summaries": tile_summaries,
+            "tile_rows": tile_rows,
+            "bedform_rows": bedform_rows,
+            "crest_points": crest_points,
+            "trough_points": trough_points,
+            "representative_transects": representative_transects,
+            "pairs_by_tolerance": pairs_by_tolerance,
+            "matches_by_tolerance": matches_by_tolerance,
+        }
+
     print(
-        f"  natural-eligible tiles: {natural_eligible_count} | anthropogenic-excluded: "
-        f"{anthropogenic_excluded_count}",
+        "Extracting + matching the diagnostic disturbed-tile pool (NOMINAL tolerance only)...",
+        flush=True,
+    )
+    diagnostic_result = _extract_and_match(
+        legacy_records, tolerance_sets=(bedform_matching.NOMINAL_TOLERANCES,), is_canonical=False
+    )
+    diagnostic_bedform_count_2018 = len(diagnostic_result["bedform_rows"]["2018"])
+    diagnostic_bedform_count_2020 = len(diagnostic_result["bedform_rows"]["2020"])
+    diagnostic_nominal_matches = diagnostic_result["matches_by_tolerance"]["NOMINAL"]
+    print(
+        f"  diagnostic bedform observations -- 2018: {diagnostic_bedform_count_2018}, "
+        f"2020: {diagnostic_bedform_count_2020} | diagnostic nominal matches: "
+        f"{len(diagnostic_nominal_matches)}",
         flush=True,
     )
 
-    canonical_bedform_count_2018 = sum(
-        1
-        for b in bedform_rows_2018
-        if b["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
+    if canonical_available:
+        n_canonical_tiles = len(canonical_pass["selected_records"])
+        print(
+            f"Extracting + matching the canonical natural-bedform pool ({n_canonical_tiles} "
+            "tiles, 3 tolerance sets)...",
+            flush=True,
+        )
+        canonical_result = _extract_and_match(
+            canonical_pass["selected_records"],
+            tolerance_sets=bedform_matching.TOLERANCE_SETS,
+            is_canonical=True,
+        )
+        nominal_matches = canonical_result["matches_by_tolerance"]["NOMINAL"]
+        conservative_pairs = canonical_result["pairs_by_tolerance"]["CONSERVATIVE"]
+        permissive_pairs = canonical_result["pairs_by_tolerance"]["PERMISSIVE"]
+        for match in nominal_matches:
+            match["matching_stability_status"] = bedform_matching.assess_matching_stability(
+                match,
+                conservative_all_pairs=conservative_pairs,
+                permissive_all_pairs=permissive_pairs,
+            )
+        stable_matches = [
+            m
+            for m in nominal_matches
+            if m["matching_stability_status"] == bedform_matching.STABILITY_STABLE
+        ]
+        canonical_bedform_count_2018 = sum(
+            1
+            for b in canonical_result["bedform_rows"]["2018"]
+            if b["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
+        )
+        canonical_bedform_count_2020 = sum(
+            1
+            for b in canonical_result["bedform_rows"]["2020"]
+            if b["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
+        )
+        print(
+            f"  canonical natural (>=30 m) observations -- 2018: {canonical_bedform_count_2018}, "
+            f"2020: {canonical_bedform_count_2020}",
+            flush=True,
+        )
+        print(
+            f"  nominal matches: {len(nominal_matches)} | stable across all 3 tolerance sets: "
+            f"{len(stable_matches)}",
+            flush=True,
+        )
+    else:
+        canonical_result = None
+        nominal_matches, stable_matches = [], []
+        canonical_bedform_count_2018 = canonical_bedform_count_2020 = 0
+        print(
+            "  CANONICAL_NATURAL_BEDFORM_VALIDATION_NOT_DEMONSTRATED at either support scale.",
+            flush=True,
+        )
+
+    # --- Section 7: tabular outputs -- canonical vs noncanonical split ------------------------
+    print("Writing canonical + diagnostic tabular outputs (Section 7)...", flush=True)
+    empty_tile_row_cols = [
+        "tile_id",
+        "epoch",
+        "center_x_m",
+        "center_y_m",
+        "tile_size_m",
+        "valid_fraction",
+        "natural_bedform_validation_status",
+        "global_dominant_wavelength_m",
+        "canonical_band_dominant_wavelength_m",
+    ]
+    if canonical_available:
+        pd.DataFrame(canonical_result["tile_rows"]["2018"]).to_parquet(
+            bedforms_dir / "canonical_natural_tile_spectral_morphometry_2018.parquet", index=False
+        )
+        pd.DataFrame(canonical_result["tile_rows"]["2020"]).to_parquet(
+            bedforms_dir / "canonical_natural_tile_spectral_morphometry_2020.parquet", index=False
+        )
+        pd.DataFrame(canonical_result["bedform_rows"]["2018"]).to_parquet(
+            bedforms_dir / "canonical_natural_bedform_observations_2018.parquet", index=False
+        )
+        pd.DataFrame(canonical_result["bedform_rows"]["2020"]).to_parquet(
+            bedforms_dir / "canonical_natural_bedform_observations_2020.parquet", index=False
+        )
+    else:
+        for name in (
+            "canonical_natural_tile_spectral_morphometry_2018.parquet",
+            "canonical_natural_tile_spectral_morphometry_2020.parquet",
+        ):
+            pd.DataFrame(columns=empty_tile_row_cols).to_parquet(bedforms_dir / name, index=False)
+        for name in (
+            "canonical_natural_bedform_observations_2018.parquet",
+            "canonical_natural_bedform_observations_2020.parquet",
+        ):
+            pd.DataFrame(columns=["bedform_id", "record_type", "tile_id", "epoch"]).to_parquet(
+                bedforms_dir / name, index=False
+            )
+
+    noncanonical_rows: list[dict[str, Any]] = []
+    for pass_result, scale_label in ((pass_2000, "2000m"), (pass_1000, "1000m")):
+        selected_ids = {r["tile"].tile_id for r in pass_result["selected_records"]}
+        for r in pass_result["excluded_records"]:
+            tile = r["tile"]
+            noncanonical_rows.append(
+                {
+                    "tile_id": tile.tile_id,
+                    "support_scale_m": scale_label,
+                    "tile_size_m": tile.tile_size_m,
+                    "center_x_m": tile.center_x_m,
+                    "center_y_m": tile.center_y_m,
+                    "valid_fraction": tile.valid_fraction,
+                    "natural_bedform_validation_status": r["natural_status"].status,
+                    "global_dominant_wavelength_m": None,
+                    "canonical_band_dominant_wavelength_m": None,
+                    "spectrally_eligible": None,
+                    "diagnostic_reason": "EXCLUDED_BY_NATURAL_CONTEXT_BEFORE_SPECTRAL_RANKING",
+                }
+            )
+        for r in pass_result["natural_records"]:
+            if r["tile"].tile_id in selected_ids or "band_diag" not in r:
+                continue
+            tile = r["tile"]
+            noncanonical_rows.append(
+                {
+                    "tile_id": tile.tile_id,
+                    "support_scale_m": scale_label,
+                    "tile_size_m": tile.tile_size_m,
+                    "center_x_m": tile.center_x_m,
+                    "center_y_m": tile.center_y_m,
+                    "valid_fraction": tile.valid_fraction,
+                    "natural_bedform_validation_status": r["natural_status"].status,
+                    "global_dominant_wavelength_m": (
+                        r["global_diag"]["dominant_wavelength_m"] if r["global_diag"] else None
+                    ),
+                    "canonical_band_dominant_wavelength_m": (
+                        r["band_diag"]["dominant_wavelength_m"] if r["band_diag"] else None
+                    ),
+                    "spectrally_eligible": r["band_diag"] is not None,
+                    "diagnostic_reason": (
+                        "NATURAL_ELIGIBLE_BUT_NOT_SPATIALLY_INDEPENDENT_SELECTED"
+                        if r["band_diag"] is not None
+                        else "NATURAL_ELIGIBLE_BUT_SPECTRALLY_INELIGIBLE_IN_CANONICAL_BAND"
+                    ),
+                }
+            )
+    for r in legacy_records:
+        tile = r["tile"]
+        noncanonical_rows.append(
+            {
+                "tile_id": tile.tile_id,
+                "support_scale_m": "2000m",
+                "tile_size_m": tile.tile_size_m,
+                "center_x_m": tile.center_x_m,
+                "center_y_m": tile.center_y_m,
+                "valid_fraction": tile.valid_fraction,
+                "natural_bedform_validation_status": r["natural_status"].status,
+                "global_dominant_wavelength_m": legacy_global_diag_by_tile_id[tile.tile_id][
+                    "dominant_wavelength_m"
+                ],
+                "canonical_band_dominant_wavelength_m": None,
+                "spectrally_eligible": None,
+                "diagnostic_reason": "LEGACY_MAR022_TOP5_DISTURBED_DETAILED_DIAGNOSTIC",
+            }
+        )
+    noncanonical_diagnostics_df = pd.DataFrame(noncanonical_rows)
+    noncanonical_diagnostics_path = bedforms_dir / "noncanonical_disturbed_tile_diagnostics.parquet"
+    noncanonical_diagnostics_df.to_parquet(noncanonical_diagnostics_path, index=False)
+    pd.DataFrame(diagnostic_result["bedform_rows"]["2018"]).to_parquet(
+        bedforms_dir / "noncanonical_diagnostic_bedform_observations_2018.parquet", index=False
     )
-    canonical_bedform_count_2020 = sum(
-        1
-        for b in bedform_rows_2020
-        if b["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
+    pd.DataFrame(diagnostic_result["bedform_rows"]["2020"]).to_parquet(
+        bedforms_dir / "noncanonical_diagnostic_bedform_observations_2020.parquet", index=False
+    )
+    pd.DataFrame(diagnostic_nominal_matches).to_parquet(
+        bedforms_dir / "noncanonical_diagnostic_crest_matches.parquet", index=False
     )
     print(
-        f"  canonical (>=30 m) bedforms -- 2018: {canonical_bedform_count_2018}, "
-        f"2020: {canonical_bedform_count_2020}",
+        f"  -> {noncanonical_diagnostics_path} ({len(noncanonical_diagnostics_df)} rows)",
         flush=True,
     )
-    print(
-        f"  crest-match candidates: {len(all_candidate_pairs)}, canonical matches: "
-        f"{len(all_canonical_matches)}",
-        flush=True,
-    )
-
-    # --- Section 24: tabular outputs -------------------------------------------------------------
-    print("Writing tabular outputs (Section 24)...", flush=True)
-    tile_spectral_2018_path = bedforms_dir / "tile_spectral_morphometry_2018.parquet"
-    tile_spectral_2020_path = bedforms_dir / "tile_spectral_morphometry_2020.parquet"
-    pd.DataFrame(tile_rows_2018).to_parquet(tile_spectral_2018_path, index=False)
-    pd.DataFrame(tile_rows_2020).to_parquet(tile_spectral_2020_path, index=False)
-
-    bedforms_2018_path = bedforms_dir / "individual_bedforms_2018.parquet"
-    bedforms_2020_path = bedforms_dir / "individual_bedforms_2020.parquet"
-    pd.DataFrame(bedform_rows_2018).to_parquet(bedforms_2018_path, index=False)
-    pd.DataFrame(bedform_rows_2020).to_parquet(bedforms_2020_path, index=False)
 
     candidates_path = bedforms_dir / "crest_match_candidates.parquet"
     canonical_matches_path = bedforms_dir / "canonical_crest_matches.parquet"
-    candidates_df = pd.DataFrame(all_candidate_pairs)
-    canonical_matches_df = pd.DataFrame(all_canonical_matches)
+    if canonical_available:
+        candidates_df = pd.DataFrame(canonical_result["pairs_by_tolerance"]["NOMINAL"])
+        canonical_matches_df = pd.DataFrame(nominal_matches)
+    else:
+        candidates_df = pd.DataFrame(
+            columns=["epoch1_crest_id", "epoch2_crest_id", "match_status", "rejection_reason"]
+        )
+        canonical_matches_df = pd.DataFrame(
+            columns=[
+                "epoch1_crest_id",
+                "epoch2_crest_id",
+                "match_status",
+                "matching_stability_status",
+            ]
+        )
     candidates_df.to_parquet(candidates_path, index=False)
     canonical_matches_df.to_parquet(canonical_matches_path, index=False)
-    print(f"  -> {tile_spectral_2018_path}, {tile_spectral_2020_path}", flush=True)
-    print(f"  -> {bedforms_2018_path}, {bedforms_2020_path}", flush=True)
+    stable_matches_df = pd.DataFrame(stable_matches)
     print(f"  -> {candidates_path}, {canonical_matches_path}", flush=True)
 
-    # --- Section 18: source-interpretation comparator --------------------------------------------
-    print("Comparing detected crests to source interpretation (Section 18)...", flush=True)
-    detected_2020_gdf = (
-        gpd.GeoDataFrame(
-            crest_points_2020,
+    # --- Section 18: source-interpretation comparator -- canonical natural detections only -----
+    print(
+        "Comparing CANONICAL detected crests to source interpretation (Section 12)...", flush=True
+    )
+    if canonical_available and canonical_result["crest_points"]["2020"]:
+        crest_points_2020_canonical = canonical_result["crest_points"]["2020"]
+        detected_2020_gdf = gpd.GeoDataFrame(
+            crest_points_2020_canonical,
             geometry=gpd.points_from_xy(
-                [c["x"] for c in crest_points_2020], [c["y"] for c in crest_points_2020]
+                [c["x"] for c in crest_points_2020_canonical],
+                [c["y"] for c in crest_points_2020_canonical],
             ),
             crs=working_crs,
         )
-        if crest_points_2020
-        else gpd.GeoDataFrame(
-            columns=["point_id", "x", "y", "crest_azimuth_deg"], geometry=[], crs=working_crs
-        )
-    )
-    detected_2020_canonical_gdf = (
-        detected_2020_gdf[
+        detected_2020_canonical_gdf = detected_2020_gdf[
             detected_2020_gdf["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
         ]
-        if not detected_2020_gdf.empty
-        else detected_2020_gdf
-    )
+    else:
+        detected_2020_canonical_gdf = gpd.GeoDataFrame(
+            columns=["point_id", "x", "y", "crest_azimuth_deg"], geometry=[], crs=working_crs
+        )
     comparator_status, comparator_df = (
         bedform_interpretation.compare_detected_crests_to_interpretation(
             detected_2020_canonical_gdf, natural_interp
         )
     )
+    comparator_summary = bedform_interpretation.summarize_comparator_results(comparator_df)
     comparator_path = bedforms_dir / "source_bedform_comparator.parquet"
     comparator_df.to_parquet(comparator_path, index=False)
-    print(f"  {comparator_status} -> {comparator_path}", flush=True)
+    print(
+        f"  {comparator_status} | correspondence: {comparator_summary['correspondence_status']} "
+        f"-> {comparator_path}",
+        flush=True,
+    )
 
-    # --- Section 19-22: figures -------------------------------------------------------------------
-    print("Rendering bedform morphometry map (Section 19)...", flush=True)
-    tile_summaries_df = pd.DataFrame(tile_summaries)
+    # --- Section 15: figures ---------------------------------------------------------------------
+    print("Rendering canonical bedform morphometry map (Section 15)...", flush=True)
+    if canonical_available:
+        canonical_tile_summaries_df = pd.DataFrame(canonical_result["tile_summaries"])
+        morphometry_unavailable_message = None
+        morphometry_transects = canonical_result["representative_transects"]
+    else:
+        canonical_tile_summaries_df = pd.DataFrame(
+            columns=[
+                "tile_id",
+                "center_x_m",
+                "center_y_m",
+                "tile_size_m",
+                "natural_bedform_validation_status",
+                "dominant_wavelength_m",
+            ]
+        )
+        morphometry_unavailable_message = (
+            "CANONICAL_NATURAL_BEDFORM_VALIDATION_NOT_DEMONSTRATED -- no natural, spectrally-"
+            "eligible, spatially-independent tile at 2000 m or 1000 m"
+        )
+        morphometry_transects = []
     morphometry_map_path = bedform_maps.render_bedform_morphometry_map(
         background_elevation=aligned2020.elevation,
         background_valid=aligned2020.valid_mask,
         transform=aligned2020.transform,
-        canonical_tiles_df=tile_summaries_df,
-        transect_endpoints=representative_transects,
+        canonical_tiles_df=canonical_tile_summaries_df,
+        transect_endpoints=morphometry_transects,
         output_path=maps_dir / "sheringham_shoal_2020_bedform_morphometry.png",
-        title="Sheringham Shoal 2020 -- Bedform Morphometry",
+        title="Sheringham Shoal 2020 -- Canonical Natural Bedform Morphometry",
+        unavailable_message=morphometry_unavailable_message,
     )
     print(f"  -> {morphometry_map_path}", flush=True)
 
-    print("Rendering multi-epoch bedform change map (Section 20)...", flush=True)
+    print("Rendering diagnostic (noncanonical) bedform morphometry map (Section 15)...", flush=True)
+    diagnostic_tile_summaries_df = pd.DataFrame(diagnostic_result["tile_summaries"])
+    diagnostic_morphometry_map_path = bedform_maps.render_bedform_morphometry_map(
+        background_elevation=aligned2020.elevation,
+        background_valid=aligned2020.valid_mask,
+        transform=aligned2020.transform,
+        canonical_tiles_df=diagnostic_tile_summaries_df,
+        transect_endpoints=diagnostic_result["representative_transects"],
+        output_path=maps_dir / "sheringham_shoal_2020_bedform_diagnostics_noncanonical.png",
+        title="Sheringham disturbed-tile bedform diagnostics -- NONCANONICAL",
+    )
+    print(f"  -> {diagnostic_morphometry_map_path}", flush=True)
+
+    print("Rendering canonical multi-epoch displacement map (Section 15)...", flush=True)
+    if canonical_available:
+        change_crests_2018 = [
+            (c["x"], c["y"])
+            for c in canonical_result["crest_points"]["2018"]
+            if c["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
+        ]
+        change_crests_2020 = [
+            (c["x"], c["y"])
+            for c in canonical_result["crest_points"]["2020"]
+            if c["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
+        ]
+    else:
+        change_crests_2018, change_crests_2020 = [], []
+    change_unavailable_message = (
+        None
+        if stable_matches
+        else "DEFENSIBLE_OBSERVED_CREST_DISPLACEMENT_NOT_DEMONSTRATED -- zero matches stable "
+        "across all 3 tested tolerance sets"
+    )
     change_map_path = bedform_maps.render_bedform_change_map(
         background_delta_bed_elevation_m=dod_array,
         transform=dod_transform,
-        crests_epoch1_xy=[(c["x"], c["y"]) for c in crest_points_2018],
-        crests_epoch2_xy=[(c["x"], c["y"]) for c in crest_points_2020],
-        matched_pairs=[
-            p
-            for p in all_candidate_pairs
-            if p["match_status"]
-            in (bedform_matching.MATCHED_HIGH_SUPPORT, bedform_matching.MATCHED_WITH_LIMITATIONS)
-        ],
+        crests_epoch1_xy=change_crests_2018,
+        crests_epoch2_xy=change_crests_2020,
+        matched_pairs=stable_matches,
         epoch1_label="2018",
         epoch2_label="2020",
         output_path=maps_dir / "sheringham_shoal_2018_2020_bedform_change.png",
-        title="Sheringham Shoal 2018-2020 -- Observed Bedform Change",
+        title="Sheringham Shoal 2018-2020 -- Canonical Stable Observed Bedform Change",
+        unavailable_message=change_unavailable_message,
     )
     print(f"  -> {change_map_path}", flush=True)
 
-    print("Rendering per-epoch morphometry statistics (Section 21)...", flush=True)
-    canonical_bedforms_2018_df = pd.DataFrame(
-        [
-            b
-            for b in bedform_rows_2018
-            if b["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
-        ]
+    print("Rendering diagnostic (noncanonical) displacement map (Section 15)...", flush=True)
+    diagnostic_change_crests_2018 = [
+        (c["x"], c["y"])
+        for c in diagnostic_result["crest_points"]["2018"]
+        if c["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
+    ]
+    diagnostic_change_crests_2020 = [
+        (c["x"], c["y"])
+        for c in diagnostic_result["crest_points"]["2020"]
+        if c["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
+    ]
+    diagnostic_change_map_path = bedform_maps.render_bedform_change_map(
+        background_delta_bed_elevation_m=dod_array,
+        transform=dod_transform,
+        crests_epoch1_xy=diagnostic_change_crests_2018,
+        crests_epoch2_xy=diagnostic_change_crests_2020,
+        matched_pairs=diagnostic_nominal_matches,
+        epoch1_label="2018",
+        epoch2_label="2020",
+        output_path=maps_dir
+        / "sheringham_shoal_2018_2020_bedform_change_diagnostic_noncanonical.png",
+        title="Sheringham disturbed-tile crest-matching diagnostics -- NONCANONICAL",
+        subdued=True,
     )
-    canonical_bedforms_2020_df = pd.DataFrame(
-        [
-            b
-            for b in bedform_rows_2020
-            if b["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
-        ]
+    print(f"  -> {diagnostic_change_map_path}", flush=True)
+
+    print("Rendering canonical natural morphometry statistics (Section 21)...", flush=True)
+    canonical_bedforms_2018_df = (
+        pd.DataFrame(
+            [
+                b
+                for b in canonical_result["bedform_rows"]["2018"]
+                if b["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
+            ]
+        )
+        if canonical_available
+        else pd.DataFrame()
+    )
+    canonical_bedforms_2020_df = (
+        pd.DataFrame(
+            [
+                b
+                for b in canonical_result["bedform_rows"]["2020"]
+                if b["scale_classification"] == bedform_extraction.SANDBED_SAND_WAVE_SCALE
+            ]
+        )
+        if canonical_available
+        else pd.DataFrame()
     )
     statistics_map_path = bedform_maps.render_bedform_statistics(
         bedforms_epoch1_df=canonical_bedforms_2018_df,
@@ -8021,22 +8391,26 @@ def _cmd_build_bedform_morphodynamics_poc(args: argparse.Namespace) -> int:
         epoch1_label="2018",
         epoch2_label="2020",
         output_path=maps_dir / "sheringham_shoal_bedform_statistics.png",
-        title="Sheringham Shoal -- Canonical Bedform Morphometry Statistics",
+        title="Sheringham Shoal -- Canonical Natural Bedform Morphometry Statistics",
     )
     print(f"  -> {statistics_map_path}", flush=True)
 
     displacement_stats_path = None
-    if len(canonical_matches_df) >= 3:
-        print("Rendering observed-displacement statistics (Section 22)...", flush=True)
+    if len(stable_matches_df) >= 3:
+        print(
+            "Rendering observed-displacement statistics from STABLE matches only (Section 22)...",
+            flush=True,
+        )
         displacement_stats_path = bedform_maps.render_displacement_statistics(
-            canonical_matches_df=canonical_matches_df,
+            canonical_matches_df=stable_matches_df,
             output_path=maps_dir / "sheringham_shoal_observed_crest_displacement_statistics.png",
-            title="Sheringham Shoal -- Observed Apparent Crest Displacement",
+            title="Sheringham Shoal -- Observed Apparent Crest Displacement (Stable Canonical "
+            "Matches)",
         )
         print(f"  -> {displacement_stats_path}", flush=True)
     else:
         print(
-            f"  skipped: only {len(canonical_matches_df)} canonical matches (<3 required)",
+            f"  skipped: only {len(stable_matches_df)} stable canonical matches (<3 required)",
             flush=True,
         )
 
@@ -8046,21 +8420,22 @@ def _cmd_build_bedform_morphodynamics_poc(args: argparse.Namespace) -> int:
     if gpkg_path.exists():
         gpkg_path.unlink()
 
-    if tile_summaries:
+    if canonical_available and canonical_result["tile_summaries"]:
         tiles_gdf = gpd.GeoDataFrame(
-            tile_summaries_df,
-            geometry=[
-                shapely_box(
-                    row["center_x_m"] - row["tile_size_m"] / 2,
-                    row["center_y_m"] - row["tile_size_m"] / 2,
-                    row["center_x_m"] + row["tile_size_m"] / 2,
-                    row["center_y_m"] + row["tile_size_m"] / 2,
-                )
-                for _, row in tile_summaries_df.iterrows()
-            ],
+            canonical_tile_summaries_df,
+            geometry=[_tile_box_from_row(row) for _, row in canonical_tile_summaries_df.iterrows()],
             crs=working_crs,
         )
         tiles_gdf.to_file(gpkg_path, driver="GPKG", layer="canonical_validation_tiles")
+    if not noncanonical_diagnostics_df.empty:
+        noncanonical_tiles_gdf = gpd.GeoDataFrame(
+            noncanonical_diagnostics_df,
+            geometry=[_tile_box_from_row(row) for _, row in noncanonical_diagnostics_df.iterrows()],
+            crs=working_crs,
+        )
+        noncanonical_tiles_gdf.to_file(
+            gpkg_path, driver="GPKG", layer="noncanonical_diagnostic_tiles"
+        )
 
     def _extrema_gdf(crest_points, trough_points):
         rows = [{**c, "extremum_type": "crest"} for c in crest_points] + [
@@ -8074,17 +8449,21 @@ def _cmd_build_bedform_morphodynamics_poc(args: argparse.Namespace) -> int:
         frame = pd.DataFrame(rows).drop(columns=["x", "y"])
         return gpd.GeoDataFrame(frame, geometry=geometry, crs=working_crs)
 
-    extrema_2018_gdf = _extrema_gdf(crest_points_2018, trough_points_2018)
-    extrema_2020_gdf = _extrema_gdf(crest_points_2020, trough_points_2020)
-    if not extrema_2018_gdf.empty:
-        extrema_2018_gdf.to_file(gpkg_path, driver="GPKG", layer="bedform_extrema_2018")
-    if not extrema_2020_gdf.empty:
-        extrema_2020_gdf.to_file(gpkg_path, driver="GPKG", layer="bedform_extrema_2020")
+    if canonical_available:
+        extrema_2018_gdf = _extrema_gdf(
+            canonical_result["crest_points"]["2018"], canonical_result["trough_points"]["2018"]
+        )
+        extrema_2020_gdf = _extrema_gdf(
+            canonical_result["crest_points"]["2020"], canonical_result["trough_points"]["2020"]
+        )
+        if not extrema_2018_gdf.empty:
+            extrema_2018_gdf.to_file(gpkg_path, driver="GPKG", layer="bedform_extrema_2018")
+        if not extrema_2020_gdf.empty:
+            extrema_2020_gdf.to_file(gpkg_path, driver="GPKG", layer="bedform_extrema_2020")
 
-    if all_candidate_pairs:
         matched_only = [
             p
-            for p in all_candidate_pairs
+            for p in canonical_result["pairs_by_tolerance"]["NOMINAL"]
             if p["match_status"]
             in (bedform_matching.MATCHED_HIGH_SUPPORT, bedform_matching.MATCHED_WITH_LIMITATIONS)
         ]
@@ -8118,21 +8497,22 @@ def _cmd_build_bedform_morphodynamics_poc(args: argparse.Namespace) -> int:
     # --- Section 27: report ---------------------------------------------------------------------
     print("Building bedform morphodynamics POC report (Section 27)...", flush=True)
     displacement_facts: dict[str, Any] = {
-        "Canonical matched crests": len(canonical_matches_df),
+        "Nominal canonical matches": len(nominal_matches),
+        "Stable-across-all-3-tolerances matches": len(stable_matches),
         "OBSERVED_CREST_DISPLACEMENT_2018_2020": bedform_matching.OBSERVED_CREST_DISPLACEMENT,
     }
-    if len(canonical_matches_df):
+    if len(stable_matches_df):
         displacement_facts.update(
             {
-                "Absolute displacement min/median/max (m)": (
-                    f"{canonical_matches_df['absolute_normal_displacement_m'].min():.3f} / "
-                    f"{canonical_matches_df['absolute_normal_displacement_m'].median():.3f} / "
-                    f"{canonical_matches_df['absolute_normal_displacement_m'].max():.3f}"
+                "Absolute displacement min/median/max (m, stable only)": (
+                    f"{stable_matches_df['absolute_normal_displacement_m'].min():.3f} / "
+                    f"{stable_matches_df['absolute_normal_displacement_m'].median():.3f} / "
+                    f"{stable_matches_df['absolute_normal_displacement_m'].max():.3f}"
                 ),
-                "Apparent rate min/median/max (m/yr)": (
-                    f"{canonical_matches_df['apparent_rate_m_per_year'].min():.3f} / "
-                    f"{canonical_matches_df['apparent_rate_m_per_year'].median():.3f} / "
-                    f"{canonical_matches_df['apparent_rate_m_per_year'].max():.3f}"
+                "Apparent rate min/median/max (m/yr, stable only)": (
+                    f"{stable_matches_df['apparent_rate_m_per_year'].min():.3f} / "
+                    f"{stable_matches_df['apparent_rate_m_per_year'].median():.3f} / "
+                    f"{stable_matches_df['apparent_rate_m_per_year'].max():.3f}"
                 ),
                 "Label": bedform_matching.OBSERVED_APPARENT_CREST_DISPLACEMENT_RATE,
                 "Disclaimer": bedform_matching.APPARENT_RATE_DISCLAIMER,
@@ -8144,7 +8524,7 @@ def _cmd_build_bedform_morphodynamics_poc(args: argparse.Namespace) -> int:
         + contract["required_fields_multi_epoch_change"]
     ]
     report_blocks = bedform_report.build_bedform_morphodynamics_report_blocks(
-        project_title="Sheringham Shoal -- Sand-Wave/Bedform Morphodynamics POC",
+        project_title="Sheringham Shoal -- Sand-Wave/Bedform Morphodynamics POC (MAR-022A)",
         source_data_facts={
             "2018 source": f"{sheringham_2018_provider.DATASET_TITLE} "
             f"({len(acq2018.xyz_entry_names)} XYZ parts, survey epoch {acq2018.survey_period})",
@@ -8154,95 +8534,115 @@ def _cmd_build_bedform_morphodynamics_poc(args: argparse.Namespace) -> int:
             f"{interp_acq.package_bytes:,} bytes",
         },
         canonical_support_facts={
-            "Qualifying 2000 m tiles": len(tiles_2000),
-            "Qualifying 1000 m tiles": len(tiles_1000),
-            "Best valid fraction": f"{best_valid_fraction:.4f}",
-            "Tile size used for detailed analysis (m)": tile_size_used_m,
-            "Exploratory fallback used": exploratory_only,
-            "Tiles selected for detailed analysis": len(selected),
+            "2000 m: support / natural-eligible / spectrally-eligible / selected": (
+                f"{pass_2000['support_tile_count']} / {len(pass_2000['natural_records'])} / "
+                f"{pass_2000['spectrally_eligible_count']} / {len(pass_2000['selected_records'])}"
+            ),
+            "1000 m: support / natural-eligible / spectrally-eligible / selected": (
+                f"{pass_1000['support_tile_count']} / {len(pass_1000['natural_records'])} / "
+                f"{pass_1000['spectrally_eligible_count']} / {len(pass_1000['selected_records'])}"
+            ),
+            "Canonical scale used": canonical_scale_used_m if canonical_available else "NONE",
         },
         natural_vs_anthropogenic_facts={
-            "Natural-seabed eligible tiles": natural_eligible_count,
-            "Anthropogenic-disturbance-present tiles": anthropogenic_excluded_count,
             "Natural interpretation features (sand-wave crest)": len(natural_interp),
             "Anthropogenic interpretation features": len(anthropogenic_interp),
             "Unclassified interpretation features": len(unclassified_interp),
-            **(
-                {"Caveat (tile selection vs. natural context)": natural_context_caveat}
-                if natural_context_caveat
-                else {}
-            ),
+            "Diagnostic (legacy top-5) tiles, natural-eligible count": legacy_natural_count,
         },
         epoch1_morphometry_facts={
-            "Canonical (>=30 m) bedforms": canonical_bedform_count_2018,
-            "Small bedforms (<30 m, QA only)": len(bedform_rows_2018)
-            - canonical_bedform_count_2018,
+            "Canonical natural (>=30 m) observations": canonical_bedform_count_2018,
+            "Diagnostic disturbed-tile observations (noncanonical)": diagnostic_bedform_count_2018,
         },
         epoch2_morphometry_facts={
-            "Canonical (>=30 m) bedforms": canonical_bedform_count_2020,
-            "Small bedforms (<30 m, QA only)": len(bedform_rows_2020)
-            - canonical_bedform_count_2020,
+            "Canonical natural (>=30 m) observations": canonical_bedform_count_2020,
+            "Diagnostic disturbed-tile observations (noncanonical)": diagnostic_bedform_count_2020,
         },
         crest_matching_facts={
-            "Candidate pairs considered": len(candidates_df),
-            "Canonical matches (HIGH_SUPPORT + WITH_LIMITATIONS)": len(canonical_matches_df),
-            "Ambiguous (no canonical match)": int(
-                (
-                    candidates_df["match_status"] == bedform_matching.AMBIGUOUS_NO_CANONICAL_MATCH
-                ).sum()
-            )
-            if len(candidates_df)
-            else 0,
+            "Nominal canonical candidate pairs": len(candidates_df),
+            "Nominal canonical matches": len(nominal_matches),
+            "Stable across CONSERVATIVE+NOMINAL+PERMISSIVE": len(stable_matches),
+            "Tolerance sets tested": ", ".join(t.name for t in bedform_matching.TOLERANCE_SETS),
         },
         observed_displacement_facts=displacement_facts,
-        dod_supporting_context_text="For each canonical matched crest, the ALREADY-ACCEPTED "
-        "MAR-021 DoD (never recomputed here) is sampled at the crest position and at a fixed "
-        "offset either side along that pair's own local cross-crest normal, purely as "
+        dod_supporting_context_text="For each STABLE canonical matched crest, the ALREADY-"
+        "ACCEPTED MAR-021 DoD (never recomputed here) is sampled at the crest position and at a "
+        "fixed offset either side along that pair's own local cross-crest normal, purely as "
         "descriptive supporting context. A perfect raising/lowering dipole is never required, "
-        "and this evidence never determines match acceptance.",
+        "and this evidence never determines match acceptance or stability.",
         source_interpretation_comparison_facts={
             "Status": comparator_status,
-            "Compared detected crests": len(comparator_df),
-            "Median nearest distance (m)": (
-                f"{comparator_df['nearest_distance_m'].median():.2f}"
-                if len(comparator_df)
+            "Correspondence": comparator_summary["correspondence_status"] or "ADEQUATE",
+            "Compared (canonical natural detections)": comparator_summary["compared_count"],
+            "Median / p95 nearest distance (m)": (
+                f"{comparator_summary['median_nearest_distance_m']:.2f} / "
+                f"{comparator_summary['p95_nearest_distance_m']:.2f}"
+                if comparator_summary["compared_count"]
+                else "n/a"
+            ),
+            "Fraction within 25 / 50 / 100 m": (
+                f"{comparator_summary['fraction_within_25m']:.2%} / "
+                f"{comparator_summary['fraction_within_50m']:.2%} / "
+                f"{comparator_summary['fraction_within_100m']:.2%}"
+                if comparator_summary["compared_count"]
                 else "n/a"
             ),
         },
         limitations=[
-            "Transect-derived point geometry only -- no continuous 2D crest lines are fabricated "
-            "from sparse profile detections.",
+            "Transect-derived point OBSERVATIONS only (TRANSECT_DERIVED_BEDFORM_OBSERVATION / "
+            "TRANSECT_DERIVED_CREST_OBSERVATION) -- never independent, unique physical crest "
+            "lines; no continuous 2D crest-line reconstruction exists in this POC.",
             "Crest matching is scoped to within one canonical tile -- never a whole-site search "
             "across clearly different bedform systems.",
             "The historical 2013-2014 ~10 m migration context for this site is external "
             "background only and was never used to calibrate matching tolerances or interpret "
             "2018-2020 displacement.",
-            "No numeric match-confidence score is produced; only the three categorical statuses.",
-            *([natural_context_caveat] if natural_context_caveat else []),
+            "No numeric match-confidence score is produced; only categorical match and stability "
+            "statuses.",
+            "The diagnostic disturbed-tile figures/tables are explicitly NONCANONICAL -- never "
+            "used for the primary observed-displacement claim.",
         ],
         input_contract_summary=input_contract_summary,
     )
     report_path = report_dir / "sheringham_shoal_bedform_morphodynamics_poc.html"
     report_path.write_text(
         bedform_report.render_blocks_html(
-            report_blocks, title="Sheringham Shoal -- Sand-Wave/Bedform Morphodynamics POC"
+            report_blocks,
+            title="Sheringham Shoal -- Sand-Wave/Bedform Morphodynamics POC (MAR-022A)",
         ),
         encoding="utf-8",
     )
     print(f"  -> {report_path}", flush=True)
 
-    # --- Section 25: validation questions -------------------------------------------------------
-    question_a = "YES" if tiles_1000 else "NO"
-    question_b = (
-        "YES" if any(t.get("dominant_wavelength_m") is not None for t in tile_summaries) else "NO"
+    # --- Section 13: validation questions -- causally consistent ------------------------------
+    questions = _derive_bedform_validation_questions(
+        has_1000m_support=pass_1000["support_tile_count"] > 0,
+        has_support_at_either_scale=(
+            pass_2000["support_tile_count"] + pass_1000["support_tile_count"]
+        )
+        > 0,
+        canonical_bedform_count=canonical_bedform_count_2018 + canonical_bedform_count_2020,
+        canonical_selected_tile_count=(
+            len(canonical_pass["selected_records"]) if canonical_available else 0
+        ),
+        stable_match_count=len(stable_matches),
     )
-    question_c = (
-        "YES" if (canonical_bedform_count_2018 + canonical_bedform_count_2020) >= 3 else "NO"
-    )
-    question_d = "YES" if natural_eligible_count > 0 else "NO"
-    question_e = "YES" if len(canonical_matches_df) > 0 else "NO"
-    question_f = "YES" if len(canonical_matches_df) > 0 else "NO"
-    question_g = "NO"
+    question_a = questions["a"]
+    question_b = questions["b"]
+    question_c = questions["c"]
+    question_d = questions["d"]
+    question_e = questions["e"]
+    question_f = questions["f"]
+    question_g = questions["g"]
+    question_d_reason = None
+    if question_d == "NO":
+        question_d_reason = (
+            "CANONICAL_NATURAL_BEDFORM_VALIDATION_NOT_DEMONSTRATED: no tile at 2000 m or 1000 m "
+            "support scale was simultaneously >=90% valid, NATURAL_SEABED_ELIGIBLE, and "
+            "spectrally eligible within the canonical 30 m <= wavelength <= tile_size/3 band. "
+            "This does not invalidate the generic engine -- the disturbed-tile diagnostics above "
+            "remain useful POC evidence."
+        )
     _write_validation(
         question_a,
         question_b,
@@ -8251,58 +8651,83 @@ def _cmd_build_bedform_morphodynamics_poc(args: argparse.Namespace) -> int:
         question_e,
         question_f,
         question_g,
-        question_d_reason=natural_context_caveat,
+        question_d_reason=question_d_reason,
     )
     print(f"  -> {validation_path}", flush=True)
 
-    # --- Section 31: final summary ---------------------------------------------------------------
+    # --- Section 18: final summary ---------------------------------------------------------------
     print()
-    print("=== Sheringham Shoal Sand-Wave/Bedform Morphodynamics POC (MAR-022) ===")
+    print("=== Sheringham Shoal Sand-Wave/Bedform Morphodynamics POC (MAR-022A) ===")
     print()
-    print("## Canonical support")
+    print("## 2000 m canonical pass")
     print(
-        f"  2000 m qualifying tiles: {len(tiles_2000)} | 1000 m qualifying tiles: {len(tiles_1000)}"
+        f"  support={pass_2000['support_tile_count']} "
+        f"natural_eligible={len(pass_2000['natural_records'])} "
+        f"spectral_eligible={pass_2000['spectrally_eligible_count']} "
+        f"selected={len(pass_2000['selected_records'])}"
     )
     print()
-    print("## Natural-seabed support")
+    print("## 1000 m canonical pass")
     print(
-        f"  eligible: {natural_eligible_count} | excluded (anthropogenic): "
-        f"{anthropogenic_excluded_count}"
+        f"  support={pass_1000['support_tile_count']} "
+        f"natural_eligible={len(pass_1000['natural_records'])} "
+        f"spectral_eligible={pass_1000['spectrally_eligible_count']} "
+        f"selected={len(pass_1000['selected_records'])}"
     )
     print()
-    print("## 2018")
-    print(f"  canonical bedforms: {canonical_bedform_count_2018}")
+    print("## Diagnostic disturbed tiles (NONCANONICAL)")
+    print(
+        f"  count={len(legacy_records)} bedform_observations_2018={diagnostic_bedform_count_2018} "
+        f"bedform_observations_2020={diagnostic_bedform_count_2020}"
+    )
     print()
-    print("## 2020")
-    print(f"  canonical bedforms: {canonical_bedform_count_2020}")
-    print()
-    print("## Matching")
-    print(f"  candidates: {len(candidates_df)} | canonical matches: {len(canonical_matches_df)}")
-    if len(canonical_matches_df):
+    print("## Canonical natural morphometry")
+    print(
+        f"  observation count -- 2018: {canonical_bedform_count_2018}, "
+        f"2020: {canonical_bedform_count_2020}"
+    )
+    if canonical_available and len(canonical_bedforms_2020_df):
         print(
-            f"  displacement min/median/p95/max (m): "
-            f"{canonical_matches_df['absolute_normal_displacement_m'].min():.3f}/"
-            f"{canonical_matches_df['absolute_normal_displacement_m'].median():.3f}/"
-            f"{canonical_matches_df['absolute_normal_displacement_m'].quantile(0.95):.3f}/"
-            f"{canonical_matches_df['absolute_normal_displacement_m'].max():.3f}"
+            "  2020 wavelength median/p95 (m): "
+            f"{canonical_bedforms_2020_df['wavelength_m'].median():.1f} / "
+            f"{canonical_bedforms_2020_df['wavelength_m'].quantile(0.95):.1f}"
         )
         print(
-            f"  apparent rate min/median/p95/max (m/yr): "
-            f"{canonical_matches_df['apparent_rate_m_per_year'].min():.3f}/"
-            f"{canonical_matches_df['apparent_rate_m_per_year'].median():.3f}/"
-            f"{canonical_matches_df['apparent_rate_m_per_year'].quantile(0.95):.3f}/"
-            f"{canonical_matches_df['apparent_rate_m_per_year'].max():.3f}"
+            "  2020 height median/p95 (m): "
+            f"{canonical_bedforms_2020_df['wave_height_m'].median():.2f} / "
+            f"{canonical_bedforms_2020_df['wave_height_m'].quantile(0.95):.2f}"
+        )
+    print()
+    print("## Matching")
+    print(
+        f"  nominal match count: {len(nominal_matches)} | stable match count: {len(stable_matches)}"
+    )
+    print(f"  tolerance-sensitive count: {len(nominal_matches) - len(stable_matches)}")
+    if len(stable_matches_df):
+        print(
+            "  displacement (stable only) min/median/p95/max (m): "
+            f"{stable_matches_df['absolute_normal_displacement_m'].min():.3f}/"
+            f"{stable_matches_df['absolute_normal_displacement_m'].median():.3f}/"
+            f"{stable_matches_df['absolute_normal_displacement_m'].quantile(0.95):.3f}/"
+            f"{stable_matches_df['absolute_normal_displacement_m'].max():.3f}"
         )
     print()
     print("## Source comparator")
+    median_dist = comparator_summary["median_nearest_distance_m"]
+    p95_dist = comparator_summary["p95_nearest_distance_m"]
+    print(f"  median/p95 distance (m): {median_dist}/{p95_dist}")
     print(
-        "  available: "
-        f"{comparator_status == bedform_interpretation.SOURCE_BEDFORM_COMPARATOR_AVAILABLE}"
+        f"  fraction <=25/50/100 m: {comparator_summary['fraction_within_25m']}/"
+        f"{comparator_summary['fraction_within_50m']}/{comparator_summary['fraction_within_100m']}"
     )
+    print(f"  correspondence: {comparator_summary['correspondence_status']}")
     print()
+    canonical_morphometry_demonstrated = (
+        "YES" if (question_b == "YES" and question_c == "YES" and question_d == "YES") else "NO"
+    )
     print(
-        "IS GENERIC HIGH-RESOLUTION MBES -> SANDBED BEDFORM MORPHOMETRY DEMONSTRATED ON REAL "
-        f"PROJECT DATA? {'YES' if question_b == 'YES' and question_c == 'YES' else 'NO'}"
+        "IS CANONICAL NATURAL SANDBED MORPHOMETRY DEMONSTRATED ON REAL PROJECT-GRADE MBES? "
+        f"{canonical_morphometry_demonstrated}"
     )
     print(f"IS DEFENSIBLE OBSERVED 2018-2020 CREST DISPLACEMENT DEMONSTRATED? {question_e}")
     return 0
