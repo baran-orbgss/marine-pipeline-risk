@@ -49,6 +49,8 @@ through explicitly rather than assumed from the "LAT" filename token
 alone.
 """
 
+import hashlib
+import io
 import json
 import zlib
 from dataclasses import dataclass
@@ -56,6 +58,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from zipfile import ZIP_STORED, ZipFile, ZipInfo
 
+import geopandas as gpd
 import requests
 
 MDE_SERIES_ID = "TCE-1986"
@@ -397,3 +400,157 @@ def download_sheringham_shoal_2020_hsd_grid(
     already_cached)."""
 
     return _download_single_bundle_entry(raw_dir, MBESHSD_ENTRY_NAME, url=url)
+
+
+# --- MAR-022: the separate "Interpretation Shapefiles" package (confirmed real, distinct from -
+# --- the "Bathymetry Data" bundle above -- the TCE-1986 series page's own "Datasets" list shows -
+# --- 7 separate top-level packages, one of which is literally titled "Interpretation
+# --- Shapefiles") ------------------------------------------------------------------------------
+#
+# Confirmed live via direct browser interaction (the same "Download Dataset" button-click
+# intercept technique already established for the other bundles in this project):
+# `https://www.marinedataexchange.co.uk/pub/TCE/122_1986_Interpretation%20Shapefiles.zip`,
+# confirmed via HEAD request at 121,996 bytes (~119 KB) -- genuinely tiny, so this acquisition is
+# a single ordinary full download (never range-fetched; there is no bandwidth reason to), then
+# extracted whole so `geopandas` can read each `.shp`'s sibling `.dbf`/`.shx`/`.prj` files from
+# local disk (a shapefile is a fileset, not resolvable via a single in-memory byte string).
+#
+# Real inspection of the extracted package (direct `geopandas.read_file` on every layer, never
+# assumed from filenames alone -- MAR-022 Section 6: "Do NOT assume any class exists before
+# inspection") found exactly 5 real shapefiles plus a `_metadata/medin_metadata.xml`:
+#
+#   G201193_20210127_SheringhamShoal_SSS_PointFeatures (146 Point features): `Descriptio` is
+#     always "Jackup location" -- anthropogenic (Section 6's own named "jack-up footprints").
+#   G201193_20210127_SheringhamShoal_SSS_SandWaveCrests_PollardBank (10 LineString features):
+#     `Descriptio` always "Sandwave crest" -- a natural-bedform interpretation, geographically
+#     concentrated in a small (~1.2 km x 0.35 km) area near the southern part of the site.
+#   G201193_20210205_SheringhamShoal_SSS_Exposures (24 Point features): named cable exposures
+#     (e.g. "Exposure_Cable_Route_B"), with `Freespan` Yes/No and `Max height` (m) fields --
+#     anthropogenic (cable infrastructure) context.
+#   G201193_20210205_SheringhamShoal_SSS_LinearFeatures (359 LineString/MultiLineString
+#     features): a MIXED layer -- `Descriptio` in {"Fishing gear", "Rock dump", "Rope",
+#     "Sandwave crest", "Sandwave Crest" (both capitalisations occur in the real data -- a real,
+#     unnormalized source inconsistency, not a transcription error introduced here), "Exposure",
+#     "Unknown_Linear_Feature"}. This is actually the much larger and more spatially extensive
+#     (~6.6 km x 12.2 km) source of natural sand-wave-crest interpretation (270 rows), spanning
+#     the northern/central part of the site -- the dedicated PollardBank file above covers only
+#     one smaller area within the wider site.
+#   G201193_20210205_SheringhamShoal_SSS_PolygonFeatures (46 Polygon features): `Descriptio` in
+#     {"Wreck", "Trenching", "Possible Debris"} -- anthropogenic/uncertain context (Section 6's
+#     own named "cable trenches" among others).
+#
+# No literal "megaripple" or "scour" feature class exists anywhere in this real package -- Section
+# 7 lists these as classes to preserve IF PRESENT, and inspection (not assumption) is what
+# establishes they are not part of this real dataset.
+#
+# All 5 layers share `EPSG:32631` (matches the bathymetry rasters, no CRS reconciliation needed).
+
+INTERPRETATION_SHAPEFILES_URL = (
+    "https://www.marinedataexchange.co.uk/pub/TCE/122_1986_Interpretation%20Shapefiles.zip"
+)
+INTERPRETATION_LAYER_NAMES = (
+    "G201193_20210127_SheringhamShoal_SSS_PointFeatures",
+    "G201193_20210127_SheringhamShoal_SSS_SandWaveCrests_PollardBank",
+    "G201193_20210205_SheringhamShoal_SSS_Exposures",
+    "G201193_20210205_SheringhamShoal_SSS_LinearFeatures",
+    "G201193_20210205_SheringhamShoal_SSS_PolygonFeatures",
+)
+
+
+@dataclass(frozen=True)
+class InterpretationShapefilesAcquisition:
+    source_page_url: str
+    package_url: str
+    package_bytes: int
+    package_sha256: str
+    extracted_dir: Path
+    layer_names: tuple[str, ...]
+    retrieved_at_utc: datetime
+    already_cached: bool
+
+
+def _interpretation_sidecar_path(extracted_dir: Path) -> Path:
+    return extracted_dir / "interpretation_shapefiles.acquisition.json"
+
+
+def download_sheringham_shoal_2020_interpretation_shapefiles(
+    raw_dir: Path, *, url: str = INTERPRETATION_SHAPEFILES_URL
+) -> InterpretationShapefilesAcquisition:
+    """MAR-022 Section 6/30: ONE minimal live acquisition (a single, tiny
+    ~120 KB whole-file download, cached thereafter via a JSON sidecar --
+    the same offline-rerun-safe convention as every other acquisition in
+    this project) of the real "Interpretation Shapefiles" package,
+    extracted whole into `raw_dir / "interpretation_shapefiles"` so every
+    layer's full shapefile fileset is available to `geopandas` on local
+    disk."""
+
+    extracted_dir = raw_dir / "interpretation_shapefiles"
+    sidecar_path = _interpretation_sidecar_path(extracted_dir)
+    expected_files = [
+        f"{name}{ext}" for name in INTERPRETATION_LAYER_NAMES for ext in (".shp", ".dbf", ".shx")
+    ]
+
+    if sidecar_path.exists() and all((extracted_dir / f).exists() for f in expected_files):
+        cached = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        return InterpretationShapefilesAcquisition(
+            source_page_url=MDE_SOURCE_PAGE_URL,
+            package_url=url,
+            package_bytes=cached["package_bytes"],
+            package_sha256=cached["package_sha256"],
+            extracted_dir=extracted_dir,
+            layer_names=INTERPRETATION_LAYER_NAMES,
+            retrieved_at_utc=datetime.fromisoformat(cached["retrieved_at_utc"]),
+            already_cached=True,
+        )
+
+    extracted_dir.mkdir(parents=True, exist_ok=True)
+    response = requests.get(url, timeout=REQUEST_TIMEOUT_S)
+    response.raise_for_status()
+    content = response.content
+    with ZipFile(io.BytesIO(content)) as zf:
+        zf.extractall(extracted_dir)
+
+    package_sha256 = hashlib.sha256(content).hexdigest()
+    retrieved_at_utc = datetime.now(UTC)
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "package_bytes": len(content),
+                "package_sha256": package_sha256,
+                "retrieved_at_utc": retrieved_at_utc.isoformat(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return InterpretationShapefilesAcquisition(
+        source_page_url=MDE_SOURCE_PAGE_URL,
+        package_url=url,
+        package_bytes=len(content),
+        package_sha256=package_sha256,
+        extracted_dir=extracted_dir,
+        layer_names=INTERPRETATION_LAYER_NAMES,
+        retrieved_at_utc=retrieved_at_utc,
+        already_cached=False,
+    )
+
+
+def load_interpretation_layers(extracted_dir: Path) -> dict[str, gpd.GeoDataFrame]:
+    """Reads all 5 real interpretation layers. The `Exposures` layer (see
+    the acquisition docstring above) has no free-text `Descriptio` column
+    of its own -- every one of its rows is, by construction, a cable
+    exposure, so a synthetic `Descriptio="Exposure"` column is added here
+    (matching the same literal tag `LinearFeatures` uses for its own
+    exposure-related rows) purely so every layer can be classified
+    uniformly downstream. This is the ONLY layer-specific adjustment made
+    -- every value is otherwise passed through unmodified from the real
+    shapefile attribute tables."""
+
+    layers: dict[str, gpd.GeoDataFrame] = {}
+    for name in INTERPRETATION_LAYER_NAMES:
+        gdf = gpd.read_file(extracted_dir / f"{name}.shp")
+        if "Descriptio" not in gdf.columns:
+            gdf = gdf.copy()
+            gdf["Descriptio"] = "Exposure"
+        layers[name] = gdf
+    return layers

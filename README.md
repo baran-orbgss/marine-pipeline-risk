@@ -82,6 +82,7 @@ uv run marine-engine build-engineering-evidence-atlas configs/pl854.yaml
 uv run marine-engine build-marine-poc-review-package configs/pl854.yaml
 uv run marine-engine build-highres-terrain-poc configs/sheringham_shoal_2020.yaml
 uv run marine-engine build-seabed-change-poc configs/sheringham_shoal_2020.yaml
+uv run marine-engine build-bedform-morphodynamics-poc configs/sheringham_shoal_2020.yaml
 ```
 
 `ingest-pipeline`, `discover-bathymetry`, `fetch-bathymetry`,
@@ -1796,5 +1797,82 @@ otherwise, never an interactive credential prompt.
   classification is ever created; and the DoD-computation code block is
   structurally independent of the uncertainty/threshold machinery. The
   full offline suite (1145 tests, 25 live/network tests correctly
-  deselected) and repo-wide `ruff format`/`ruff check` pass clean. No
-  further ticket has started.
+  deselected) and repo-wide `ruff format`/`ruff check` pass clean.
+
+- `MAR-022`: the third non-PL854 OrbGSS Marine Module benchmark --
+  `SANDBED_BEDFORM_MORPHOLOGY_AND_OBSERVED_CHANGE`, a new generic
+  `marine_engine.bedforms` package (interpretation classification, natural-
+  vs-anthropogenic tile context, array-based transect/bedform extraction,
+  independent multi-epoch crest matching) built entirely on TOP of the
+  already-accepted MAR-017 morphometry engine (reused unchanged) and the
+  already-accepted MAR-020/021 canonical bathymetry pipeline (re-derived
+  from the same cached sources, never reacquired; the MAR-021 DoD GeoTIFF
+  itself is loaded read-only, never recomputed). One new real, live
+  acquisition: the TCE-1986 series' separate "Interpretation Shapefiles"
+  package (confirmed via the same button-click URL-intercept technique as
+  every other bundle in this project) -- a genuinely tiny (121,996-byte)
+  5-shapefile set, inspected directly (never assumed from filenames) to
+  find 146 "Jackup location" points, 24 named cable exposures, a dedicated
+  10-feature "SandWaveCrests_PollardBank" layer, a 359-feature mixed
+  `LinearFeatures` layer (270 more sand-wave-crest lines plus fishing
+  gear/rock dump/rope/cable-exposure/one unclassified "Unknown_Linear_
+  Feature"), and a 46-feature polygon layer of wrecks/trenching/possible
+  debris -- 280 real features classified `NATURAL_BEDFORM_INTERPRETATION`,
+  303 `ANTHROPOGENIC_DISTURBANCE_CONTEXT`, 2 left honestly
+  `UNCLASSIFIED_INTERPRETATION_FEATURE` (an unmapped descriptor is never
+  assumed either way). Canonical spatial support on this project-grade 1 m
+  MBES turned out to be abundant, not marginal like MAR-017's prior open
+  analogs: 48 qualifying 2000 m tiles and 277 qualifying 1000 m tiles at
+  up to 100% valid fraction. A genuinely interesting, honestly-reported
+  finding: the strict `tile_size/wavelength >= 3` canonical-tile-ranking
+  rule found zero eligible 2000 m tiles, because the tile-level 2D spectral
+  diagnostic's "dominant wavelength" repeatedly locked onto the tile size
+  itself (2000 m) -- residual long-wavelength content a first-order planar
+  detrend cannot fully remove over such a large real window -- and because
+  this project's real anthropogenic infrastructure (cable routes, rock
+  dump) is itself strongly linear, the fallback top-5-by-directional-
+  concentration ranking empirically favoured disturbed tiles over natural
+  ones every time (`natural_bedform_validation_status` came back
+  `ANTHROPOGENIC_DISTURBANCE_PRESENT` for all 5 selected tiles, 0 natural-
+  eligible). This is reported transparently (a dedicated validation-JSON
+  reason string and a report caveat/limitation) rather than re-tuned until
+  a nicer-looking tile appeared. None of this blocked real morphometry:
+  the (unaffected, per-transect) detection recovered 276/287 real
+  canonical (>=30 m) bedforms for 2018/2020 respectively (plus 28/26 small
+  sub-30 m bedforms preserved for QA only, per Section 9's scale
+  separation), and independent multi-epoch crest matching -- spatial
+  proximity + orientation compatibility + wavelength-scale consistency +
+  displacement along a reproducible local cross-crest normal axis, global
+  ambiguity-aware assignment so one epoch-2020 crest can never be claimed
+  by two different 2018 crests, zero DoD involvement in any matching
+  decision -- produced 209 canonical matches (117 `MATCHED_HIGH_SUPPORT`,
+  92 `MATCHED_WITH_LIMITATIONS`, plus 4 genuinely tied pairs correctly
+  left `AMBIGUOUS_NO_CANONICAL_MATCH` rather than forced) out of 16,421
+  candidate pairs considered, with real observed displacement statistics
+  (absolute displacement median 6.0 m, p95 31-38 m; apparent rate median
+  0.48 m/yr) explicitly labelled `OBSERVED_APPARENT_CREST_DISPLACEMENT_
+  RATE` and never compared against this site's own external-only 2013-2014
+  ~10 m historical migration context. Comparing the independently-detected
+  2020 crests against Fugro's own mapped sand-wave-crest interpretation
+  (never used to seed detection) gave a real median nearest-distance of
+  ~494 m -- consistent with the 5 analyzed tiles all sitting in
+  infrastructure-disturbed ground rather than where Fugro's own natural-
+  bedform interpretation was concentrated, not a bug. Two real bugs were
+  found and fixed from actually running the CLI against real data: the
+  source-interpretation feature inventory mixed strings and numbers in one
+  parquet column across different real attribute tables (a genuine
+  `pyarrow.lib.ArrowTypeError`, fixed by stringifying every inventoried
+  value); and the real `LinearFeatures` shapefile has at least one row
+  with a missing/`None` geometry, which crashed the naive per-row azimuth
+  computation used for the source comparator (fixed to skip it, covered by
+  a regression test). Two further map-layout defects -- a title/subtitle
+  collision on the primary morphometry figure, and the multi-epoch change
+  map rendering into little more than half its own canvas for this
+  benchmark's tall/narrow footprint -- were caught by actually looking at
+  the rendered PNGs and fixed the same way as every prior MAR-018/019/020/
+  021 instance of this defect class (explicit title `y=`/`va="top"`
+  placement; deriving figure size from the real content aspect ratio).
+  25 new tests (`test_bedform_morphodynamics_poc.py`) cover the required
+  list; the full offline suite (1170 tests, 25 live/network tests
+  correctly deselected) and repo-wide `ruff format`/`ruff check` pass
+  clean. No further ticket has started.
