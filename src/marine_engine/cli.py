@@ -53,6 +53,13 @@ from marine_engine.evidence_atlas import core as evidence_atlas_core
 from marine_engine.evidence_atlas import maps as evidence_atlas_maps
 from marine_engine.evidence_atlas import poc as evidence_atlas_poc
 from marine_engine.evidence_atlas import report as evidence_atlas_report
+from marine_engine.freespan import contract as fs_contract
+from marine_engine.freespan import maps as fs_maps
+from marine_engine.freespan import nsta_registry as fs_nsta_registry
+from marine_engine.freespan import report as fs_report
+from marine_engine.freespan import structural_handoff as fs_structural_handoff
+from marine_engine.freespan import support_state as fs_support_state
+from marine_engine.freespan import synthetic as fs_synthetic
 from marine_engine.metocean import (
     combined_bed_shear,
     combined_bed_shear_map,
@@ -9838,6 +9845,447 @@ def _cmd_build_burial_exposure_poc(args: argparse.Namespace) -> int:
     return 0
 
 
+def _derive_free_span_poc_validation_questions(
+    *,
+    pipe_bottom_normalization_demonstrated: bool,
+    clearance_computable: bool,
+    defensible_intervals_extracted: bool,
+    unsurveyed_gaps_prevented_from_joining: bool,
+    scenario_creates_and_extends_support_loss: bool,
+    real_nsta_evidence_ingested: bool,
+) -> dict[str, str]:
+    """MAR-025 Section 31: a pure function so G/H/I's mandated NO answers are structurally
+    enforced (asserted) -- this POC never claims PL854 has enough data for a site-specific
+    free-span susceptibility map, never performs a structural DNV-RP-F105/VIV/fatigue
+    assessment, and never produces a failure probability, regardless of what upstream facts
+    say."""
+
+    pl854_site_specific_susceptibility_defensible = False
+    structural_assessment_performed = False
+    future_failure_probability_produced = False
+    assert pl854_site_specific_susceptibility_defensible is False
+    assert structural_assessment_performed is False
+    assert future_failure_probability_produced is False
+
+    return {
+        "question_a_pipe_vertical_reference_normalized_to_pipe_bottom_elevation": (
+            "YES" if pipe_bottom_normalization_demonstrated else "NO"
+        ),
+        "question_b_current_pipe_underside_clearance_computed": (
+            "YES" if clearance_computable else "NO"
+        ),
+        "question_c_defensible_current_free_span_intervals_extracted": (
+            "YES" if defensible_intervals_extracted else "NO"
+        ),
+        "question_d_unsurveyed_gaps_prevented_from_joining_spans": (
+            "YES" if unsurveyed_gaps_prevented_from_joining else "NO"
+        ),
+        "question_e_lowering_scenario_creates_or_extends_support_loss_intervals": (
+            "YES" if scenario_creates_and_extends_support_loss else "NO"
+        ),
+        "question_f_real_authoritative_nsta_observed_free_span_evidence_ingested": (
+            "YES" if real_nsta_evidence_ingested else "NO"
+        ),
+        "question_g_pl854_site_specific_free_span_susceptibility_map_defensible": (
+            "YES" if pl854_site_specific_susceptibility_defensible else "NO"
+        ),
+        "question_h_structural_dnv_rp_f105_viv_fatigue_assessment_performed": (
+            "YES" if structural_assessment_performed else "NO"
+        ),
+        "question_i_future_failure_probability_produced": (
+            "YES" if future_failure_probability_produced else "NO"
+        ),
+    }
+
+
+def _cmd_build_free_span_poc(args: argparse.Namespace) -> int:
+    """MAR-025: generic pipeline free-span geometry and support-loss susceptibility screening
+    POC. Three tracks, kept structurally separate throughout: (A) an explicitly synthetic exact
+    engineering validation case exercising the full generic engine (Sections 3-17); (B) real
+    authoritative NSTA UKCS-wide observed free-span registry evidence, cached/acquired only
+    when the current accepted cache is absent (Sections 18-20); (C) the accepted, already-
+    computed PL854 Table B.1 2018 observed evidence, repackaged and never recomputed (Sections
+    21-22, 27). No structural free-span integrity assessment (DNV-RP-F105/VIV/fatigue/ULS/FLS)
+    is performed anywhere in this command."""
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pl854_study_dir = config.paths.processed_dir / pipeline_id.lower()
+    freespan_poc_dir = config.paths.processed_dir / "freespan_poc"
+    synthetic_dir = freespan_poc_dir / "synthetic"
+    maps_dir = freespan_poc_dir / "maps"
+    gis_dir = freespan_poc_dir / "gis"
+    report_dir = freespan_poc_dir / "report"
+    contracts_dir = freespan_poc_dir / "freespan"
+
+    # ==========================================================================================
+    # Sections 3-17: synthetic exact engineering validation
+    # ==========================================================================================
+    print("Building the synthetic exact engine validation case (Section 17)...")
+    case = fs_synthetic.build_synthetic_free_span_case()
+    synthetic_summary = fs_synthetic.summarize_synthetic_case(case)
+    for key, value in synthetic_summary.items():
+        print(f"  {key}: {value}")
+
+    synthetic_dir.mkdir(parents=True, exist_ok=True)
+    profile_path = metocean_evidence.write_parquet(
+        case.scenario_result["profile_df"], synthetic_dir / "synthetic_pipeline_profile.parquet"
+    )
+    spans_path = metocean_evidence.write_parquet(
+        case.measured_intervals_df, synthetic_dir / "synthetic_measured_free_spans.parquet"
+    )
+    scenario_path = metocean_evidence.write_parquet(
+        case.scenario_result["scenario_intervals_df"],
+        synthetic_dir / "synthetic_support_loss_scenario.parquet",
+    )
+    print(f"  Profile ({len(case.profile_df)} sample(s)) -> {profile_path}")
+    print(f"  Measured free spans ({len(case.measured_intervals_df)}) -> {spans_path}")
+    print(
+        f"  Scenario support-loss intervals "
+        f"({len(case.scenario_result['scenario_intervals_df'])}) -> {scenario_path}"
+    )
+
+    maps_dir.mkdir(parents=True, exist_ok=True)
+    synthetic_map_path = fs_maps.render_free_span_support_map(
+        route=case.route,
+        profile_df=case.profile_df,
+        measured_intervals_df=case.measured_intervals_df,
+        scenario_intervals_df=case.scenario_result["scenario_intervals_df"],
+        output_path=synthetic_dir / "synthetic_free_span_map.png",
+        title=f"Synthetic Pipeline Free-Span Support Map ({fs_synthetic.PROMINENT_DISCLAIMER})",
+    )
+    synthetic_kp_path = fs_maps.render_free_span_kp_view(
+        profile_df=case.scenario_result["profile_df"],
+        measured_intervals_df=case.measured_intervals_df,
+        scenario_intervals_df=case.scenario_result["scenario_intervals_df"],
+        classification_threshold_m=fs_synthetic.CLASSIFICATION_THRESHOLD_M,
+        seabed_lowering_m=case.lowering_input.seabed_lowering_m,
+        output_path=synthetic_dir / "synthetic_free_span_kp_view.png",
+        title=f"Synthetic Pipeline Free-Span KP View ({fs_synthetic.PROMINENT_DISCLAIMER})",
+    )
+    print(f"  Map -> {synthetic_map_path}")
+    print(f"  KP view -> {synthetic_kp_path}")
+
+    # Sections 25 + 28: synthetic GIS, written to both required locations -- every interval
+    # geometry is a real substring of the real synthetic route, never a fabricated geometry.
+    profile_gdf = gpd.GeoDataFrame(
+        case.scenario_result["profile_df"],
+        geometry=gpd.points_from_xy(
+            case.scenario_result["profile_df"]["x_m"], case.scenario_result["profile_df"]["y_m"]
+        ),
+        crs=fs_synthetic.SYNTHETIC_CRS,
+    )
+
+    def _intervals_to_gdf(intervals_df: pd.DataFrame) -> gpd.GeoDataFrame:
+        geometries = [
+            shapely_substring(
+                case.route, float(row["start_chainage_m"]), float(row["end_chainage_m"])
+            )
+            for _, row in intervals_df.iterrows()
+        ]
+        return gpd.GeoDataFrame(intervals_df, geometry=geometries, crs=fs_synthetic.SYNTHETIC_CRS)
+
+    measured_intervals_gdf = _intervals_to_gdf(case.measured_intervals_df)
+    scenario_intervals_gdf = _intervals_to_gdf(case.scenario_result["scenario_intervals_df"])
+
+    def _write_synthetic_gpkg(gpkg_path: Path) -> None:
+        gpkg_path.parent.mkdir(parents=True, exist_ok=True)
+        if gpkg_path.exists():
+            gpkg_path.unlink()
+        case.route_gdf.to_file(gpkg_path, driver="GPKG", layer="asset_route")
+        profile_gdf.to_file(gpkg_path, driver="GPKG", layer="pipeline_profile")
+        measured_intervals_gdf.to_file(
+            gpkg_path, driver="GPKG", layer="measured_free_span_intervals"
+        )
+        scenario_intervals_gdf.to_file(
+            gpkg_path, driver="GPKG", layer="scenario_support_loss_intervals"
+        )
+
+    gis_dir.mkdir(parents=True, exist_ok=True)
+    synthetic_gpkg_path = synthetic_dir / "synthetic_free_span_poc.gpkg"
+    synthetic_screening_gpkg_path = gis_dir / "synthetic_free_span_support_screening.gpkg"
+    _write_synthetic_gpkg(synthetic_gpkg_path)
+    _write_synthetic_gpkg(synthetic_screening_gpkg_path)
+    print(f"  GIS -> {synthetic_gpkg_path}")
+    print(f"  GIS -> {synthetic_screening_gpkg_path}")
+
+    # ==========================================================================================
+    # Sections 18-20: real NSTA UKCS-wide observed free-span registry
+    # ==========================================================================================
+    print("Acquiring/auditing the real NSTA UKCS-wide freespan registry (Sections 18-20)...")
+    nsta_cache_dir = config.paths.raw_dir / "nsta" / "freespans_full_registry"
+    nsta_evidence = fs_nsta_registry.build_real_nsta_evidence(nsta_cache_dir)
+    for registry_layer, info in nsta_evidence["acquisitions"].items():
+        print(
+            f"  {registry_layer}: already_cached={info['already_cached']} -> {info['cache_path']}"
+        )
+    for key, value in nsta_evidence["audit_summary"].items():
+        print(f"  {key}: {value}")
+
+    audit_path = metocean_evidence.write_parquet(
+        nsta_evidence["audit_df"], freespan_poc_dir / "nsta_freespan_registry_audit.parquet"
+    )
+    print(f"  Registry audit -> {audit_path}")
+
+    nsta_gpkg_path = gis_dir / "nsta_observed_freespan_evidence.gpkg"
+    if nsta_gpkg_path.exists():
+        nsta_gpkg_path.unlink()
+    nsta_evidence["registry_gdf"].to_file(
+        nsta_gpkg_path, driver="GPKG", layer="nsta_observed_freespan_evidence"
+    )
+    print(f"  GIS -> {nsta_gpkg_path}")
+
+    example_pipeline, example_count = fs_nsta_registry.select_example_pipeline_by_record_count(
+        nsta_evidence["audit_df"]
+    )
+    nsta_map_path = fs_maps.render_nsta_registry_overview_map(
+        registry_gdf=nsta_evidence["registry_gdf"],
+        example_pipeline_number=example_pipeline,
+        example_record_count=example_count,
+        output_path=maps_dir / "ukcs_observed_pipeline_freespan_evidence.png",
+    )
+    print(
+        f"  Map -> {nsta_map_path} (example pipeline: {example_pipeline}, "
+        f"{example_count} record(s) -- selected by record count only, not a risk indication)"
+    )
+
+    # ==========================================================================================
+    # Sections 21-22, 27: PL854 observed evidence -- reused, never recomputed
+    # ==========================================================================================
+    print("Repackaging the accepted PL854 2018 observed freespan evidence (Sections 21-22, 27)...")
+    pl854_evidence_gpkg = (
+        pl854_study_dir / "freespan_evidence" / "anglia_freespan_spatial_evidence.gpkg"
+    )
+    if not pl854_evidence_gpkg.exists():
+        print(
+            "error: missing required PL854 input -- run "
+            "'marine-engine build-freespan-spatial-evidence configs/pl854.yaml' first: "
+            f"{pl854_evidence_gpkg}",
+            file=sys.stderr,
+        )
+        return 1
+
+    freespans_2018_gdf = evidence_atlas_core.build_observed_freespans_2018_layer(pl854_study_dir)
+    pl854_observed_summary = {
+        "event_count": int(freespans_2018_gdf["source_length_m"].count()),
+        "total_length_m": float(freespans_2018_gdf["source_length_m"].sum()),
+        "max_length_m": float(freespans_2018_gdf["source_length_m"].max()),
+        "max_height_m": float(freespans_2018_gdf["source_height_m"].max()),
+        "asset_scope": sorted(freespans_2018_gdf["asset_scope"].astype(str).unique().tolist()),
+        "individual_line_attribution": sorted(
+            freespans_2018_gdf["individual_line_attribution"].astype(str).unique().tolist()
+        ),
+    }
+    for key, value in pl854_observed_summary.items():
+        print(f"  {key}: {value}")
+
+    pl854_route_layer = evidence_atlas_core.build_pipeline_route_layer(pl854_study_dir)
+    pl854_route = pl854_route_layer.geometry.iloc[0]
+    pl854_map_path = freespan_evidence_map.render_2018_freespan_evidence_map(
+        events_2018_gdf=freespans_2018_gdf,
+        route=pl854_route,
+        output_path=maps_dir / "pl854_2018_observed_freespan_evidence.png",
+        title="PL854/PL855 Corridor — Official 2018 Observed Freespan Evidence",
+    )
+    print(f"  Map -> {pl854_map_path} (individual line attribution unresolved)")
+    pl854_susceptibility_unavailable_reason = (
+        "PL854_SITE_SPECIFIC_FREE_SPAN_SUSCEPTIBILITY_NOT_AVAILABLE (Section 22): no "
+        "high-resolution route bathymetry, measured continuous pipe vertical profile, or "
+        "measured continuous embedment/support profile exists for PL854."
+    )
+    print(f"  {pl854_susceptibility_unavailable_reason}")
+
+    # ==========================================================================================
+    # Sections 16, 29: input contract + structural handoff contract
+    # ==========================================================================================
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+    contract_dict = fs_contract.build_free_span_input_contract()
+    contract_path = contracts_dir / "free_span_input_contract.json"
+    contract_path.write_text(json.dumps(contract_dict, indent=2, default=str), encoding="utf-8")
+
+    handoff_dict = fs_structural_handoff.build_structural_free_span_assessment_handoff_contract()
+    handoff_path = contracts_dir / "structural_free_span_assessment_handoff.json"
+    handoff_path.write_text(json.dumps(handoff_dict, indent=2, default=str), encoding="utf-8")
+    print(f"  Input contract -> {contract_path}")
+    print(f"  Structural handoff contract -> {handoff_path}")
+
+    # ==========================================================================================
+    # Section 31: validation
+    # ==========================================================================================
+    validation = _derive_free_span_poc_validation_questions(
+        pipe_bottom_normalization_demonstrated=bool(
+            abs(
+                case.profile_df["pipe_bottom_elevation_m"].iloc[0]
+                - fs_synthetic.EXPECTED_PIPE_BOTTOM_ELEVATION_M
+            )
+            < 1e-9
+        ),
+        clearance_computable=bool(case.profile_df["clearance_m"].notna().all()),
+        defensible_intervals_extracted=len(case.measured_intervals_df) > 0,
+        unsurveyed_gaps_prevented_from_joining=bool(
+            case.measured_intervals_df["limitations"].notna().any()
+        ),
+        scenario_creates_and_extends_support_loss=(
+            case.scenario_result["new_span_count"] > 0
+            and case.scenario_result["extended_span_count"] > 0
+        ),
+        real_nsta_evidence_ingested=len(nsta_evidence["records"]) > 0,
+    )
+
+    # ==========================================================================================
+    # Section 30: report
+    # ==========================================================================================
+    print("Building the generic free-span support-loss POC report (Section 30)...")
+    blocks = fs_report.build_free_span_report_blocks(
+        project_title="Generic Pipeline Free-Span Geometry & Support-Loss Susceptibility POC",
+        purpose_text=(
+            "Demonstrates the future OrbGSS workflow: operator pipeline vertical profile + "
+            "seabed support profile + pipe geometry -> canonical pipe underside clearance -> "
+            "current unsupported-span geometry -> optional seabed-lowering/support-loss "
+            "scenario -> free-span support-loss susceptibility -> map + KP view + GIS + "
+            "report. Source-reported/observed free-span evidence (NSTA registry, PL854 Table "
+            "B.1) is ingested and audited separately, never used to derive a susceptibility "
+            "result."
+        ),
+        product_boundary_text=(
+            "MAR-025 covers measured/observed free-span geometry, generic support-loss "
+            "susceptibility screening, and real authoritative free-span evidence ingestion. It "
+            "does NOT perform structural free-span integrity assessment -- "
+            f"{fs_structural_handoff.STRUCTURAL_FREE_SPAN_ASSESSMENT_NOT_PERFORMED}. The result "
+            "produced here is "
+            f"{fs_structural_handoff.GEOMETRIC_SUPPORT_CONDITION_AND_SUPPORT_LOSS_SCREENING}."
+        ),
+        operator_input_model_facts={
+            "pipe_vertical_reference": fs_synthetic.PIPE_VERTICAL_REFERENCE,
+            "seabed_sign_convention": fs_synthetic.SEABED_SIGN_CONVENTION,
+            "classification_threshold_m": fs_synthetic.CLASSIFICATION_THRESHOLD_M,
+            "classification_threshold_provenance": (
+                fs_synthetic.CLASSIFICATION_THRESHOLD_PROVENANCE
+            ),
+            "max_measurement_gap_m": fs_synthetic.MAX_MEASUREMENT_GAP_M,
+        },
+        canonical_geometry_facts={
+            "pipe_bottom_elevation_m": fs_synthetic.EXPECTED_PIPE_BOTTOM_ELEVATION_M,
+            "clearance_equation": (
+                "pipe_underside_clearance_m = pipe_bottom_elevation_m - seabed_support_elevation_m"
+            ),
+        },
+        measured_free_span_facts=synthetic_summary,
+        gap_governance_text=(
+            f"An along-route measurement gap exceeding {fs_synthetic.MAX_MEASUREMENT_GAP_M:g} m "
+            "between two unsupported observations is never bridged into one free span -- both "
+            f"resulting intervals are flagged {fs_support_state.SPAN_SPLIT_BY_MEASUREMENT_GAP}. "
+            "The synthetic case demonstrates this directly: "
+            f"{synthetic_summary['gap_split_interval_count']} of "
+            f"{synthetic_summary['recovered_measured_span_count']} recovered measured "
+            "intervals are gap-split halves of what would otherwise misleadingly appear as one "
+            "continuous span."
+        ),
+        support_loss_scenario_facts={
+            "seabed_lowering_m": case.lowering_input.seabed_lowering_m,
+            "lowering_evidence_type": case.lowering_input.evidence_type,
+            "new_span_count": case.scenario_result["new_span_count"],
+            "extended_span_count": case.scenario_result["extended_span_count"],
+            "pipe_vertical_position": (
+                "fixed -- MAR-025 assumes no pipe-response model (Section 13)"
+            ),
+        },
+        synthetic_validation_facts=synthetic_summary,
+        nsta_registry_facts=nsta_evidence["audit_summary"],
+        pl854_observed_context_facts=pl854_observed_summary,
+        structural_boundary_text=(
+            f"{fs_structural_handoff.STRUCTURAL_FREE_SPAN_ASSESSMENT_NOT_PERFORMED}. MAR-025 "
+            "does not claim DNV compliance, allowable span assessment, VIV assessment, fatigue "
+            "assessment, or structural acceptability. See "
+            "freespan/structural_free_span_assessment_handoff.json for what a future "
+            "structural/VIV/fatigue module would additionally require."
+        ),
+        production_transfer_contract_summary=[
+            f"{f['field']}: {f['description']}" for f in fs_contract.STRONGLY_PREFERRED_FIELDS
+        ],
+        limitations=[
+            "Synthetic case is an exact engineering validation of the generic engine, never "
+            "field validation.",
+            "PL854 vs PL855 freespan attribution unresolved (reused from the accepted Table "
+            "B.1 evidence).",
+            "PL854 has no measured continuous pipe vertical profile or seabed support profile "
+            "-- no site-specific free-span susceptibility map is produced for it.",
+            "NSTA registry records for PL854/PL855 specifically are real and confirmed zero "
+            "(investigated, not a data gap this POC works around).",
+            "No structural free-span integrity assessment (DNV-RP-F105/VIV/fatigue/ULS/FLS) is "
+            "performed anywhere in this POC.",
+        ],
+    )
+    report_html = fs_report.render_blocks_html(
+        blocks, title="Generic Pipeline Free-Span Support-Loss POC"
+    )
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "generic_pipeline_free_span_poc.html"
+    report_path.write_text(report_html, encoding="utf-8")
+    print(f"  Report -> {report_path}")
+
+    validation_path = freespan_poc_dir / "freespan_poc_validation.json"
+    validation_path.write_text(json.dumps(validation, indent=2, default=str), encoding="utf-8")
+    print(f"  Validation -> {validation_path}")
+
+    # ==========================================================================================
+    # Section 34: final report
+    # ==========================================================================================
+    print()
+    print("=== Generic Pipeline Free-Span Support-Loss POC (MAR-025) ===")
+    print()
+    print("## Generic engine")
+    print(f"  pipe_vertical_reference: {fs_synthetic.PIPE_VERTICAL_REFERENCE}")
+    print(
+        "  clearance_equation: pipe_underside_clearance_m = pipe_bottom_elevation_m - "
+        "seabed_support_elevation_m"
+    )
+    print(
+        f"  classification_threshold_provenance: {fs_synthetic.CLASSIFICATION_THRESHOLD_PROVENANCE}"
+    )
+    print(f"  max_measurement_gap_m: {fs_synthetic.MAX_MEASUREMENT_GAP_M}")
+    print()
+    print("## Synthetic validation")
+    for key, value in synthetic_summary.items():
+        print(f"  {key}: {value}")
+    print()
+    print("## NSTA real evidence")
+    for key, value in nsta_evidence["audit_summary"].items():
+        print(f"  {key}: {value}")
+    print()
+    print("## PL854")
+    for key, value in pl854_observed_summary.items():
+        print(f"  {key}: {value}")
+    print(
+        f"  explicit_reason_susceptibility_unavailable: {pl854_susceptibility_unavailable_reason}"
+    )
+    print()
+
+    measured_geometry_demonstrated = (
+        validation["question_a_pipe_vertical_reference_normalized_to_pipe_bottom_elevation"]
+        == "YES"
+        and validation["question_b_current_pipe_underside_clearance_computed"] == "YES"
+        and validation["question_c_defensible_current_free_span_intervals_extracted"] == "YES"
+    )
+    print(
+        "IS GENERIC OPERATOR-SUPPLIED PIPE/SEABED PROFILE -> FREE-SPAN GEOMETRY ANALYTICS "
+        f"DEMONSTRATED? {'YES' if measured_geometry_demonstrated else 'NO'}"
+    )
+    print(
+        "IS GENERIC SUPPORT-LOSS SUSCEPTIBILITY SCREENING DEMONSTRATED? "
+        f"{validation['question_e_lowering_scenario_creates_or_extends_support_loss_intervals']}"
+    )
+    print(
+        "IS SITE-SPECIFIC PL854 FREE-SPAN SUSCEPTIBILITY DEFENSIBLE? "
+        f"{validation['question_g_pl854_site_specific_free_span_susceptibility_map_defensible']}"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -10277,6 +10725,25 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_burial_exposure_poc_parser.set_defaults(func=_cmd_build_burial_exposure_poc)
+
+    build_free_span_poc_parser = subparsers.add_parser(
+        "build-free-span-poc",
+        help=(
+            "MAR-025: generic pipeline free-span geometry and support-loss susceptibility "
+            "screening POC -- measured/observed free-span geometry, generic support-loss "
+            "screening, and real authoritative free-span evidence ingestion (NSTA UKCS-wide "
+            "registry, cached/acquired only if absent; PL854 Table B.1 2018 observed evidence, "
+            "reused never recomputed). An explicitly synthetic exact engineering validation "
+            "case exercises the full generic engine, since no verified open project-grade "
+            "pipeline vertical-profile + seabed support-profile dataset is currently available "
+            "in this repo. No structural free-span integrity assessment (DNV-RP-F105/VIV/"
+            "fatigue/ULS/FLS), no failure probability, no risk score, no ML."
+        ),
+    )
+    build_free_span_poc_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_free_span_poc_parser.set_defaults(func=_cmd_build_free_span_poc)
 
     return parser
 

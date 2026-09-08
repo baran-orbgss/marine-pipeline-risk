@@ -2242,5 +2242,75 @@ otherwise, never an interactive credential prompt.
   the screening function's new signature and reordered precedence, and a
   synthetic analog of Barrow's exact real split (unresolved reference +
   unresolved sign together); the full offline suite (1279 tests, up from
-  1259) and repo-wide `ruff format`/`ruff check` pass clean. No further
-  ticket has started.
+  1259) and repo-wide `ruff format`/`ruff check` pass clean.
+- **MAR-025 (generic pipeline free-span geometry & support-loss
+  susceptibility screening POC).** Three tracks kept structurally
+  separate throughout: measured/observed free-span geometry, generic
+  support-loss susceptibility screening, and source-reported/observed
+  free-span evidence -- explicitly excludes structural free-span
+  integrity assessment (`STRUCTURAL_FREE_SPAN_ASSESSMENT_NOT_PERFORMED`;
+  no DNV-RP-F105, VIV, fatigue, ULS/FLS, or failure probability anywhere).
+  Because no verified open project-grade pipeline vertical-profile +
+  seabed support-profile dataset exists in this repo, a new
+  `src/marine_engine/freespan/` package's full generic engine (pipe
+  vertical reference normalization, canonical `pipe_underside_clearance_m
+  = pipe_bottom_elevation_m - seabed_support_elevation_m`, measured
+  support-state classification, free-span interval extraction with gap
+  governance, and support-loss scenario screening) is exercised end to
+  end through an explicitly synthetic, analytically-known engineering
+  validation case (`SYNTHETIC_EXACT_ENGINE_VALIDATION`, never presented
+  as field validation): 20 hand-authored samples along a straight
+  650 m route recover exactly the 3 expected measured free-span
+  intervals (lengths 100/10/10 m, max clearance 0.6 m, the two 10 m
+  spans deliberately gap-split from what would otherwise misleadingly
+  look like one continuous span across a 60 m unsurveyed gap exceeding
+  the 50 m governance threshold), and a 0.30 m operator-defined lowering
+  scenario recovers exactly 1 new support-loss span and extends exactly
+  1 existing span -- every number verified by direct hand calculation
+  before ever running the code, then confirmed identical via real
+  execution. A source-interpreted-free-span sample is deliberately placed
+  where its own clearance would otherwise numerically qualify as
+  unsupported, proving the explicit source flag overrides geometric
+  inference and never leaks into either the measured-interval or
+  scenario-interval extraction. Real authoritative evidence is ingested
+  on two independent tracks, never used to derive or validate the
+  screening physics: the full NSTA UKCS-wide pipeline freespan registry
+  (both ArcGIS Feature Services, cached/acquired only when absent --
+  real counts 978 total records, 953 current + 25 removed, 212 unique
+  pipelines, 2 duplicated feature IDs, all real and none fabricated or
+  smoothed), reusing the accepted provider's query/parse primitives but
+  built as a new unfiltered "1=1" acquisition since the existing
+  PL854/PL855-scoped registry function is real-and-correctly zero for
+  those two lines (MAR-014C's own investigated finding, not a gap this
+  ticket works around); and the accepted PL854 Table B.1 2018 observed
+  freespan evidence, reused byte-for-byte via
+  `evidence_atlas_core.build_observed_freespans_2018_layer` and
+  `freespan_evidence_map.render_2018_freespan_evidence_map` with only a
+  new title -- the exact accepted 8 events / 97.42 m / 23.16 m / 0.41 m
+  numbers never recomputed. PL854 itself still has no measured continuous
+  pipe vertical profile or embedment/support profile, so
+  `PL854_SITE_SPECIFIC_FREE_SPAN_SUSCEPTIBILITY_NOT_AVAILABLE` is
+  reported explicitly rather than a fabricated site-specific map. The
+  real NSTA UKCS map uses a documented, non-risk-implying
+  example-selection rule (the pipeline with the most registry records --
+  real result `PL1840A`, 59 records) since the full 222+-pipeline
+  registry is unreadable as one detailed map. 56 new tests cover every
+  Section 32 proof point (centreline/top references requiring an
+  explicit offset, positive-clearance-means-unsupported semantics, no
+  threshold meaning no categorical classification, the operator-QC-
+  threshold vs. combined-1-sigma-uncertainty distinction staying
+  separate, the exact synthetic span/clearance/new-span/extended-span
+  recovery, the gap-splits-one-span-into-two proof, all three geometric
+  states plus source-interpreted independence, a structural signature
+  check proving the scenario-clearance function has no pipe-elevation
+  parameter at all (so pipe motion cannot be silently introduced), a
+  real cache-hit-never-touches-network acquisition test, and absence
+  checks for VIV/fatigue/ULS/FLS/risk-score/failure-probability
+  vocabulary and any hard-coded PL854/NSTA identity in the generic
+  engine); the full offline suite (1335 tests, up from 1279) and
+  repo-wide `ruff format`/`ruff check` pass clean. Final real answers:
+  `IS GENERIC OPERATOR-SUPPLIED PIPE/SEABED PROFILE -> FREE-SPAN GEOMETRY
+  ANALYTICS DEMONSTRATED?` YES; `IS GENERIC SUPPORT-LOSS SUSCEPTIBILITY
+  SCREENING DEMONSTRATED?` YES; `IS SITE-SPECIFIC PL854 FREE-SPAN
+  SUSCEPTIBILITY DEFENSIBLE?` NO (expected -- PL854 lacks a measured
+  pipe/seabed profile). No further ticket has started.
