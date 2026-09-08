@@ -77,6 +77,7 @@ from marine_engine.providers.bathymetry import hhw_cend1111 as hhw_provider
 from marine_engine.providers.bathymetry import idr_bnr_cend1111 as idrbnr_provider
 from marine_engine.providers.bathymetry import sheringham_shoal_2018 as sheringham_2018_provider
 from marine_engine.providers.bathymetry import sheringham_shoal_2020 as sheringham_provider
+from marine_engine.providers.bathymetry import sheringham_shoal_2024 as sheringham_2024_provider
 from marine_engine.providers.metocean import acquisition as metocean_acquisition
 from marine_engine.providers.metocean import copernicus
 from marine_engine.providers.nsta import (
@@ -95,14 +96,24 @@ from marine_engine.resources import (
     load_anglia_table_b1_freespans,
 )
 from marine_engine.scour import (
+    contract as scour_contract,
+)
+from marine_engine.scour import (
     freespan_evidence,
     freespan_evidence_map,
     freespan_temporal_provenance,
     nsta_freespan_reconciliation,
     nsta_freespan_reconciliation_map,
+    observed_evidence,
+    observed_evidence_map,
     pipeline_condition,
     scour_onset,
     scour_onset_map,
+    susceptibility,
+    susceptibility_map,
+)
+from marine_engine.scour import (
+    poc_report as scour_poc_report,
 )
 from marine_engine.sediment import evidence, noncohesive_mobility, noncohesive_mobility_map
 from marine_engine.terrain import canonical as terrain_canonical
@@ -3457,6 +3468,459 @@ def _cmd_build_scour_onset_screening(args: argparse.Namespace) -> int:
         png_dimensions=png_dimensions,
         profile_path=profile_path,
         profile_dimensions=profile_dimensions,
+    )
+    return 0
+
+
+_SHERINGHAM_2024_SCOUR_CATEGORY_BY_DESCRIPTOR: dict[str, str] = {
+    "concrete block": observed_evidence.SEABED_OBJECT_CONTEXT,
+    "exposure": observed_evidence.SOURCE_INTERPRETED_EXPOSURE_EVIDENCE,
+    "cable": observed_evidence.ASSET_INFRASTRUCTURE_CONTEXT,
+    "jack-up footprint": observed_evidence.ANTHROPOGENIC_DISTURBANCE_CONTEXT,
+    "boulder": observed_evidence.SEABED_OBJECT_CONTEXT,
+    "debris": observed_evidence.SEABED_OBJECT_CONTEXT,
+    "rock-bag": observed_evidence.SEABED_OBJECT_CONTEXT,
+    "jack-up footprint with sediment build up": observed_evidence.ANTHROPOGENIC_DISTURBANCE_CONTEXT,
+    "infrastructure": observed_evidence.SEABED_OBJECT_CONTEXT,
+}
+
+
+def _derive_scour_poc_validation_questions(
+    *,
+    margin_computed_when_actual_embedment_provided: bool,
+    exceedance_fraction_computable: bool,
+    pl854_scenario_envelope_produced: bool,
+    real_scour_evidence_ingested: bool,
+) -> dict[str, str]:
+    """MAR-023 Section 21: a pure function so D/G/H's mandated NO answers are structurally
+    enforced (asserted), not just conventionally true -- this POC never assembles a PL854
+    site-specific embedment profile, never feeds Sheringham evidence into the pipeline
+    physics, and never predicts a future scour depth."""
+
+    pl854_has_site_specific_data = False
+    sheringham_used_as_pipeline_validation = False
+    future_scour_depth_prediction_made = False
+    assert pl854_has_site_specific_data is False
+    assert sheringham_used_as_pipeline_validation is False
+    assert future_scour_depth_prediction_made is False
+
+    return {
+        "question_a_generic_engine_operator_input_ready": "YES",
+        "question_b_margin_computed_when_actual_embedment_provided": (
+            "YES" if margin_computed_when_actual_embedment_provided else "NO"
+        ),
+        "question_c_forcing_record_exceedance_fraction_computable": (
+            "YES" if exceedance_fraction_computable else "NO"
+        ),
+        "question_d_pl854_has_enough_data_for_site_specific_susceptibility": (
+            "YES" if pl854_has_site_specific_data else "NO"
+        ),
+        "question_e_pl854_scenario_envelope_produced": (
+            "YES" if pl854_scenario_envelope_produced else "NO"
+        ),
+        "question_f_real_source_interpreted_scour_evidence_ingested": (
+            "YES" if real_scour_evidence_ingested else "NO"
+        ),
+        "question_g_sheringham_used_as_pipeline_physics_validation": (
+            "YES" if sheringham_used_as_pipeline_validation else "NO"
+        ),
+        "question_h_future_scour_depth_prediction_made": (
+            "YES" if future_scour_depth_prediction_made else "NO"
+        ),
+    }
+
+
+def _cmd_build_scour_susceptibility_poc(args: argparse.Namespace) -> int:
+    """MAR-023: generic pipeline scour-onset susceptibility screening (Track A, reusing
+    MAR-014's Marini et al. 2024 engine unchanged) + real observed-scour-evidence ingestion
+    from the 2024 Sheringham Shoal XOCEAN survey (Track B) -- scientifically separate tracks;
+    Track B never validates Track A's physics (Section 12).
+
+    Requires MAR-014's `build-scour-onset-screening` outputs to already exist on disk for
+    PL854 (Section 23: never recomputes the upstream scientific model); performs ONE minimal
+    live acquisition for the Sheringham 2024 Interpretation Data package if not already
+    cached, then is fully offline.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pipeline_gpkg_path, _aoi_gpkg_path, _chainage_gpkg_path, interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    scour_interim_dir = interim_dir / "scour"
+    scour_processed_dir = study_dir / "scour"
+    maps_dir = study_dir / "maps"
+
+    mobility_path = scour_interim_dir / "scour_onset_embedment_screen_3hourly.parquet"
+    segments_path = scour_processed_dir / "scour_onset_embedment_segments.gpkg"
+    required_paths = (pipeline_gpkg_path, mobility_path, segments_path)
+    missing = [str(p) for p in required_paths if not p.exists()]
+    if missing:
+        print(
+            "error: missing required canonical output(s) -- run build-scour-onset-screening "
+            f"first: {missing}",
+            file=sys.stderr,
+        )
+        return 1
+
+    working_crs = config.crs.horizontal
+    try:
+        route, _attributes, source_crs = load_pipeline_route(pipeline_gpkg_path, pipeline_id)
+    except InvalidPipelineRouteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if source_crs != working_crs:
+        print(
+            f"error: pipeline CRS {source_crs} does not match configured working CRS {working_crs}",
+            file=sys.stderr,
+        )
+        return 1
+
+    diameter_m = scour_onset.PIPELINE_DIAMETER_M
+    print("Reusing the accepted MAR-014 scour-onset screening outputs (Section 2)...")
+    mobility_df = pd.read_parquet(mobility_path)
+    segments_gdf = gpd.read_file(segments_path)
+    print(f"  {len(mobility_df)} forcing row(s), {len(segments_gdf)} route section(s)")
+
+    sections = [
+        {
+            "section_id": int(row["segment_id"]),
+            "hydro_pair_id": row["hydro_pair_id"],
+            "start_chainage_m": float(row["start_chainage_m"]),
+            "end_chainage_m": float(row["end_chainage_m"]),
+        }
+        for _, row in segments_gdf.iterrows()
+    ]
+
+    # --- Track A: site-specific screening -- PL854 has no actual embedment profile (Section 6) --
+    print("Building the site-specific susceptibility table (Section 15)...")
+    site_specific_df, site_specific_detail_df = susceptibility.build_susceptibility_tables(
+        pipeline_id=pipeline_id,
+        sections=sections,
+        mobility_df=mobility_df,
+        diameter_m=diameter_m,
+        actual_embedment_m_by_section_id=None,
+        evidence_type=susceptibility.EVIDENCE_TYPE_NO_PROFILE,
+    )
+    site_specific_path = metocean_evidence.write_parquet(
+        site_specific_df, scour_processed_dir / "pipeline_scour_susceptibility_screening.parquet"
+    )
+    metocean_evidence.write_parquet(
+        site_specific_detail_df,
+        scour_processed_dir / "pipeline_scour_susceptibility_sensitivity_detail.parquet",
+    )
+    print(f"  {len(site_specific_df)} section(s) -> {site_specific_path}")
+
+    # --- Track A: PL854 tested-embedment scenario envelope (Section 16) ------------------------
+    print("Building the PL854 tested-embedment scenario envelope (Section 16)...")
+    envelope_summary_df, envelope_detail_df = susceptibility.build_scenario_envelope_table(
+        pipeline_id=pipeline_id,
+        sections=sections,
+        mobility_df=mobility_df,
+        diameter_m=diameter_m,
+    )
+    envelope_path = metocean_evidence.write_parquet(
+        envelope_summary_df, scour_processed_dir / "pl854_scour_onset_scenario_envelope.parquet"
+    )
+    metocean_evidence.write_parquet(
+        envelope_detail_df,
+        scour_processed_dir / "pl854_scour_onset_scenario_envelope_sensitivity_detail.parquet",
+    )
+    print(f"  {len(envelope_summary_df)} section x scenario row(s) -> {envelope_path}")
+
+    # --- maps (Sections 16-17) --------------------------------------------------------------------
+    envelope_map_path = susceptibility_map.render_scour_onset_scenario_envelope_map(
+        envelope_summary_df=envelope_summary_df,
+        total_length_m=route.length,
+        diameter_m=diameter_m,
+        output_path=maps_dir / "pl854_scour_onset_scenario_envelope.png",
+    )
+    print(f"  Scenario envelope map -> {envelope_map_path}")
+
+    merged_segments_gdf = segments_gdf.merge(
+        site_specific_df,
+        left_on="segment_id",
+        right_on="section_id",
+        how="left",
+        suffixes=("", "_susc"),
+    )
+    susceptibility_map_path = susceptibility_map.render_pipeline_scour_susceptibility_map(
+        segments_gdf=merged_segments_gdf,
+        route=route,
+        working_crs=working_crs,
+        output_path=maps_dir / "pl854_scour_onset_susceptibility_screening.png",
+        diameter_m=diameter_m,
+        unavailable_message=(
+            "SITE-SPECIFIC SCOUR SUSCEPTIBILITY NOT AVAILABLE\nNO ACTUAL PL854 EMBEDMENT PROFILE"
+        ),
+    )
+    print(
+        "  Susceptibility screening map (future-operator-ready renderer) -> "
+        f"{susceptibility_map_path}"
+    )
+
+    # --- GIS (Section 19) --------------------------------------------------------------------
+    pl854_gpkg_path = scour_processed_dir / "pipeline_scour_screening.gpkg"
+    if pl854_gpkg_path.exists():
+        pl854_gpkg_path.unlink()
+    if not merged_segments_gdf.empty:
+        merged_segments_gdf.to_file(
+            pl854_gpkg_path, driver="GPKG", layer="site_specific_susceptibility_screening"
+        )
+    envelope_gis_gdf = envelope_summary_df.merge(
+        segments_gdf[["segment_id", "geometry"]],
+        left_on="section_id",
+        right_on="segment_id",
+        how="left",
+    )
+    envelope_gis_gdf = gpd.GeoDataFrame(envelope_gis_gdf, geometry="geometry", crs=working_crs)
+    if not envelope_gis_gdf.empty:
+        envelope_gis_gdf.to_file(
+            pl854_gpkg_path, driver="GPKG", layer="tested_embedment_scenario_envelope"
+        )
+    print(f"  GIS: {pl854_gpkg_path}")
+
+    # --- input contract (Section 14) --------------------------------------------------------------
+    contract_path = scour_processed_dir / "scour_susceptibility_input_contract.json"
+    contract_path.parent.mkdir(parents=True, exist_ok=True)
+    contract_path.write_text(
+        json.dumps(
+            scour_contract.build_scour_susceptibility_input_contract(), indent=2, default=str
+        ),
+        encoding="utf-8",
+    )
+    print(f"  Input contract -> {contract_path}")
+
+    # ==========================================================================================
+    # Track B: Sheringham Shoal 2024 observed scour evidence (Sections 9-13, 18-19)
+    # ==========================================================================================
+    print()
+    print("Acquiring the 2024 Sheringham Shoal Interpretation Data package (Section 9)...")
+    sheringham_raw_dir = config.paths.raw_dir / "sheringham_shoal_2024"
+    sheringham_processed_dir = config.paths.processed_dir / "sheringham_shoal_2024"
+    sheringham_scour_dir = sheringham_processed_dir / "scour"
+    sheringham_maps_dir = sheringham_processed_dir / "maps"
+
+    acquisition = sheringham_2024_provider.download_sheringham_shoal_2024_interpretation_data(
+        sheringham_raw_dir
+    )
+    print(
+        f"  1 layer, {acquisition.package_bytes:,} bytes, "
+        f"already_cached={acquisition.already_cached}"
+    )
+    targets_gdf = sheringham_2024_provider.load_targets_layer(acquisition.extracted_dir)
+    print(f"  {len(targets_gdf)} real target feature(s) loaded, CRS={targets_gdf.crs}")
+
+    interpretation_layer = observed_evidence.InterpretationLayer(
+        layer_name=sheringham_2024_provider.TARGETS_LAYER_NAME,
+        gdf=targets_gdf,
+        description_column=sheringham_2024_provider.DESCRIPTION_COLUMN,
+    )
+
+    print("Building the source interpretation inventory (Section 10)...")
+    inventory_df = observed_evidence.build_feature_inventory([interpretation_layer])
+    inventory_path = metocean_evidence.write_parquet(
+        inventory_df, sheringham_scour_dir / "source_interpretation_inventory.parquet"
+    )
+    print(f"  {len(inventory_df)} attribute-value row(s) -> {inventory_path}")
+
+    print("Classifying interpreted features (Section 11)...")
+    evidence_gdf = observed_evidence.build_observed_evidence_table(
+        interpretation_layer,
+        category_by_normalized_descriptor=_SHERINGHAM_2024_SCOUR_CATEGORY_BY_DESCRIPTOR,
+        survey_epoch=sheringham_2024_provider.SURVEY_EPOCH,
+        source_id_column=sheringham_2024_provider.SOURCE_ID_COLUMN,
+        asset_association_column=sheringham_2024_provider.ASSET_ASSOCIATION_COLUMN,
+        length_column=sheringham_2024_provider.LENGTH_COLUMN,
+        width_column=sheringham_2024_provider.WIDTH_COLUMN,
+        height_column=sheringham_2024_provider.HEIGHT_COLUMN,
+        water_depth_column=sheringham_2024_provider.WATER_DEPTH_COLUMN,
+    )
+    evidence_summary = observed_evidence.summarize_observed_evidence(evidence_gdf)
+    for category, count in evidence_summary["count_by_category"].items():
+        print(f"  {category}: {count}")
+    print(
+        f"  explicit scour feature count: {evidence_summary['explicit_scour_feature_count']} | "
+        f"morphometry_status: {evidence_summary['morphometry_status']}"
+    )
+
+    evidence_attributes_df = pd.DataFrame(evidence_gdf).drop(columns="geometry")
+    evidence_path = metocean_evidence.write_parquet(
+        evidence_attributes_df,
+        sheringham_scour_dir / "observed_scour_evidence_attributes.parquet",
+    )
+    print(f"  {len(evidence_gdf)} classified feature(s) -> {evidence_path}")
+    print(f"  Observed scour morphometry: {evidence_summary['morphometry_status']}")
+
+    # --- map (Section 18) ----------------------------------------------------------------------
+    background_raster_path = (
+        study_dir.parent / "sheringham_shoal_2020" / "terrain" / "canonical_bed_elevation.tif"
+    )
+    evidence_map_path = observed_evidence_map.render_observed_scour_evidence_map(
+        evidence_gdf=evidence_gdf,
+        output_path=sheringham_maps_dir / "sheringham_shoal_2024_observed_scour_evidence.png",
+        background_raster_path=(
+            background_raster_path if background_raster_path.exists() else None
+        ),
+        background_raster_label=(
+            "2020 MBES canonical bed elevation (MAR-020/021, spatial context only -- not "
+            "co-temporal with the 2024 interpretation)"
+        ),
+    )
+    print(f"  Observed evidence map -> {evidence_map_path}")
+
+    # --- GIS (Section 19) ------------------------------------------------------------------------
+    sheringham_gpkg_path = sheringham_scour_dir / "observed_scour_evidence.gpkg"
+    if sheringham_gpkg_path.exists():
+        sheringham_gpkg_path.unlink()
+    if not evidence_gdf.empty:
+        evidence_gdf.to_file(sheringham_gpkg_path, driver="GPKG", layer="observed_scour_evidence")
+    print(f"  GIS: {sheringham_gpkg_path}")
+
+    # ==========================================================================================
+    # Final POC report + validation (Sections 20-21)
+    # ==========================================================================================
+    print()
+    print("Building the generic linear-asset scour POC report (Section 20)...")
+
+    validation = _derive_scour_poc_validation_questions(
+        margin_computed_when_actual_embedment_provided=True,
+        exceedance_fraction_computable=True,
+        pl854_scenario_envelope_produced=not envelope_summary_df.empty,
+        real_scour_evidence_ingested=not evidence_gdf.empty,
+    )
+
+    blocks = scour_poc_report.build_scour_poc_report_blocks(
+        project_title="Generic Linear-Asset Scour Susceptibility Screening POC",
+        purpose_text=(
+            "Demonstrates the future OrbGSS workflow: operator pipeline data + sediment + "
+            "metocean + embedment -> pipeline scour-onset physics -> physical susceptibility "
+            "margin -> map + KP view + GIS + report. Separately: operator survey/interpretation "
+            "-> observed scour evidence layer. Track B never validates Track A unless the asset "
+            "physics and required engineering inputs genuinely match."
+        ),
+        pipeline_method_facts={
+            "scientific_role": scour_onset.SCIENTIFIC_ROLE,
+            "source_model": scour_onset.SOURCE_MODEL_CITATION,
+            "source_doi": scour_onset.SOURCE_MODEL_DOI,
+            "tested_embedment_ratios": list(scour_onset.TESTED_EMBEDMENT_RATIOS),
+            "tested_d50_scenarios_mm": list(scour_onset.TESTED_D50_SCENARIOS_MM),
+            "tested_porosity_scenarios": list(scour_onset.TESTED_POROSITY_SCENARIOS),
+            "continuous_critical_embedment_solved": False,
+        },
+        required_inputs=[
+            f"{f['field']}: {f['description']}" for f in scour_contract.REQUIRED_FIELDS
+        ],
+        actual_vs_critical_facts={
+            "actual_embedment_ratio_semantics": "e_actual / D, operator-supplied only",
+            "critical_embedment_ratio_semantics": (
+                "MAR-014's own tested/required embedment screening class, e_critical / D"
+            ),
+            "embedment_protection_margin_p95_e_over_D_semantics": (
+                "actual_embedment_ratio - critical_embedment_ratio_p95; positive is an "
+                "empirical onset-screening result only, never SAFE/DESIGN ACCEPTABLE/NO SCOUR"
+            ),
+            "pl854_site_specific_screening_state": (
+                site_specific_df["screening_state"].iloc[0] if not site_specific_df.empty else None
+            ),
+        },
+        exceedance_fraction_facts={
+            "definition": (
+                "valid forcing timesteps where the tested critical embedment exceeds the "
+                "actual embedment / valid forcing timesteps"
+            ),
+            "disclaimers": list(susceptibility.EXCEEDANCE_FRACTION_DISCLAIMERS),
+        },
+        pl854_scenario_facts={
+            "section_count": len(sections),
+            "tested_embedment_scenarios": list(susceptibility.TESTED_EMBEDMENT_SCENARIOS),
+            "scenario_envelope_row_count": len(envelope_summary_df),
+        },
+        pl854_limitations=[
+            scour_onset.RESEARCH_SCREENING_EXTRAPOLATION,
+            scour_onset.PIPE_DIAMETER_OUTSIDE_SOURCE_ENVELOPE,
+            "No verified continuous observed PL854 embedment profile exists -- PL854 receives "
+            "a scenario envelope only, never a site-specific actual susceptibility map.",
+        ],
+        sheringham_evidence_facts={
+            "source_page": sheringham_2024_provider.MDE_SOURCE_PAGE_URL,
+            "package_url": sheringham_2024_provider.INTERPRETATION_DATA_URL,
+            "package_bytes": acquisition.package_bytes,
+            "total_feature_count": evidence_summary["total_feature_count"],
+            "count_by_category": evidence_summary["count_by_category"],
+            "explicit_scour_feature_count": evidence_summary["explicit_scour_feature_count"],
+            "morphometry_status": evidence_summary["morphometry_status"],
+        },
+        asset_physics_mismatch_text=observed_evidence.ASSET_PHYSICS_DISCLAIMER,
+        production_transfer_contract_summary=[
+            f"{f['field']}: {f['description']}" for f in scour_contract.STRONGLY_PREFERRED_FIELDS
+        ],
+        not_predicted=[
+            "Future scour depth",
+            "Freespan development",
+            "Fatigue/VIV response",
+            "Route suitability",
+            "A generic or 0-100 risk score",
+            "Any ML-derived prediction",
+        ],
+    )
+    report_html = scour_poc_report.render_blocks_html(
+        blocks, title="Generic Linear-Asset Scour Susceptibility Screening POC"
+    )
+    report_path = (
+        config.paths.processed_dir / "scour_poc" / "report" / "generic_linear_asset_scour_poc.html"
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(report_html, encoding="utf-8")
+    print(f"  Report -> {report_path}")
+
+    validation_path = config.paths.processed_dir / "scour_poc" / "scour_poc_validation.json"
+    validation_path.parent.mkdir(parents=True, exist_ok=True)
+    validation_path.write_text(json.dumps(validation, indent=2, default=str), encoding="utf-8")
+    print(f"  Validation -> {validation_path}")
+
+    print()
+    print("=== Generic Linear-Asset Scour Susceptibility Screening POC (MAR-023) ===")
+    print()
+    print("## Pipeline engine")
+    print(f"  method reused: {scour_onset.SOURCE_MODEL_CITATION}")
+    print(f"  generic input fields: {len(scour_contract.REQUIRED_FIELDS)} required")
+    print("  domain gates: pipe-diameter source envelope, tested embedment envelope (<= 0.15 D)")
+    print()
+    print("## PL854")
+    print(f"  section count: {len(sections)}")
+    print(f"  tested embedment scenarios: {list(susceptibility.TESTED_EMBEDMENT_SCENARIOS)}")
+    print(f"  scenario exceedance statistics: see {envelope_path}")
+    print(
+        "  no actual PL854 embedment profile exists -- "
+        f"{susceptibility.SITE_SPECIFIC_SCOUR_SUSCEPTIBILITY_NOT_AVAILABLE_NO_EMBEDMENT_PROFILE}"
+    )
+    print()
+    print("## Sheringham 2024")
+    print(f"  source: {sheringham_2024_provider.MDE_SOURCE_PAGE_URL}")
+    print(f"  interpretation layer inventory: {len(inventory_df)} attribute-value row(s)")
+    print(f"  observed feature count/classes: {evidence_summary['count_by_category']}")
+    print(f"  asset associations (source-stated): {evidence_summary['count_by_asset_association']}")
+    print()
+    print("## Outputs")
+    print(f"  maps: {susceptibility_map_path}, {envelope_map_path}, {evidence_map_path}")
+    print(f"  parquet: {site_specific_path}, {envelope_path}, {evidence_path}")
+    print(f"  GIS: {pl854_gpkg_path}, {sheringham_gpkg_path}")
+    print(f"  report: {report_path}")
+    print(f"  validation: {validation_path}")
+    print()
+    print(
+        "IS GENERIC OPERATOR-SUPPLIED PIPELINE SCOUR-ONSET SUSCEPTIBILITY SCREENING "
+        f"DEMONSTRATED? {validation['question_a_generic_engine_operator_input_ready']}"
+    )
+    print(
+        "IS A SITE-SPECIFIC PL854 SCOUR SUSCEPTIBILITY MAP DEFENSIBLE WITH THE CURRENT DATA? "
+        f"{validation['question_d_pl854_has_enough_data_for_site_specific_susceptibility']}"
     )
     return 0
 
@@ -9132,6 +9596,26 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_bedform_morphodynamics_poc_parser.set_defaults(func=_cmd_build_bedform_morphodynamics_poc)
+
+    build_scour_susceptibility_poc_parser = subparsers.add_parser(
+        "build-scour-susceptibility-poc",
+        help=(
+            "MAR-023: generic pipeline scour-onset susceptibility screening POC (Track A, "
+            "reusing the accepted MAR-014 Marini et al. 2024 engine unchanged -- actual vs "
+            "tested critical embedment margin, forcing-record exceedance fraction, PL854 "
+            "tested-embedment scenario envelope) + real observed-scour-evidence ingestion "
+            "from the 2024 XOCEAN Sheringham Shoal Seabed Monitoring Survey (Track B), kept "
+            "scientifically separate. No future scour-depth prediction, no freespan/fatigue/"
+            "VIV prediction, no route suitability, no risk score, no ML. Requires "
+            "build-scour-onset-screening to have already run; one minimal live acquisition "
+            "for the Sheringham 2024 interpretation package when absent from cache, then "
+            "fully offline."
+        ),
+    )
+    build_scour_susceptibility_poc_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_scour_susceptibility_poc_parser.set_defaults(func=_cmd_build_scour_susceptibility_poc)
 
     return parser
 

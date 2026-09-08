@@ -1954,4 +1954,83 @@ otherwise, never an interactive credential prompt.
   `ruff check` pass clean. Final real answers: `IS CANONICAL NATURAL
   SANDBED MORPHOMETRY DEMONSTRATED ON REAL PROJECT-GRADE MBES?` YES;
   `IS DEFENSIBLE OBSERVED 2018-2020 CREST DISPLACEMENT DEMONSTRATED?` YES.
-  No further ticket has started.
+- **MAR-023 (generic linear-asset scour susceptibility screening POC,
+  `src/marine_engine/scour/susceptibility.py`/`susceptibility_map.py`/
+  `observed_evidence.py`/`observed_evidence_map.py`/`contract.py`/
+  `poc_report.py`, `providers/bathymetry/sheringham_shoal_2024.py`,
+  `build-scour-susceptibility-poc`).** Two scientifically separate tracks,
+  never conflated: Track A screens the operator's ACTUAL pipeline embedment
+  against the accepted MAR-014 Marini et al. (2024) engine's own tested
+  critical-embedment screening class -- reused completely unchanged, never
+  re-derived -- via `embedment_protection_margin_p95_e_over_D` (actual
+  minus critical p95) and a descriptive `scour_onset_screening_exceedance_
+  fraction` (explicitly NOT a probability, NOT a failure probability, NOT a
+  return-period metric); Track B ingests real observed scour evidence from
+  a brand-new 2024 Crown Estate Marine Data Exchange survey (TCE-3974, "2024
+  XOCEAN Sheringham Shoal Seabed Monitoring Survey") and is never used to
+  validate Track A's pipeline physics, since the survey covers monopiles,
+  cables, and protection, not a pipeline. PL854 genuinely has no continuous
+  observed embedment profile, so its site-specific table (14 sections) is
+  honestly `SITE_SPECIFIC_SCOUR_SUSCEPTIBILITY_NOT_AVAILABLE_NO_EMBEDMENT_
+  PROFILE` throughout -- Track A is instead demonstrated via a PL854
+  tested-embedment SCENARIO envelope (70 section x scenario rows, the five
+  already-tested ratios treated in turn as a hypothetical actual value,
+  never a real profile): at zero embedment the real forcing record exceeds
+  the tested critical class on 20.9-50.8% of valid timesteps per section
+  (median 43.8%), collapsing to 0-1.5% (median ~0.2%) at the 0.03D
+  scenario, consistent with a route-wide `critical_embedment_ratio_p95` of
+  exactly 0.03D throughout -- a real, internally-consistent, honestly
+  reported result. Real inspection of the 2024 interpretation package (a
+  single 746-feature `Targets` shapefile, 140,928 bytes, downloaded live
+  via the same button-click-intercept technique established in MAR-022,
+  then cached) found NO literal "scour" feature class despite the survey's
+  own stated integrity-relevant purpose -- classified honestly into
+  `SEABED_OBJECT_CONTEXT` (340), `SOURCE_INTERPRETED_EXPOSURE_EVIDENCE`
+  (152, kept separate from scour evidence since the source never attributes
+  causality), `ASSET_INFRASTRUCTURE_CONTEXT` (151), and
+  `ANTHROPOGENIC_DISTURBANCE_CONTEXT` (103), with source-stated asset
+  association preserved verbatim (390/346/9/1 across two IAC/WTG corridors,
+  the export cable route, and one unassociated feature), yielding
+  `OBSERVED_SCOUR_MORPHOMETRY_NOT_AVAILABLE_FROM_SOURCE_PACKAGE` rather
+  than measuring a different feature class and calling it scour morphometry.
+  The cached MAR-020/021 2020 bathymetry raster is reused unchanged as
+  background map context (confirmed via a direct bounding-box check that
+  all 746 real 2024 targets fall inside it) rather than re-acquiring a
+  second, comparably large MBES surface -- zero new bathymetry bytes
+  downloaded, satisfying the ticket's "minimum acquisition" requirement
+  exactly. A real, subtle bug was found via visual inspection of the
+  rendered scenario-envelope figure (the zero-embedment scenario's line was
+  invisible, hidden under an incorrectly identical 0.03D line): `actual_
+  embedment_m = scenario_ratio * diameter_m` followed by `actual_embedment_
+  ratio = actual_embedment_m / diameter_m` does not always round-trip to
+  the exact same float (confirmed: `0.03 * 0.3048 / 0.3048 ==
+  0.029999999999999995`), which without a tolerance made the 0.03D
+  scenario spuriously "exceed" real timesteps whose required embedment was
+  the identical tested class -- fixed with a `1e-9` tolerance mirroring
+  `scour_onset.py`'s own established `compute_embedment_monotonicity_
+  violations` convention, with two new regression tests reproducing the
+  exact real failure mode. A second real design issue was caught before
+  the CLI ever ran: `bedforms.interpretation.classify_features` validates
+  its caller-supplied category mapping against a frozenset hardcoded to
+  the THREE bedform-specific category strings, so it could never actually
+  accept this module's six scour-specific categories -- fixed by giving
+  `observed_evidence.py` its own small, structurally-identical local
+  `classify_scour_features`/`extract_scour_category` (still reusing the
+  genuinely dataset-agnostic `build_feature_inventory` directly). Two
+  figure title/subtitle collisions were found and fixed following the same
+  established MAR-018/019/020/022 pattern (pinned suptitle y, `va="top"`
+  anchored subtitles, widened `tight_layout` headroom). 31 new tests cover
+  actual-vs-critical separation, negative/positive margin classification,
+  valid-timestep-only exceedance computation, the missing-profile block,
+  PL854 scenario-only structural checks, Marini domain-envelope
+  preservation, absence of any scour-depth/risk-score field, Track A/B
+  non-coupling, asset-physics-mismatch disclosure, a synthetic operator
+  route producing a real rendered map, absence of hard-coded PL854/
+  Sheringham coordinates in the generic engine, and an offline-cache-hit
+  acquisition test that raises if `requests.get` is ever called on a cache
+  hit; the full offline suite (1218 tests, 25 live/network tests correctly
+  deselected) and repo-wide `ruff format`/`ruff check` pass clean. Final
+  real answers: `IS GENERIC OPERATOR-SUPPLIED PIPELINE SCOUR-ONSET
+  SUSCEPTIBILITY SCREENING DEMONSTRATED?` YES; `IS A SITE-SPECIFIC PL854
+  SCOUR SUSCEPTIBILITY MAP DEFENSIBLE WITH THE CURRENT DATA?` NO (expected
+  -- no actual embedment profile exists). No further ticket has started.
