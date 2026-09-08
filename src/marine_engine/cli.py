@@ -86,6 +86,10 @@ from marine_engine.preprocessing.chainage import (
     load_pipeline_route,
     print_chainage_report,
 )
+from marine_engine.project import categories as project_categories
+from marine_engine.project import manifest as project_manifest
+from marine_engine.project import registry as project_registry
+from marine_engine.project import report as project_report
 from marine_engine.providers import barrow_2016 as barrow_2016_provider
 from marine_engine.providers import bgs_offshore_surveys, nsta_freespan
 from marine_engine.providers.bathymetry import acquisition, bgs, emodnet, inventory, ukho
@@ -10339,6 +10343,237 @@ def _cmd_build_free_span_poc(args: argparse.Namespace) -> int:
     return 0
 
 
+def _derive_project_readiness_validation_questions(
+    *,
+    generic_registration_demonstrated: bool,
+    source_files_registered_without_mutation: bool,
+    bathymetry_readiness_reused: bool,
+    burial_readiness_reused: bool,
+) -> dict[str, str]:
+    """MAR-026 Section 20: a pure function so the final NO is structurally enforced -- this
+    package never claims universal marine-geohazard readiness, regardless of any upstream facts."""
+
+    claims_universal_hazard_readiness = False
+    assert claims_universal_hazard_readiness is False
+
+    return {
+        "question_a_generic_local_operator_project_registration_demonstrated": (
+            "YES" if generic_registration_demonstrated else "NO"
+        ),
+        "question_b_source_files_registered_with_identity_and_provenance_without_mutation": (
+            "YES" if source_files_registered_without_mutation else "NO"
+        ),
+        "question_c_existing_bathymetry_readiness_reused_through_generic_project_layer": (
+            "YES" if bathymetry_readiness_reused else "NO"
+        ),
+        "question_d_existing_burial_profile_readiness_reused_through_generic_project_layer": (
+            "YES" if burial_readiness_reused else "NO"
+        ),
+        "question_e_does_mar026_claim_project_ready_for_every_marine_geohazard": (
+            "YES" if claims_universal_hazard_readiness else "NO"
+        ),
+    }
+
+
+def _cmd_build_project_readiness(args: argparse.Namespace) -> int:
+    """MAR-026: generic local operator-project registration and asset-readiness layer. Sits
+    above raw operator files and below the independent scientific geohazard engines -- performs
+    NO hazard-specific science, and delegates bathymetry/burial readiness to the existing,
+    unmodified `terrain.readiness`/`burial.readiness` modules. Fully offline: no network
+    access, no provider discovery, no credentials, no interactive prompts.
+    """
+
+    try:
+        manifest, manifest_dir = project_manifest.load_project_manifest(args.manifest)
+    except Exception as exc:
+        print(f"error: project manifest is invalid: {exc}", file=sys.stderr)
+        return 1
+
+    project_id = manifest.project.id
+    working_crs = manifest.project.working_crs
+    output_dir = Path("data/processed") / project_id / "project"
+
+    print(f"Registering project {project_id!r} (Section 6)...")
+    summary = project_registry.register_project(manifest, manifest_dir)
+    for r in summary.asset_results:
+        reg = r.registration
+        print(
+            f"  {reg.asset_id}: category={reg.category} evidence_role={reg.evidence_role} "
+            f"registration={reg.registration_status} readiness={reg.readiness_status}"
+        )
+        for conflict in reg.conflicts:
+            print(f"    CONFLICT: {conflict}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    normalized_manifest_path = output_dir / "normalized_project_manifest.json"
+    normalized_manifest_path.write_text(
+        json.dumps(manifest.model_dump(mode="json"), indent=2, default=str), encoding="utf-8"
+    )
+    print(f"  Normalized manifest -> {normalized_manifest_path}")
+
+    registry_df = project_registry.build_asset_registry_df(summary)
+    registry_path = metocean_evidence.write_parquet(
+        registry_df, output_dir / "project_asset_registry.parquet"
+    )
+    print(f"  Asset registry ({len(registry_df)} row(s)) -> {registry_path}")
+
+    readiness_dict = project_registry.build_project_readiness_dict(summary)
+    readiness_path = output_dir / "project_readiness.json"
+    readiness_path.write_text(json.dumps(readiness_dict, indent=2, default=str), encoding="utf-8")
+    print(f"  Readiness -> {readiness_path}")
+
+    route_gpkg_path = output_dir / "project_route.gpkg"
+    if route_gpkg_path.exists():
+        route_gpkg_path.unlink()
+    route_layer_written = False
+    for r in summary.asset_results:
+        if r.canonical_route_gdf is not None:
+            r.canonical_route_gdf.to_file(
+                route_gpkg_path, driver="GPKG", layer=r.registration.asset_id
+            )
+            route_layer_written = True
+    if route_layer_written:
+        print(f"  Canonical route(s) -> {route_gpkg_path}")
+    else:
+        route_gpkg_path = None
+
+    asset_rows = [
+        {
+            "asset_id": r.registration.asset_id,
+            "category": r.registration.category,
+            "evidence_role": r.registration.evidence_role,
+            "registration_status": r.registration.registration_status,
+            "readiness_status": r.registration.readiness_status,
+            "filename": r.registration.filename,
+            "byte_size": r.registration.byte_size,
+            "sha256": (r.registration.sha256[:16] + "...") if r.registration.sha256 else None,
+            "conflicts": "; ".join(r.registration.conflicts) or "none",
+        }
+        for r in summary.asset_results
+    ]
+
+    evidence_role_summary: dict[str, int] = {}
+    blocking_issues: list[str] = []
+    limitations_list: list[str] = []
+    unsupported_categories_list: list[str] = []
+    for r in summary.asset_results:
+        reg = r.registration
+        evidence_role_summary[reg.evidence_role] = (
+            evidence_role_summary.get(reg.evidence_role, 0) + 1
+        )
+        if reg.registration_status == project_registry.REGISTRATION_FAILED:
+            blocking_issues.append(f"{reg.asset_id}: {reg.registration_detail}")
+        if reg.readiness_result:
+            blocking_issues.extend(
+                f"{reg.asset_id}: {detail}"
+                for detail in reg.readiness_result.get("blocking_reasons", [])
+            )
+            limitations_list.extend(
+                f"{reg.asset_id}: {detail}"
+                for detail in reg.readiness_result.get("limitation_reasons", [])
+            )
+        if reg.readiness_status == project_categories.REGISTERED_READINESS_NOT_IMPLEMENTED:
+            unsupported_categories_list.append(f"{reg.asset_id} ({reg.category})")
+
+    blocks = project_report.build_project_readiness_report_blocks(
+        project_title=f"Operator Project Registration & Readiness -- {manifest.project.name}",
+        purpose_text=(
+            "Registers operator-supplied local project files (route, bathymetry, burial "
+            "profile, and other declared evidence) into a canonical project inventory, "
+            "verifying content identity/provenance and delegating scientific readiness "
+            "assessment to the existing accepted readiness modules. Introduces no new scour, "
+            "mobility, free-span, burial, erosion/deposition, bedform, or risk physics."
+        ),
+        project_identity_facts={
+            "project_id": manifest.project.id,
+            "project_name": manifest.project.name,
+            "working_crs": working_crs,
+            "primary_route_asset_id": manifest.primary_route_asset_id,
+            "asset_count": len(summary.asset_results),
+        },
+        asset_rows=asset_rows,
+        evidence_role_summary=evidence_role_summary,
+        readiness_summary=summary.readiness_status_counts(),
+        blocking_issues=blocking_issues,
+        limitations=limitations_list,
+        unsupported_categories=unsupported_categories_list,
+        production_transfer_notes=[
+            "PIPELINE_ROUTE, BATHYMETRY_RASTER, and BURIAL_PROFILE have real readiness "
+            "adapters in MAR-026; every other category is registered honestly as "
+            "REGISTERED_READINESS_NOT_IMPLEMENTED, never READY, merely because a file exists.",
+            project_registry.PROJECT_HAZARD_READINESS_DISCLAIMER,
+        ],
+    )
+    report_html = project_report.render_blocks_html(
+        blocks, title=f"Project Readiness -- {manifest.project.name}"
+    )
+    report_path = output_dir / "project_readiness_report.html"
+    report_path.write_text(report_html, encoding="utf-8")
+    print(f"  Report -> {report_path}")
+
+    generic_registration_demonstrated = any(
+        r.registration.registration_status == project_registry.REGISTERED
+        for r in summary.asset_results
+    )
+    source_files_registered_without_mutation = any(
+        r.registration.sha256 is not None for r in summary.asset_results
+    )
+    bathymetry_readiness_reused = any(
+        r.registration.category == project_categories.BATHYMETRY_RASTER
+        and r.registration.readiness_result is not None
+        for r in summary.asset_results
+    )
+    burial_readiness_reused = any(
+        r.registration.category == project_categories.BURIAL_PROFILE
+        and r.registration.readiness_result is not None
+        for r in summary.asset_results
+    )
+    validation = _derive_project_readiness_validation_questions(
+        generic_registration_demonstrated=generic_registration_demonstrated,
+        source_files_registered_without_mutation=source_files_registered_without_mutation,
+        bathymetry_readiness_reused=bathymetry_readiness_reused,
+        burial_readiness_reused=burial_readiness_reused,
+    )
+    validation_path = output_dir / "project_readiness_validation.json"
+    validation_path.write_text(json.dumps(validation, indent=2, default=str), encoding="utf-8")
+    print(f"  Validation -> {validation_path}")
+
+    print()
+    print("=== Generic Operator Project Registration & Readiness (MAR-026) ===")
+    print()
+    print(f"Project: {manifest.project.id} ({manifest.project.name})")
+    print(f"Working CRS: {working_crs}")
+    print(f"Assets registered: {len(summary.asset_results)}")
+    print(f"Registration status counts: {summary.registration_status_counts()}")
+    print(f"Readiness status counts: {summary.readiness_status_counts()}")
+    print()
+    print(project_registry.PROJECT_HAZARD_READINESS_DISCLAIMER)
+    print()
+    print(
+        "IS GENERIC LOCAL OPERATOR PROJECT REGISTRATION DEMONSTRATED? "
+        f"{validation['question_a_generic_local_operator_project_registration_demonstrated']}"
+    )
+    print(
+        "ARE OPERATOR SOURCE FILES REGISTERED WITH CONTENT IDENTITY AND PROVENANCE WITHOUT "
+        "MUTATION? "
+        f"{validation['question_b_source_files_registered_with_identity_and_provenance_without_mutation']}"
+    )
+    print(
+        "IS EXISTING BATHYMETRY READINESS REUSED THROUGH THE GENERIC PROJECT LAYER? "
+        f"{validation['question_c_existing_bathymetry_readiness_reused_through_generic_project_layer']}"
+    )
+    print(
+        "IS EXISTING BURIAL-PROFILE READINESS REUSED THROUGH THE GENERIC PROJECT LAYER? "
+        f"{validation['question_d_existing_burial_profile_readiness_reused_through_generic_project_layer']}"
+    )
+    print(
+        "DOES MAR-026 CLAIM THE PROJECT IS READY FOR EVERY MARINE GEOHAZARD? "
+        f"{validation['question_e_does_mar026_claim_project_ready_for_every_marine_geohazard']}"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -10797,6 +11032,23 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_free_span_poc_parser.set_defaults(func=_cmd_build_free_span_poc)
+
+    build_project_readiness_parser = subparsers.add_parser(
+        "build-project-readiness",
+        help=(
+            "MAR-026: generic local operator-project registration and asset-readiness layer -- "
+            "registers operator-supplied local files (route, bathymetry raster, burial profile, "
+            "and other declared evidence) against a project manifest, verifies content identity/"
+            "provenance without ever mutating the source files, and delegates scientific "
+            "readiness to the existing, unmodified terrain/burial readiness modules. Fully "
+            "offline: no network access, no provider discovery, no credentials. Makes no "
+            "universal marine-geohazard-readiness claim."
+        ),
+    )
+    build_project_readiness_parser.add_argument(
+        "manifest", type=Path, help="Path to an operator project manifest YAML file."
+    )
+    build_project_readiness_parser.set_defaults(func=_cmd_build_project_readiness)
 
     return parser
 

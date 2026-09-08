@@ -2396,5 +2396,105 @@ otherwise, never an interactive credential prompt.
   EVIDENCE IS AN ORTHOGONAL EVIDENCE DIMENSION AND NEVER OVERRIDES
   GEOMETRIC CLASSIFICATION`, `A DISCRETE UNSUPPORTED SAMPLE RUN IS NOT
   AUTOMATICALLY CLAIMED TO BE AN EXACT PHYSICAL FREE-SPAN LENGTH`, and
-  `EXISTING SYNTHETIC NUMERICAL OUTPUTS ARE UNCHANGED: YES`. No further
-  ticket has started.
+  `EXISTING SYNTHETIC NUMERICAL OUTPUTS ARE UNCHANGED: YES`.
+- **MAR-026 (generic operator project ingestion & asset-readiness POC,
+  `src/marine_engine/project/`).** The first foundation layer sitting
+  ABOVE raw operator files and BELOW the independent geohazard engines --
+  introduces no new scour/mobility/free-span/burial/erosion-deposition/
+  bedform/risk physics. A typed, validated operator project manifest
+  (`project.manifest.ProjectManifest`, Pydantic `extra="forbid"`, unknown
+  keys rejected, duplicate `asset_id`s rejected, every asset path resolved
+  relative to the MANIFEST's own directory, never the shell's cwd)
+  registers local operator files under an explicit, never-inferred,
+  four-way orthogonal evidence-role vocabulary --
+  `PROJECT_GEOMETRY`/`MEASURED`/`SOURCE_INTERPRETED`/`DERIVED`
+  (`project.categories`) -- generalizing MAR-025A's measured-geometry-vs-
+  source-interpretation principle project-wide: proven by a real test that
+  registers the identical file under `MEASURED` and `SOURCE_INTERPRETED`
+  and asserts the readiness RESULT is byte-identical, while the declared
+  role itself is faithfully preserved. Source-file identity is
+  content-based (SHA-256 + byte size), computed by reading the file
+  exactly once and never writing to it (`project.identity`) -- proven by a
+  real test that alters a file's bytes and confirms its identity changes,
+  and another that hashes the same bytes under two different filenames and
+  confirms the identity matches. Declared (operator-stated) metadata and
+  observed (file-extracted) facts are two structurally separate field
+  groups everywhere; a material declared-vs-observed CRS conflict (e.g. a
+  route file whose real embedded CRS doesn't match what the manifest
+  declares) is recorded explicitly as a `conflicts` list entry, never
+  silently reprojected or silently resolved by picking one side. Two-tier
+  status throughout: REGISTRATION (`REGISTERED`/`REGISTRATION_FAILED` --
+  can the file even be found/opened/parsed) is kept structurally distinct
+  from READINESS (`READY`/`READY_WITH_LIMITATIONS`/`NOT_READY`, reusing
+  the exact existing vocabulary), since a totally missing file can never
+  reach the reused readiness modules (which structurally assume a
+  successfully-opened source). `PIPELINE_ROUTE` gets a new generic
+  route-readiness check set (`project.route_adapter`: CRS presence,
+  geographic-vs-projected-aware coordinate-magnitude plausibility,
+  positive length, and -- critically -- topological continuity: a
+  disconnected multi-part route is reported `NOT_READY` rather than having
+  connectivity invented via `shapely.ops.linemerge`, and canonical route
+  direction is always `SOURCE_GEOMETRY_ORDER`, never a guessed platform/
+  landfall endpoint identity). `BATHYMETRY_RASTER` and `BURIAL_PROFILE`
+  reuse the existing accepted `terrain.readiness.assess_bathymetry_readiness`
+  and `burial.readiness.assess_burial_profile_readiness` completely
+  unmodified (`project.bathymetry_adapter`/`project.burial_adapter` only
+  open the real file and assemble the existing `RasterFacts`/
+  `BurialProfileFacts` -- proven by tests asserting the project-layer
+  result and a direct call to the same accepted function produce
+  identical `ReadinessResult.to_dict()` output). Every other category in
+  the forward-compatible vocabulary (`METOCEAN`, `CPT`, `BOREHOLE`,
+  `SHALLOW_GAS_INTERPRETATION`, `FAULT_INTERPRETATION`,
+  `BURIED_CHANNEL_INTERPRETATION`, `BOULDER_CATALOGUE`,
+  `EXISTING_INFRASTRUCTURE`, `FREESPAN_OBSERVATION`, `OTHER`) registers
+  honestly as `REGISTERED_READINESS_NOT_IMPLEMENTED` -- proven, for every
+  such category, never `READY` merely because a file exists. No numeric
+  readiness score, percentage, or confidence index exists anywhere in the
+  new public schemas, and the project-level summary carries an explicit,
+  literal disclaimer (`project.registry.PROJECT_HAZARD_READINESS_DISCLAIMER`)
+  that structural registration and per-asset readiness never imply the
+  project has sufficient data for scour, free-span, liquefaction, shallow
+  gas, or any other specific marine geohazard. Two real, independent
+  demonstrations (deliberately never combined into one fake project):
+  the real, already-accepted Sheringham Shoal 2020 MAR-020 MBES bathymetry
+  raster (`G201193_20210127_SS_MBES_1m_LAT.tif`, 162,924,933 real bytes --
+  matching the original MAR-020 acquisition sidecar exactly) registers as
+  `READY` with the exact real facts (1.0 x 1.0 m native resolution,
+  9855x25610 px, real data range -24.40 to -3.19 m, 30.3% valid-cell
+  coverage); the real, already-accepted Barrow 2016 MAR-024/MAR-024A
+  canonical burial profile (20,946 real records) registers as
+  `READY_WITH_LIMITATIONS`, correctly and independently re-deriving the
+  exact same real `burial_reference_convention_known` limitation text as
+  the original accepted MAR-024A run (the manifest deliberately leaves
+  `measurement_reference_declared`/`sign_convention_declared` unset,
+  since MAR-024A's own real Z-vs-Exposure statistical evidence found both
+  genuinely unresolved -- declaring either would have misrepresented that
+  real finding) -- a real, previously-unflagged limitation (1 duplicate KP
+  value in the real source) also surfaced honestly during this real run.
+  Deterministic per-project output package: `normalized_project_manifest.json`,
+  `project_asset_registry.parquet` (one row per asset, declared/observed
+  facts JSON-encoded, real SHA-256), `project_readiness.json` (full
+  per-check blocking/limitation detail), `project_route.gpkg` (only when a
+  route resolves safely), and `project_readiness_report.html` -- verified
+  directly (not just via unit tests): JSON booleans are real Python
+  `bool`s (never NumPy/string artefacts) even after a full
+  `json.dumps`/`json.loads` round trip, and neither report contains
+  "validated", "safe", "low risk", or "high risk" anywhere. 57 new tests
+  cover every Section 16/18 proof point (missing file, duplicate asset ID,
+  missing CRS, declared/observed CRS conflict, invalid/empty/disconnected
+  route geometry, relative-path resolution, SHA-256 stability, an altered
+  file changing identity, both readiness delegations, missing-provenance
+  limitations, and an unsupported category never reported ready); the full
+  offline suite (1415 tests, up from 1358) and repo-wide `ruff format`/
+  `ruff check` pass clean, and every existing StudyConfig-based command
+  (PL854, Barrow, Sheringham) was independently re-verified working
+  unchanged. Final real answers: `IS GENERIC LOCAL OPERATOR PROJECT
+  REGISTRATION DEMONSTRATED?` YES; `ARE OPERATOR SOURCE FILES REGISTERED
+  WITH CONTENT IDENTITY AND PROVENANCE WITHOUT MUTATION?` YES; `IS
+  EXISTING BATHYMETRY READINESS REUSED THROUGH THE GENERIC PROJECT LAYER?`
+  YES (Sheringham run); `IS EXISTING BURIAL-PROFILE READINESS REUSED
+  THROUGH THE GENERIC PROJECT LAYER?` YES (Barrow run); `DOES MAR-026
+  CLAIM THE PROJECT IS READY FOR EVERY MARINE GEOHAZARD?` NO (required,
+  and structurally enforced by an asserted pure function mirroring this
+  project's established validation-question pattern). No further ticket
+  has started.

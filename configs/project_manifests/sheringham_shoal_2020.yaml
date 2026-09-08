@@ -1,0 +1,30 @@
+# MAR-026 real registration demonstration: the accepted MAR-020 high-resolution bathymetry
+# raster, registered through the generic operator-project layer. Proves the same
+# `terrain.readiness.assess_bathymetry_readiness` checks are reached without recomputing any
+# MAR-020 terrain analytics. Paths are relative to THIS file's own directory (never the shell's
+# working directory) -- see marine_engine.project.manifest.resolve_asset_path.
+
+project:
+  id: sheringham_shoal_2020
+  name: "Sheringham Shoal 2020 High-Resolution Bathymetry (MAR-026 registration demo)"
+  description: >
+    Registers the real, already-accepted MAR-020 high-resolution MBES bathymetry raster
+    through the generic MAR-026 project layer.
+  working_crs: "EPSG:32631"
+
+assets:
+  - asset_id: mbes_2020
+    category: BATHYMETRY_RASTER
+    evidence_role: MEASURED
+    path: ../../data/raw/sheringham_shoal_2020/G201193_20210127_SS_MBES_1m_LAT.tif
+    provenance:
+      source_name: >-
+        Sheringham Shoal 2020 MBES bathymetry, 1 m grid, LAT (operator survey via
+        The Crown Estate Marine Data Exchange, TCE-1986)
+      source_uri: "https://www.marinedataexchange.co.uk/details/TCE-1986/summary"
+      supplier: "The Crown Estate Marine Data Exchange"
+      survey_epoch: "November 2020 - December 2020"
+      horizontal_crs_declared: "EPSG:32631"
+      vertical_datum_declared: "LAT (Lowest Astronomical Tide)"
+      units_declared: "m"
+      licence_note: "Marine Data Exchange -- see source page for licence terms"

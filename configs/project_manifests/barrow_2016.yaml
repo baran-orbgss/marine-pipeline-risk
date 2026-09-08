@@ -1,0 +1,45 @@
+# MAR-026 real registration demonstration: the accepted MAR-024/MAR-024A canonical burial
+# profile, registered through the generic operator-project layer. Proves the same
+# `burial.readiness.assess_burial_profile_readiness` checks are reached without recomputing or
+# altering the accepted SOURCE_BURIAL_REFERENCE_UNRESOLVED conclusion. Paths are relative to
+# THIS file's own directory (never the shell's working directory).
+#
+# `measurement_reference_declared` and `sign_convention_declared` are DELIBERATELY left unset:
+# MAR-024A's own real Z-vs-Exposure statistical evidence found the source's burial reference and
+# sign convention genuinely unresolved. Declaring either here would misrepresent that real
+# finding -- leaving them unset lets the generic project layer independently reach the same
+# honest MEASURED_REFERENCE_REQUIRES_REVIEW / LIMITATION conclusion, never guessed.
+
+project:
+  id: barrow_2016
+  name: "Barrow Offshore Wind Farm 2016 Export Cable Burial Survey (MAR-026 registration demo)"
+  description: >
+    Registers the real, already-accepted MAR-024/MAR-024A canonical burial profile through
+    the generic MAR-026 project layer.
+  working_crs: "EPSG:25830"
+
+assets:
+  - asset_id: export_cable_dob_2016
+    category: BURIAL_PROFILE
+    evidence_role: MEASURED
+    path: ../../data/processed/barrow_2016/burial/canonical_burial_profile.parquet
+    burial_columns:
+      chainage_or_kp_column: chainage_m
+      x_column: x_m
+      y_column: y_m
+      measured_value_column: measured_burial_value_m
+      record_id_column: source_record_id
+      uncertainty_column: source_uncertainty_m
+    provenance:
+      source_name: >-
+        Barrow Offshore Wind Farm 2016 export cable Deep BV geophysical depth-of-burial
+        survey (canonical MAR-024/MAR-024A profile), TCE-48
+      source_uri: "https://www.marinedataexchange.co.uk/details/TCE-48"
+      supplier: "Deep BV"
+      survey_epoch: "2016-09-05/2016-09-30"
+      horizontal_crs_declared: "EPSG:25830"
+      units_declared: "m"
+      licence_note: >-
+        Marine Data Exchange -- see source page for licence terms. Burial-reference and
+        sign-convention semantics are unresolved (MAR-024A real finding) and are not
+        declared here.
