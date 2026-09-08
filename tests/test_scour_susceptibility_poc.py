@@ -453,7 +453,8 @@ def test_validation_questions_D_G_H_are_hardcoded_no():
         margin_computed_when_actual_embedment_provided=True,
         exceedance_fraction_computable=True,
         pl854_scenario_envelope_produced=True,
-        real_scour_evidence_ingested=True,
+        explicit_scour_evidence_present=True,
+        operator_interpretation_package_ingested=True,
     )
     assert result["question_d_pl854_has_enough_data_for_site_specific_susceptibility"] == "NO"
     assert result["question_g_sheringham_used_as_pipeline_physics_validation"] == "NO"
@@ -462,6 +463,181 @@ def test_validation_questions_D_G_H_are_hardcoded_no():
     assert result["question_b_margin_computed_when_actual_embedment_provided"] == "YES"
     assert result["question_e_pl854_scenario_envelope_produced"] == "YES"
     assert result["question_f_real_source_interpreted_scour_evidence_ingested"] == "YES"
+    assert result["question_f_reason"] is None
+    assert result["operator_interpretation_package_ingested"] == "YES"
+    assert result["explicit_source_interpreted_scour_evidence_present"] == "YES"
+
+
+# ==============================================================================================
+# MAR-023A: observed scour evidence validation semantics repair
+#
+# Real bug: Question F was derived from `not evidence_gdf.empty`, so a real, correctly
+# classified, non-empty table of exposure/infrastructure/disturbance/seabed-object context
+# (exactly what the real Sheringham 2024 run produces -- zero explicit scour features) wrongly
+# answered YES to "was real source-interpreted SCOUR evidence ingested?". Section 22's A-F list.
+# ==============================================================================================
+
+
+def _classified_evidence(descriptors, category_by_normalized_descriptor):
+    gdf = gpd.GeoDataFrame(
+        {
+            "Descriptio": descriptors,
+            "geometry": [Point(i, i) for i in range(len(descriptors))],
+        },
+        crs="EPSG:32631",
+    )
+    layer = observed_evidence.InterpretationLayer(
+        layer_name="test_layer", gdf=gdf, description_column="Descriptio"
+    )
+    return observed_evidence.build_observed_evidence_table(
+        layer,
+        category_by_normalized_descriptor=category_by_normalized_descriptor,
+        survey_epoch="2024",
+        source_id_column="missing_column",
+    )
+
+
+def test_mar023a_A_nonempty_package_zero_explicit_scour_produces_question_f_no():
+    # exactly the real Sheringham 2024 shape: real, non-empty, correctly classified, but no
+    # descriptor anywhere literally says "scour".
+    evidence_gdf = _classified_evidence(
+        ["Exposure", "Boulder", "Cable", "Jack-up footprint"],
+        {
+            "exposure": observed_evidence.SOURCE_INTERPRETED_EXPOSURE_EVIDENCE,
+            "boulder": observed_evidence.SEABED_OBJECT_CONTEXT,
+            "cable": observed_evidence.ASSET_INFRASTRUCTURE_CONTEXT,
+            "jack-up footprint": observed_evidence.ANTHROPOGENIC_DISTURBANCE_CONTEXT,
+        },
+    )
+    assert not evidence_gdf.empty
+    summary = observed_evidence.summarize_observed_evidence(evidence_gdf)
+    assert summary["explicit_scour_feature_count"] == 0
+    assert summary["explicit_source_interpreted_scour_evidence_present"] is False
+
+    validation = cli._derive_scour_poc_validation_questions(
+        margin_computed_when_actual_embedment_provided=True,
+        exceedance_fraction_computable=True,
+        pl854_scenario_envelope_produced=True,
+        explicit_scour_evidence_present=summary[
+            "explicit_source_interpreted_scour_evidence_present"
+        ],
+        operator_interpretation_package_ingested=summary[
+            "operator_interpretation_package_ingested"
+        ],
+    )
+    assert validation["question_f_real_source_interpreted_scour_evidence_ingested"] == "NO"
+    assert (
+        validation["question_f_reason"]
+        == observed_evidence.NO_EXPLICIT_SOURCE_INTERPRETED_SCOUR_FEATURE_CLASS_PRESENT
+    )
+
+
+def test_mar023a_B_explicit_scour_count_positive_produces_question_f_yes():
+    evidence_gdf = _classified_evidence(
+        ["Scour Pit", "Boulder"],
+        {
+            "scour pit": observed_evidence.SOURCE_INTERPRETED_OBSERVED_SCOUR_EVIDENCE,
+            "boulder": observed_evidence.SEABED_OBJECT_CONTEXT,
+        },
+    )
+    summary = observed_evidence.summarize_observed_evidence(evidence_gdf)
+    assert summary["explicit_scour_feature_count"] == 1
+    assert summary["explicit_source_interpreted_scour_evidence_present"] is True
+
+    validation = cli._derive_scour_poc_validation_questions(
+        margin_computed_when_actual_embedment_provided=True,
+        exceedance_fraction_computable=True,
+        pl854_scenario_envelope_produced=True,
+        explicit_scour_evidence_present=summary[
+            "explicit_source_interpreted_scour_evidence_present"
+        ],
+        operator_interpretation_package_ingested=summary[
+            "operator_interpretation_package_ingested"
+        ],
+    )
+    assert validation["question_f_real_source_interpreted_scour_evidence_ingested"] == "YES"
+    assert validation["question_f_reason"] is None
+
+
+def test_mar023a_C_operator_ingestion_status_independent_of_explicit_scour_presence():
+    evidence_gdf = _classified_evidence(
+        ["Exposure"], {"exposure": observed_evidence.SOURCE_INTERPRETED_EXPOSURE_EVIDENCE}
+    )
+    summary = observed_evidence.summarize_observed_evidence(evidence_gdf)
+    # ingestion succeeded (real, non-empty, classified data arrived) EVEN THOUGH no explicit
+    # scour evidence exists -- the two facts are independent, never derived from each other.
+    assert summary["operator_interpretation_package_ingested"] is True
+    assert summary["explicit_source_interpreted_scour_evidence_present"] is False
+
+    validation = cli._derive_scour_poc_validation_questions(
+        margin_computed_when_actual_embedment_provided=True,
+        exceedance_fraction_computable=True,
+        pl854_scenario_envelope_produced=True,
+        explicit_scour_evidence_present=summary[
+            "explicit_source_interpreted_scour_evidence_present"
+        ],
+        operator_interpretation_package_ingested=summary[
+            "operator_interpretation_package_ingested"
+        ],
+    )
+    assert validation["operator_interpretation_package_ingested"] == "YES"
+    assert validation["explicit_source_interpreted_scour_evidence_present"] == "NO"
+
+
+def test_mar023a_D_exposure_never_counts_as_scour():
+    evidence_gdf = _classified_evidence(
+        ["Exposure"] * 50, {"exposure": observed_evidence.SOURCE_INTERPRETED_EXPOSURE_EVIDENCE}
+    )
+    summary = observed_evidence.summarize_observed_evidence(evidence_gdf)
+    assert summary["count_by_category"] == {
+        observed_evidence.SOURCE_INTERPRETED_EXPOSURE_EVIDENCE: 50
+    }
+    assert summary["explicit_scour_feature_count"] == 0
+    assert (
+        observed_evidence.SOURCE_INTERPRETED_OBSERVED_SCOUR_EVIDENCE
+        not in summary["count_by_category"]
+    )
+
+
+def test_mar023a_E_gis_layer_not_named_as_though_every_row_were_scour():
+    source = inspect.getsource(cli._cmd_build_scour_susceptibility_poc)
+    assert '"source_interpreted_integrity_context"' in source
+    assert '"explicit_observed_scour_evidence"' in source
+    # the old, misleading name (implying every row is a scour observation) must no longer be
+    # used as a live GIS layer name.
+    assert 'layer="observed_scour_evidence"' not in source
+
+
+def test_mar023a_E2_map_title_states_integrity_context_not_scour_evidence():
+    source = inspect.getsource(observed_evidence_map)
+    assert "Source-Interpreted Scour / Integrity Context" in source
+    assert "NO EXPLICIT SOURCE-INTERPRETED SCOUR FEATURES WERE PRESENT" in source
+
+
+def test_mar023a_F_track_a_scenario_envelope_numeric_output_unchanged():
+    # golden-value regression: locks in the exact real numbers MAR-023 already produced and
+    # verified, proving this ticket's changes never touched Track A's arithmetic.
+    mobility_df = _single_scenario_mobility_df("HP1", [0.06] * 20)
+    summary_df, _detail_df = susceptibility.build_scenario_envelope_table(
+        pipeline_id="PL854", sections=[SECTION], mobility_df=mobility_df, diameter_m=0.3048
+    )
+    ordered = summary_df.sort_values("tested_embedment_scenario_ratio")
+    assert ordered["scour_onset_screening_exceedance_fraction"].tolist() == [
+        1.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
+    assert ordered["critical_embedment_ratio_p95"].tolist() == [0.06] * 5
+
+
+def test_mar023a_F2_track_a_module_source_untouched_by_this_ticket():
+    # a coarse but meaningful guard: MAR-023A's ticket text explicitly forbids touching
+    # Track A's physics/margin/exceedance logic -- confirm the module carries no MAR-023A
+    # marker/reference, i.e. it was never edited for this ticket.
+    source = inspect.getsource(susceptibility)
+    assert "MAR-023A" not in source
 
 
 # --- scenario envelope table shape (Section 16) ----------------------------------------------

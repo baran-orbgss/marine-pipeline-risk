@@ -63,6 +63,7 @@ __all__ = [
     "UNCLASSIFIED_INTERPRETATION_FEATURE",
     "ASSET_PHYSICS_NOT_EQUIVALENT_TO_PIPELINE_SCOUR_MODEL",
     "OBSERVED_SCOUR_MORPHOMETRY_NOT_AVAILABLE_FROM_SOURCE_PACKAGE",
+    "NO_EXPLICIT_SOURCE_INTERPRETED_SCOUR_FEATURE_CLASS_PRESENT",
     "build_observed_evidence_table",
     "summarize_observed_evidence",
 ]
@@ -107,6 +108,15 @@ ASSET_PHYSICS_DISCLAIMER = (
 # --- Section 13: optional descriptive morphometry ---------------------------------------------
 OBSERVED_SCOUR_MORPHOMETRY_NOT_AVAILABLE_FROM_SOURCE_PACKAGE = (
     "OBSERVED_SCOUR_MORPHOMETRY_NOT_AVAILABLE_FROM_SOURCE_PACKAGE"
+)
+
+# --- MAR-023A: two separate concepts, never conflated (Section 4) ---------------------------
+# "An operator's interpretation package was ingested" and "that package contains an explicit
+# scour feature class" are independent facts -- a survey can genuinely ingest 746 real,
+# classified features and still contain zero literal scour observations (exactly what
+# Sheringham 2024 demonstrates). Neither implies the other.
+NO_EXPLICIT_SOURCE_INTERPRETED_SCOUR_FEATURE_CLASS_PRESENT = (
+    "NO_EXPLICIT_SOURCE_INTERPRETED_SCOUR_FEATURE_CLASS_PRESENT"
 )
 
 
@@ -236,7 +246,14 @@ def build_observed_evidence_table(
 
 def summarize_observed_evidence(evidence_gdf: gpd.GeoDataFrame) -> dict[str, Any]:
     """Section 11/24: feature counts by category and by source-stated asset association --
-    descriptive only, never a morphometric or physics claim."""
+    descriptive only, never a morphometric or physics claim.
+
+    MAR-023A Section 4: `operator_interpretation_package_ingested` (did real, classified
+    operator data arrive at all) and `explicit_source_interpreted_scour_evidence_present`
+    (does the source literally use the word "scour" for at least one feature) are recorded as
+    two INDEPENDENT booleans -- a non-empty `evidence_gdf` full of exposure/debris/cable
+    context proves the first without proving the second.
+    """
 
     if evidence_gdf.empty:
         return {
@@ -245,6 +262,11 @@ def summarize_observed_evidence(evidence_gdf: gpd.GeoDataFrame) -> dict[str, Any
             "count_by_asset_association": {},
             "explicit_scour_feature_count": 0,
             "morphometry_status": OBSERVED_SCOUR_MORPHOMETRY_NOT_AVAILABLE_FROM_SOURCE_PACKAGE,
+            "operator_interpretation_package_ingested": False,
+            "explicit_source_interpreted_scour_evidence_present": False,
+            "explicit_scour_absence_reason": (
+                NO_EXPLICIT_SOURCE_INTERPRETED_SCOUR_FEATURE_CLASS_PRESENT
+            ),
         }
 
     count_by_category = {
@@ -255,6 +277,7 @@ def summarize_observed_evidence(evidence_gdf: gpd.GeoDataFrame) -> dict[str, Any
         str(k): int(v) for k, v in asset_series.value_counts(dropna=False).items()
     }
     explicit_scour_count = count_by_category.get(SOURCE_INTERPRETED_OBSERVED_SCOUR_EVIDENCE, 0)
+    explicit_scour_present = explicit_scour_count > 0
 
     return {
         "total_feature_count": int(len(evidence_gdf)),
@@ -266,7 +289,16 @@ def summarize_observed_evidence(evidence_gdf: gpd.GeoDataFrame) -> dict[str, Any
         # a different (e.g. exposure/debris) feature class and calling it scour morphometry.
         "morphometry_status": (
             OBSERVED_SCOUR_MORPHOMETRY_NOT_AVAILABLE_FROM_SOURCE_PACKAGE
-            if explicit_scour_count == 0
+            if not explicit_scour_present
             else None
+        ),
+        # A real, non-empty, classified table is itself proof that operator data was ingested
+        # -- independent of what any of it turned out to be classified as.
+        "operator_interpretation_package_ingested": True,
+        "explicit_source_interpreted_scour_evidence_present": explicit_scour_present,
+        "explicit_scour_absence_reason": (
+            None
+            if explicit_scour_present
+            else NO_EXPLICIT_SOURCE_INTERPRETED_SCOUR_FEATURE_CLASS_PRESENT
         ),
     }

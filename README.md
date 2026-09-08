@@ -2033,4 +2033,52 @@ otherwise, never an interactive credential prompt.
   real answers: `IS GENERIC OPERATOR-SUPPLIED PIPELINE SCOUR-ONSET
   SUSCEPTIBILITY SCREENING DEMONSTRATED?` YES; `IS A SITE-SPECIFIC PL854
   SCOUR SUSCEPTIBILITY MAP DEFENSIBLE WITH THE CURRENT DATA?` NO (expected
-  -- no actual embedment profile exists). No further ticket has started.
+  -- no actual embedment profile exists).
+- **MAR-023A (observed scour evidence validation semantics repair, Track A
+  untouched).** A precise correction, not a rewrite: MAR-023's validation
+  Question F ("was real source-interpreted SCOUR evidence ingested from an
+  operator survey?") was wrongly derived from `not evidence_gdf.empty` --
+  true for the real Sheringham 2024 run's 746 classified features even
+  though every single one of them is exposure/infrastructure/disturbance/
+  seabed-object context, never a literal scour observation. Fixed to
+  derive strictly from `explicit_scour_feature_count > 0`
+  (`observed_evidence.summarize_observed_evidence` already computed this
+  count correctly; only the CLI's validation call was wrong), so the real
+  run now correctly answers Question F **NO**, with reason
+  `NO_EXPLICIT_SOURCE_INTERPRETED_SCOUR_FEATURE_CLASS_PRESENT`. Two
+  previously-conflated facts are now recorded as fully independent
+  booleans everywhere the ticket required (validation JSON, HTML report,
+  CLI final report): `operator_interpretation_package_ingested` (YES --
+  real data genuinely arrived and was classified) and
+  `explicit_source_interpreted_scour_evidence_present` (NO). The GIS
+  geopackage's primary layer (`observed_scour_evidence.gpkg`, filename
+  kept for compatibility) is renamed from the misleading
+  `observed_scour_evidence` to `source_interpreted_integrity_context`;
+  code to write a separate `explicit_observed_scour_evidence` layer exists
+  for when a source genuinely does contain literal scour features, but is
+  correctly absent for the real Sheringham run (zero such features). The
+  evidence map's title changed to "Sheringham Shoal 2024 -- Source-
+  Interpreted Scour / Integrity Context" with a prominent red banner --
+  "NO EXPLICIT SOURCE-INTERPRETED SCOUR FEATURES WERE PRESENT" -- rendered
+  with fixed figure headroom (`fig.subplots_adjust(top=0.83)`) so the
+  banner can never collide with the title/subtitle regardless of whether
+  it renders, avoiding a repeat of the title-collision bug class already
+  fixed once in this same ticket. `susceptibility.py`/`susceptibility_map.py`
+  (Track A: MAR-014 physics, the PL854 scenario envelope, critical-
+  embedment percentiles, the actual-vs-critical margin, exceedance
+  fractions, the floating-point tolerance fix) were not modified at all --
+  confirmed both by `git status` and by a test asserting the module source
+  carries no MAR-023A reference -- and a real offline rerun reproduced
+  bit-identical PL854 numbers (0D exceedance min/median/max
+  0.20907866897480284/0.43758415079823043/0.5079823042892864, unchanged to
+  the last digit) against the already-cached MDE package
+  (`already_cached=True`, zero new network access). 8 new tests cover: a
+  non-empty package with zero explicit scour features producing Question F
+  = NO with the correct reason; an explicit scour count > 0 producing
+  Question F = YES; operator-ingestion status remaining YES independently
+  of explicit-scour presence; exposure never counting as scour; the GIS
+  layer/map title no longer implying every row is a scour observation; and
+  an exact numeric golden-value regression proving Track A's scenario
+  envelope arithmetic is untouched. Full offline suite: 1226 tests, 25
+  live/network tests correctly deselected; repo-wide `ruff format`/
+  `ruff check` pass clean. No further ticket has started.

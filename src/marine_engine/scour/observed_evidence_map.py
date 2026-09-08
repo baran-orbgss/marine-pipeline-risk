@@ -104,13 +104,20 @@ def render_observed_scour_evidence_map(
     output_path: Path,
     background_raster_path: Path | None = None,
     background_raster_label: str | None = None,
-    title: str = "Sheringham Shoal 2024 — Observed Scour Evidence",
+    explicit_scour_evidence_present: bool = True,
+    title: str = "Sheringham Shoal 2024 — Source-Interpreted Scour / Integrity Context",
     subtitle: str = "Source-interpreted survey targets, classified exactly as source-stated",
     dpi: int = 150,
 ) -> Path:
     """Shows ONLY the observed/source-interpreted evidence plus subdued background context
     (Section 18) -- title is never "Pipeline Scour Susceptibility": this survey covers
-    windfarm infrastructure, not a pipeline."""
+    windfarm infrastructure, not a pipeline.
+
+    MAR-023A Section 6: the title itself is never "Observed Scour Evidence" -- most (usually
+    all) of what this map shows is general integrity context (exposure, infrastructure,
+    disturbance, seabed objects), not scour. When `explicit_scour_evidence_present` is False
+    (the real Sheringham 2024 result), a prominent banner states that plainly rather than
+    letting the legend's mere presence of colour categories imply otherwise."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -145,7 +152,24 @@ def render_observed_scour_evidence_map(
     _add_scale_bar(ax)
     _add_north_arrow(ax)
 
+    # Fixed headroom (whether or not the banner below actually renders, so the figure layout
+    # is identical either way) for three stacked lines -- suptitle, the explicit-scour-absence
+    # banner, and the axes' own subtitle -- avoiding the title/subtitle collision class of bug
+    # already found and fixed elsewhere in this ticket (MAR-023's `susceptibility_map.py`).
+    fig.subplots_adjust(top=0.83)
     fig.suptitle(title, fontsize=14, fontweight="bold", y=0.98)
+    if not explicit_scour_evidence_present:
+        fig.text(
+            0.5,
+            0.935,
+            "NO EXPLICIT SOURCE-INTERPRETED SCOUR FEATURES WERE PRESENT",
+            transform=fig.transFigure,
+            ha="center",
+            va="top",
+            fontsize=10,
+            fontweight="bold",
+            color="#8b0000",
+        )
     ax.set_title(subtitle, fontsize=9, style="italic", pad=14)
     ax.set_aspect("equal")
     ax.set_xticks([])

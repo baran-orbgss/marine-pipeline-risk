@@ -3490,12 +3490,21 @@ def _derive_scour_poc_validation_questions(
     margin_computed_when_actual_embedment_provided: bool,
     exceedance_fraction_computable: bool,
     pl854_scenario_envelope_produced: bool,
-    real_scour_evidence_ingested: bool,
-) -> dict[str, str]:
-    """MAR-023 Section 21: a pure function so D/G/H's mandated NO answers are structurally
-    enforced (asserted), not just conventionally true -- this POC never assembles a PL854
-    site-specific embedment profile, never feeds Sheringham evidence into the pipeline
-    physics, and never predicts a future scour depth."""
+    explicit_scour_evidence_present: bool,
+    operator_interpretation_package_ingested: bool,
+) -> dict[str, str | None]:
+    """MAR-023 Section 21 (MAR-023A Section 3 correction): a pure function so D/G/H's mandated
+    NO answers are structurally enforced (asserted), not just conventionally true -- this POC
+    never assembles a PL854 site-specific embedment profile, never feeds Sheringham evidence
+    into the pipeline physics, and never predicts a future scour depth.
+
+    Question F asks specifically about EXPLICIT source-interpreted SCOUR evidence -- never
+    "any interpreted feature at all" (Section 3's real bug: a non-empty, fully-real,
+    correctly-classified `evidence_gdf` full of exposure/debris/cable context is NOT scour
+    evidence, and must not be read as YES here). `operator_interpretation_package_ingested`
+    is threaded through separately (never derived FROM the F answer or vice versa) so a
+    caller cannot accidentally collapse the two independent facts back into one (Section 4).
+    """
 
     pl854_has_site_specific_data = False
     sheringham_used_as_pipeline_validation = False
@@ -3519,13 +3528,26 @@ def _derive_scour_poc_validation_questions(
             "YES" if pl854_scenario_envelope_produced else "NO"
         ),
         "question_f_real_source_interpreted_scour_evidence_ingested": (
-            "YES" if real_scour_evidence_ingested else "NO"
+            "YES" if explicit_scour_evidence_present else "NO"
+        ),
+        "question_f_reason": (
+            None
+            if explicit_scour_evidence_present
+            else observed_evidence.NO_EXPLICIT_SOURCE_INTERPRETED_SCOUR_FEATURE_CLASS_PRESENT
         ),
         "question_g_sheringham_used_as_pipeline_physics_validation": (
             "YES" if sheringham_used_as_pipeline_validation else "NO"
         ),
         "question_h_future_scour_depth_prediction_made": (
             "YES" if future_scour_depth_prediction_made else "NO"
+        ),
+        # Section 4: recorded here too so the validation JSON carries both concepts even
+        # though only F is a lettered question -- deliberately independent of question_f.
+        "operator_interpretation_package_ingested": (
+            "YES" if operator_interpretation_package_ingested else "NO"
+        ),
+        "explicit_source_interpreted_scour_evidence_present": (
+            "YES" if explicit_scour_evidence_present else "NO"
         ),
     }
 
@@ -3761,6 +3783,7 @@ def _cmd_build_scour_susceptibility_poc(args: argparse.Namespace) -> int:
     background_raster_path = (
         study_dir.parent / "sheringham_shoal_2020" / "terrain" / "canonical_bed_elevation.tif"
     )
+    explicit_scour_present = evidence_summary["explicit_source_interpreted_scour_evidence_present"]
     evidence_map_path = observed_evidence_map.render_observed_scour_evidence_map(
         evidence_gdf=evidence_gdf,
         output_path=sheringham_maps_dir / "sheringham_shoal_2024_observed_scour_evidence.png",
@@ -3771,15 +3794,28 @@ def _cmd_build_scour_susceptibility_poc(args: argparse.Namespace) -> int:
             "2020 MBES canonical bed elevation (MAR-020/021, spatial context only -- not "
             "co-temporal with the 2024 interpretation)"
         ),
+        explicit_scour_evidence_present=explicit_scour_present,
     )
     print(f"  Observed evidence map -> {evidence_map_path}")
 
-    # --- GIS (Section 19) ------------------------------------------------------------------------
+    # --- GIS (Section 19; MAR-023A Section 5: semantically-correct layer names) ------------------
+    # Filename kept as `observed_scour_evidence.gpkg` for compatibility (Section 5), but the
+    # primary layer holding ALL 746 interpreted features is named for what it actually is --
+    # a general integrity-context layer, never implying every row is a scour observation.
     sheringham_gpkg_path = sheringham_scour_dir / "observed_scour_evidence.gpkg"
     if sheringham_gpkg_path.exists():
         sheringham_gpkg_path.unlink()
     if not evidence_gdf.empty:
-        evidence_gdf.to_file(sheringham_gpkg_path, driver="GPKG", layer="observed_scour_evidence")
+        evidence_gdf.to_file(
+            sheringham_gpkg_path, driver="GPKG", layer="source_interpreted_integrity_context"
+        )
+    explicit_scour_gdf = observed_evidence.extract_scour_category(
+        evidence_gdf, observed_evidence.SOURCE_INTERPRETED_OBSERVED_SCOUR_EVIDENCE
+    )
+    if not explicit_scour_gdf.empty:
+        explicit_scour_gdf.to_file(
+            sheringham_gpkg_path, driver="GPKG", layer="explicit_observed_scour_evidence"
+        )
     print(f"  GIS: {sheringham_gpkg_path}")
 
     # ==========================================================================================
@@ -3792,7 +3828,12 @@ def _cmd_build_scour_susceptibility_poc(args: argparse.Namespace) -> int:
         margin_computed_when_actual_embedment_provided=True,
         exceedance_fraction_computable=True,
         pl854_scenario_envelope_produced=not envelope_summary_df.empty,
-        real_scour_evidence_ingested=not evidence_gdf.empty,
+        explicit_scour_evidence_present=evidence_summary[
+            "explicit_source_interpreted_scour_evidence_present"
+        ],
+        operator_interpretation_package_ingested=evidence_summary[
+            "operator_interpretation_package_ingested"
+        ],
     )
 
     blocks = scour_poc_report.build_scour_poc_report_blocks(
@@ -3853,7 +3894,16 @@ def _cmd_build_scour_susceptibility_poc(args: argparse.Namespace) -> int:
             "package_bytes": acquisition.package_bytes,
             "total_feature_count": evidence_summary["total_feature_count"],
             "count_by_category": evidence_summary["count_by_category"],
+            "operator_interpretation_package_ingested": (
+                "YES" if evidence_summary["operator_interpretation_package_ingested"] else "NO"
+            ),
+            "explicit_source_interpreted_scour_evidence_present": (
+                "YES"
+                if evidence_summary["explicit_source_interpreted_scour_evidence_present"]
+                else "NO"
+            ),
             "explicit_scour_feature_count": evidence_summary["explicit_scour_feature_count"],
+            "explicit_scour_absence_reason": evidence_summary["explicit_scour_absence_reason"],
             "morphometry_status": evidence_summary["morphometry_status"],
         },
         asset_physics_mismatch_text=observed_evidence.ASSET_PHYSICS_DISCLAIMER,
@@ -3906,6 +3956,16 @@ def _cmd_build_scour_susceptibility_poc(args: argparse.Namespace) -> int:
     print(f"  interpretation layer inventory: {len(inventory_df)} attribute-value row(s)")
     print(f"  observed feature count/classes: {evidence_summary['count_by_category']}")
     print(f"  asset associations (source-stated): {evidence_summary['count_by_asset_association']}")
+    print(
+        "  operator_interpretation_package_ingested: "
+        f"{validation['operator_interpretation_package_ingested']}"
+    )
+    print(
+        "  explicit_source_interpreted_scour_evidence_present: "
+        f"{validation['explicit_source_interpreted_scour_evidence_present']}"
+    )
+    if validation.get("question_f_reason"):
+        print(f"  reason: {validation['question_f_reason']}")
     print()
     print("## Outputs")
     print(f"  maps: {susceptibility_map_path}, {envelope_map_path}, {evidence_map_path}")
