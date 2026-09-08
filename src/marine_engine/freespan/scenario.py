@@ -199,16 +199,19 @@ def build_support_loss_scenario_profile(
     survey_epoch: str,
     vertical_reference_semantics: str,
     measured_intervals_df: pd.DataFrame,
+    interval_boundary_semantics: str = support_state.UNSUPPORTED_SAMPLE_RUN_EXTENT,
     chainage_column: str = "chainage_m",
     clearance_column: str = "clearance_m",
     support_state_column: str = "measured_support_state",
 ) -> dict[str, Any]:
     """The interval-aware profile screening (Sections 12-15): recomputes scenario clearance and
-    scenario measured state per sample (never moving the pipe), re-extracts scenario intervals
-    with the SAME gap-governance rule as the baseline (Section 10), and classifies each scenario
-    interval against the baseline `measured_intervals_df` as NEW, an EXTENSION of an existing
-    span, or UNCHANGED -- giving `new_span_count`/`extended_span_count` as real interval counts,
-    not per-sample counts."""
+    scenario measured state per sample (never moving the pipe, and never consuming any source-
+    interpretation flag -- MAR-025A Section 7), re-extracts scenario intervals with the SAME
+    gap-governance rule as the baseline (Section 10), and classifies each scenario interval
+    against the baseline `measured_intervals_df` as NEW, an EXTENSION of an existing span, or
+    UNCHANGED -- giving `new_span_count`/`extended_span_count` as real interval counts, not
+    per-sample counts. `interval_boundary_semantics` defaults to `UNSUPPORTED_SAMPLE_RUN_EXTENT`,
+    same as the baseline extraction (MAR-025A Section 9)."""
 
     result_df = profile_df.reset_index(drop=True).copy()
     scenario_available = lowering_input is not None and classification_threshold_m is not None
@@ -237,7 +240,6 @@ def build_support_loss_scenario_profile(
     result_df["scenario_measured_support_state"] = [
         support_state.classify_measured_support_state(
             None if pd.isna(v) else float(v),
-            is_source_interpreted_free_span=False,
             classification_threshold_m=classification_threshold_m,
         )
         for v in result_df["scenario_clearance_m"]
@@ -250,6 +252,7 @@ def build_support_loss_scenario_profile(
         survey_epoch=survey_epoch,
         classification_threshold_m=classification_threshold_m,
         vertical_reference_semantics=vertical_reference_semantics,
+        interval_boundary_semantics=interval_boundary_semantics,
         support_state_column="scenario_measured_support_state",
         clearance_column="scenario_clearance_m",
         chainage_column=chainage_column,

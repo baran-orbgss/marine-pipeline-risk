@@ -10249,6 +10249,59 @@ def _cmd_build_free_span_poc(args: argparse.Namespace) -> int:
     )
     print(f"  max_measurement_gap_m: {fs_synthetic.MAX_MEASUREMENT_GAP_M}")
     print()
+    print("## Measured geometry")
+    print("  MEASURED SUPPORT STATE IS DERIVED ONLY FROM PIPE/SEABED GEOMETRY.")
+    print()
+    print("## Source interpretation")
+    print(
+        "  SOURCE-INTERPRETED FREE-SPAN EVIDENCE IS AN ORTHOGONAL EVIDENCE DIMENSION AND NEVER "
+        "OVERRIDES GEOMETRIC CLASSIFICATION."
+    )
+    print(
+        f"  source_interpreted_free_span_sample_count (synthetic): "
+        f"{synthetic_summary['source_interpreted_free_span_sample_count']}"
+    )
+    print(
+        "  geometry_vs_source_interpretation_statuses observed (synthetic): "
+        f"{synthetic_summary['source_interpreted_geometry_vs_source_statuses']}"
+    )
+    print()
+    print("## Interval support")
+    print(
+        "  interval_boundary_semantics (synthetic): "
+        f"{synthetic_summary['interval_boundary_semantics']}"
+    )
+    print(f"  span_length_semantics: {fs_support_state.SPAN_LENGTH_SEMANTICS_NOTE}")
+    print(
+        f"  gap_governance: max_measurement_gap_m={fs_synthetic.MAX_MEASUREMENT_GAP_M}, "
+        f"flag={fs_support_state.SPAN_SPLIT_BY_MEASUREMENT_GAP}"
+    )
+    print(
+        "  A DISCRETE UNSUPPORTED SAMPLE RUN IS NOT AUTOMATICALLY CLAIMED TO BE AN EXACT "
+        "PHYSICAL FREE-SPAN LENGTH."
+    )
+    print()
+    print("## Regression")
+    regression_unchanged = (
+        synthetic_summary["recovered_measured_span_count"]
+        == synthetic_summary["expected_measured_span_count"]
+        and sorted(synthetic_summary["recovered_measured_span_lengths_m"])
+        == sorted(synthetic_summary["expected_measured_span_lengths_m"])
+        and abs(
+            synthetic_summary["recovered_max_clearance_m"]
+            - synthetic_summary["expected_max_clearance_m"]
+        )
+        < 1e-6
+        and synthetic_summary["recovered_scenario_new_span_count"]
+        == synthetic_summary["expected_scenario_new_span_count"]
+        and synthetic_summary["recovered_scenario_extended_span_count"]
+        == synthetic_summary["expected_scenario_extended_span_count"]
+    )
+    print(
+        "  EXISTING SYNTHETIC NUMERICAL OUTPUTS ARE UNCHANGED: "
+        f"{'YES' if regression_unchanged else 'NO'}"
+    )
+    print()
     print("## Synthetic validation")
     for key, value in synthetic_summary.items():
         print(f"  {key}: {value}")

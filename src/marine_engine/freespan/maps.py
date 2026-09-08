@@ -308,10 +308,11 @@ def render_nsta_registry_overview_map(
     dpi: int = 150,
 ) -> Path:
     """Section 26: an observed-evidence-only map (no risk colouring). Because the full UKCS
-    registry spans 222+ distinct pipelines and is unreadable as one detailed map, this renders
-    an overview (every real record, by longitude/latitude) plus one data-driven high-record-
-    count pipeline example -- the example is selected purely by registry record count and is
-    explicitly NOT an indication of highest risk (Section 26)."""
+    registry spans many distinct pipelines (a runtime-derived count, never hard-coded here --
+    MAR-025A Section 15) and is unreadable as one detailed map, this renders an overview (every
+    real record, by longitude/latitude) plus one data-driven high-record-count pipeline example
+    -- the example is selected purely by registry record count and is explicitly NOT an
+    indication of highest risk (Section 26)."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, (ax_overview, ax_example) = plt.subplots(1, 2, figsize=(14.0, 6.5))

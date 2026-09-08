@@ -143,9 +143,7 @@ def test_3c_missing_input_yields_no_clearance():
 
 
 def test_4_no_threshold_means_no_categorical_free_span():
-    state = support_state.classify_measured_support_state(
-        0.6, is_source_interpreted_free_span=False, classification_threshold_m=None
-    )
+    state = support_state.classify_measured_support_state(0.6, classification_threshold_m=None)
     assert state == support_state.MEASURED_SUPPORT_STATE_UNRESOLVED
     assert state != support_state.MEASURED_UNSUPPORTED
 
@@ -253,55 +251,386 @@ def test_8b_no_gap_produces_one_interval():
     assert intervals["limitations"].iloc[0] is None
 
 
+# --- 16.G: ordinary discrete interval is labelled UNSUPPORTED_SAMPLE_RUN_EXTENT ----------------
+
+
+def test_16g_ordinary_interval_defaults_to_unsupported_sample_run_extent():
+    profile_df = pd.DataFrame(
+        {
+            "chainage_m": [0.0, 10.0, 20.0],
+            "clearance_m": [0.6, 0.6, 0.6],
+            "measured_support_state": [support_state.MEASURED_UNSUPPORTED] * 3,
+        }
+    )
+    # interval_boundary_semantics is not passed -- must default, never silently assign
+    # EXPLICIT_BOUNDARY_SAMPLES.
+    intervals = support_state.extract_measured_free_span_intervals(
+        profile_df,
+        asset_id="TEST_ASSET",
+        max_measurement_gap_m=50.0,
+        survey_epoch="TEST",
+        classification_threshold_m=0.1,
+        vertical_reference_semantics="TEST",
+    )
+    assert (
+        intervals["interval_boundary_semantics"] == support_state.UNSUPPORTED_SAMPLE_RUN_EXTENT
+    ).all()
+    assert not (
+        intervals["interval_boundary_semantics"] == support_state.EXPLICIT_BOUNDARY_SAMPLES
+    ).any()
+
+
+def test_16g2_unknown_boundary_semantics_is_rejected():
+    profile_df = pd.DataFrame(
+        {
+            "chainage_m": [0.0],
+            "clearance_m": [0.6],
+            "measured_support_state": [support_state.MEASURED_UNSUPPORTED],
+        }
+    )
+    with pytest.raises(ValueError):
+        support_state.extract_measured_free_span_intervals(
+            profile_df,
+            asset_id="TEST_ASSET",
+            max_measurement_gap_m=50.0,
+            survey_epoch="TEST",
+            classification_threshold_m=0.1,
+            vertical_reference_semantics="TEST",
+            interval_boundary_semantics="NOT_A_REAL_SEMANTICS_VALUE",
+        )
+
+
+def test_16g3_boundary_brackets_only_populated_when_requested():
+    profile_df = pd.DataFrame(
+        {
+            "chainage_m": [0.0, 10.0, 20.0, 30.0, 40.0],
+            "clearance_m": [-0.5, 0.6, 0.6, 0.6, -0.5],
+            "measured_support_state": [
+                support_state.MEASURED_SUPPORTED,
+                support_state.MEASURED_UNSUPPORTED,
+                support_state.MEASURED_UNSUPPORTED,
+                support_state.MEASURED_UNSUPPORTED,
+                support_state.MEASURED_SUPPORTED,
+            ],
+        }
+    )
+    default_intervals = support_state.extract_measured_free_span_intervals(
+        profile_df,
+        asset_id="TEST_ASSET",
+        max_measurement_gap_m=50.0,
+        survey_epoch="TEST",
+        classification_threshold_m=0.1,
+        vertical_reference_semantics="TEST",
+    )
+    assert default_intervals["left_boundary_bracket_start_m"].isna().all()
+    assert default_intervals["right_boundary_bracket_start_m"].isna().all()
+
+    bracketed_intervals = support_state.extract_measured_free_span_intervals(
+        profile_df,
+        asset_id="TEST_ASSET",
+        max_measurement_gap_m=50.0,
+        survey_epoch="TEST",
+        classification_threshold_m=0.1,
+        vertical_reference_semantics="TEST",
+        interval_boundary_semantics=support_state.BOUNDARY_BRACKETED_BY_ADJACENT_MEASUREMENTS,
+    )
+    row = bracketed_intervals.iloc[0]
+    assert row["left_boundary_bracket_start_m"] == pytest.approx(0.0)
+    assert row["left_boundary_bracket_end_m"] == pytest.approx(10.0)
+    assert row["right_boundary_bracket_start_m"] == pytest.approx(30.0)
+    assert row["right_boundary_bracket_end_m"] == pytest.approx(40.0)
+
+
+# --- 16.H: synthetic exact case is explicitly labelled as exact-by-construction ----------------
+
+
+def test_16h_synthetic_case_is_labelled_explicit_boundary_by_construction():
+    case = synthetic.build_synthetic_free_span_case()
+    assert (
+        case.measured_intervals_df["interval_boundary_semantics"]
+        == support_state.EXPLICIT_BOUNDARY_SAMPLES
+    ).all()
+    assert synthetic.SYNTHETIC_BOUNDARY_SEMANTICS_NOTE == (
+        "EXPLICIT_BOUNDARY_SAMPLES_BY_SYNTHETIC_CONSTRUCTION"
+    )
+    summary = synthetic.summarize_synthetic_case(case)
+    assert summary["boundary_semantics_note"] == synthetic.SYNTHETIC_BOUNDARY_SEMANTICS_NOTE
+
+
+def test_16h2_explicit_boundary_is_never_the_generic_default():
+    # the generic engine's own default must remain UNSUPPORTED_SAMPLE_RUN_EXTENT -- only the
+    # synthetic case opts into EXPLICIT_BOUNDARY_SAMPLES, and only by explicitly passing it.
+    import inspect as _inspect
+
+    default = (
+        _inspect.signature(support_state.extract_measured_free_span_intervals)
+        .parameters["interval_boundary_semantics"]
+        .default
+    )
+    assert default == support_state.UNSUPPORTED_SAMPLE_RUN_EXTENT
+
+
+# --- 16.I: generic interval length is not described as exact without explicit semantics --------
+
+
+def test_16i_span_length_semantics_field_present_and_honest():
+    profile_df = pd.DataFrame(
+        {
+            "chainage_m": [0.0, 10.0],
+            "clearance_m": [0.6, 0.6],
+            "measured_support_state": [support_state.MEASURED_UNSUPPORTED] * 2,
+        }
+    )
+    intervals = support_state.extract_measured_free_span_intervals(
+        profile_df,
+        asset_id="TEST_ASSET",
+        max_measurement_gap_m=50.0,
+        survey_epoch="TEST",
+        classification_threshold_m=0.1,
+        vertical_reference_semantics="TEST",
+    )
+    note = intervals["span_length_semantics"].iloc[0]
+    assert "EXPLICIT_BOUNDARY_SAMPLES" in note
+    assert "never" in note.lower()
+    # the preferred, unambiguous field names are also present and agree numerically.
+    assert intervals["unsupported_sample_run_extent_m"].iloc[0] == pytest.approx(
+        intervals["span_length_m"].iloc[0]
+    )
+    assert intervals["unsupported_sample_run_start_chainage_m"].iloc[0] == pytest.approx(
+        intervals["start_chainage_m"].iloc[0]
+    )
+    assert intervals["unsupported_sample_run_end_chainage_m"].iloc[0] == pytest.approx(
+        intervals["end_chainage_m"].iloc[0]
+    )
+
+
+# --- 16.J: gap governance remains unchanged ------------------------------------------------------
+
+
+def test_16j_gap_governance_unchanged_with_default_boundary_semantics():
+    # identical scenario to test_8, but explicit about proving the (now-default,
+    # UNSUPPORTED_SAMPLE_RUN_EXTENT) boundary semantics does not weaken gap governance.
+    profile_df = pd.DataFrame(
+        {
+            "chainage_m": [0.0, 10.0, 70.0, 80.0],
+            "clearance_m": [0.6, 0.6, 0.6, 0.6],
+            "measured_support_state": [support_state.MEASURED_UNSUPPORTED] * 4,
+        }
+    )
+    intervals = support_state.extract_measured_free_span_intervals(
+        profile_df,
+        asset_id="TEST_ASSET",
+        max_measurement_gap_m=50.0,
+        survey_epoch="TEST",
+        classification_threshold_m=0.1,
+        vertical_reference_semantics="TEST",
+    )
+    assert len(intervals) == 2
+    assert (intervals["limitations"] == support_state.SPAN_SPLIT_BY_MEASUREMENT_GAP).all()
+    assert (
+        intervals["interval_boundary_semantics"] == support_state.UNSUPPORTED_SAMPLE_RUN_EXTENT
+    ).all()
+
+
+# --- 16.K: synthetic 3 spans / 100-10-10 m / 0.6 m / 1 new / 1 extended results unchanged -------
+
+
+def test_16k_synthetic_case_numerical_results_unchanged():
+    case = synthetic.build_synthetic_free_span_case()
+    assert len(case.measured_intervals_df) == 3
+    recovered_lengths = sorted(
+        float(v) for v in case.measured_intervals_df["unsupported_sample_run_extent_m"]
+    )
+    assert recovered_lengths == pytest.approx([10.0, 10.0, 100.0])
+    assert float(case.measured_intervals_df["maximum_clearance_m"].max()) == pytest.approx(0.6)
+    assert case.scenario_result["new_span_count"] == 1
+    assert case.scenario_result["extended_span_count"] == 1
+
+
 # --- 9: supported/transition/unsupported states correct -----------------------------------------
 
 
 def test_9_positive_clearance_beyond_threshold_is_unsupported():
-    state = support_state.classify_measured_support_state(
-        0.5, is_source_interpreted_free_span=False, classification_threshold_m=0.1
-    )
+    state = support_state.classify_measured_support_state(0.5, classification_threshold_m=0.1)
     assert state == support_state.MEASURED_UNSUPPORTED
 
 
 def test_9b_negative_clearance_beyond_threshold_is_supported():
-    state = support_state.classify_measured_support_state(
-        -0.5, is_source_interpreted_free_span=False, classification_threshold_m=0.1
-    )
+    state = support_state.classify_measured_support_state(-0.5, classification_threshold_m=0.1)
     assert state == support_state.MEASURED_SUPPORTED
 
 
 def test_9c_clearance_within_threshold_band_is_transition():
     for clearance_value in (0.0, 0.05, -0.05, 0.1, -0.1):
         state = support_state.classify_measured_support_state(
-            clearance_value, is_source_interpreted_free_span=False, classification_threshold_m=0.1
+            clearance_value, classification_threshold_m=0.1
         )
         assert state == support_state.MEASURED_SUPPORT_TRANSITION, clearance_value
 
 
-# --- 10: source-interpreted span remains separate from measured inference ----------------------
+def test_9d_classifier_has_no_source_interpretation_parameter():
+    # MAR-025A Section 3: the generic measured-state classifier must not accept a source-
+    # interpretation flag at all -- structurally, not just by convention.
+    params = list(inspect.signature(support_state.classify_measured_support_state).parameters)
+    assert params == ["clearance_m", "classification_threshold_m"]
+    assert not any("source" in p.lower() for p in params)
 
 
-def test_10_source_interpreted_span_overrides_geometric_label():
-    # a clearance value that would geometrically be MEASURED_UNSUPPORTED on its own must become
-    # SOURCE_INTERPRETED_FREE_SPAN when explicitly flagged -- never silently counted as a
-    # geometric measured span.
-    state = support_state.classify_measured_support_state(
-        0.7, is_source_interpreted_free_span=True, classification_threshold_m=0.1
+def test_9e_source_interpreted_free_span_removed_from_measured_state_machine():
+    assert not hasattr(support_state, "SOURCE_INTERPRETED_FREE_SPAN")
+    assert "SOURCE_INTERPRETED_FREE_SPAN" not in support_state.MEASURED_SUPPORT_STATES
+
+
+# --- 10 / MAR-025A 16.A-C: source interpretation is a separate, orthogonal field ---------------
+
+
+def test_10a_source_flag_cannot_alter_measured_support_state():
+    # Section 16.A: a clearance value that would geometrically be MEASURED_UNSUPPORTED must stay
+    # MEASURED_UNSUPPORTED regardless of any source-interpretation bookkeeping -- there is no
+    # parameter through which a source flag could reach this function at all (see test_9d).
+    state_a = support_state.classify_measured_support_state(0.7, classification_threshold_m=0.1)
+    state_b = support_state.classify_measured_support_state(0.7, classification_threshold_m=0.1)
+    assert state_a == state_b == support_state.MEASURED_UNSUPPORTED
+
+
+def test_10b_row_can_be_unsupported_and_source_interpreted_simultaneously():
+    # Section 16.B: one row can simultaneously be geometrically unsupported AND carry source-
+    # interpreted freespan evidence -- both truthfully recorded, neither erased.
+    measured_state = support_state.classify_measured_support_state(
+        0.7, classification_threshold_m=0.1
     )
-    assert state == support_state.SOURCE_INTERPRETED_FREE_SPAN
-    assert state != support_state.MEASURED_UNSUPPORTED
+    source_present = True
+    assert measured_state == support_state.MEASURED_UNSUPPORTED
+    assert source_present is True
+    status = support_state.compute_geometry_vs_source_interpretation_status(
+        measured_state, source_present
+    )
+    assert status == support_state.AGREES_UNSUPPORTED
 
 
-def test_10b_source_interpreted_sample_never_enters_measured_intervals():
+def test_10c_row_can_be_supported_with_source_evidence_without_overwrite():
+    # Section 16.C: one row can be geometrically supported while carrying source freespan
+    # evidence -- a real evidence disagreement, neither value silently overwritten.
+    measured_state = support_state.classify_measured_support_state(
+        -0.7, classification_threshold_m=0.1
+    )
+    source_present = True
+    assert measured_state == support_state.MEASURED_SUPPORTED
+    assert source_present is True
+    status = support_state.compute_geometry_vs_source_interpretation_status(
+        measured_state, source_present
+    )
+    assert status == support_state.SOURCE_ONLY_FREESPAN_EVIDENCE
+
+
+def test_10d_geometry_vs_source_status_never_alters_inputs():
+    # the status function is purely descriptive -- calling it cannot change measured_support_state
+    # or the source flag; re-deriving both from the same inputs always agrees.
+    for clearance_value, threshold, source_present in (
+        (0.7, 0.1, True),
+        (0.7, 0.1, False),
+        (-0.7, 0.1, True),
+        (-0.7, 0.1, False),
+        (0.0, 0.1, True),
+        (0.5, None, True),
+    ):
+        state = support_state.classify_measured_support_state(
+            clearance_value, classification_threshold_m=threshold
+        )
+        status = support_state.compute_geometry_vs_source_interpretation_status(
+            state, source_present
+        )
+        assert status in support_state.GEOMETRY_VS_SOURCE_INTERPRETATION_STATUSES
+        # recompute independently -- the status call must not have mutated anything.
+        state_again = support_state.classify_measured_support_state(
+            clearance_value, classification_threshold_m=threshold
+        )
+        assert state_again == state
+
+
+def test_10e_unresolved_geometry_means_comparison_not_available():
+    state = support_state.classify_measured_support_state(0.5, classification_threshold_m=None)
+    assert state == support_state.MEASURED_SUPPORT_STATE_UNRESOLVED
+    status = support_state.compute_geometry_vs_source_interpretation_status(state, True)
+    assert status == support_state.COMPARISON_NOT_AVAILABLE
+    status_no_flag = support_state.compute_geometry_vs_source_interpretation_status(state, False)
+    assert status_no_flag == support_state.COMPARISON_NOT_AVAILABLE
+
+
+def test_10f_no_evidence_at_all_status():
+    state = support_state.classify_measured_support_state(-0.7, classification_threshold_m=0.1)
+    status = support_state.compute_geometry_vs_source_interpretation_status(state, False)
+    assert status == support_state.NO_FREESPAN_EVIDENCE
+
+
+# --- 16.D/E: source flag inside/outside a run cannot split or create a measured span -----------
+
+
+def test_16d_source_flag_inside_an_unsupported_run_does_not_split_the_measured_span():
+    # MAR-025A Section 6 regression case: unsupported geometry at chainages 100, 125, 150, with
+    # the middle 125 m sample ALSO carrying source-interpreted evidence in the caller's own
+    # bookkeeping (irrelevant to this function, since `measured_support_state` never encodes it).
+    profile_df = pd.DataFrame(
+        {
+            "chainage_m": [100.0, 125.0, 150.0],
+            "clearance_m": [0.6, 0.6, 0.6],
+            "measured_support_state": [support_state.MEASURED_UNSUPPORTED] * 3,
+            "source_interpreted_free_span_present": [False, True, False],
+        }
+    )
+    intervals = support_state.extract_measured_free_span_intervals(
+        profile_df,
+        asset_id="TEST_ASSET",
+        max_measurement_gap_m=50.0,
+        survey_epoch="TEST",
+        classification_threshold_m=0.1,
+        vertical_reference_semantics="TEST",
+    )
+    assert len(intervals) == 1
+    assert float(intervals["start_chainage_m"].iloc[0]) == pytest.approx(100.0)
+    assert float(intervals["end_chainage_m"].iloc[0]) == pytest.approx(150.0)
+    assert int(intervals["sample_count"].iloc[0]) == 3
+
+
+def test_16d2_same_geometry_without_the_source_flag_produces_an_identical_interval():
+    # proves the flag's presence/absence makes literally no difference to extraction.
+    def _build(flagged_at_125: bool) -> pd.DataFrame:
+        profile_df = pd.DataFrame(
+            {
+                "chainage_m": [100.0, 125.0, 150.0],
+                "clearance_m": [0.6, 0.6, 0.6],
+                "measured_support_state": [support_state.MEASURED_UNSUPPORTED] * 3,
+                "source_interpreted_free_span_present": [False, flagged_at_125, False],
+            }
+        )
+        return support_state.extract_measured_free_span_intervals(
+            profile_df,
+            asset_id="TEST_ASSET",
+            max_measurement_gap_m=50.0,
+            survey_epoch="TEST",
+            classification_threshold_m=0.1,
+            vertical_reference_semantics="TEST",
+        )
+
+    with_flag = _build(True)
+    without_flag = _build(False)
+    compare_cols = ["start_chainage_m", "end_chainage_m", "span_length_m", "sample_count"]
+    pd.testing.assert_frame_equal(
+        with_flag[compare_cols].reset_index(drop=True),
+        without_flag[compare_cols].reset_index(drop=True),
+    )
+
+
+def test_16e_source_flag_alone_cannot_create_a_measured_span():
+    # a row that is geometrically MEASURED_SUPPORTED, even with source evidence present, must
+    # never appear in the extracted intervals -- extraction only ever looks at
+    # measured_support_state, which this row's flag cannot touch.
     profile_df = pd.DataFrame(
         {
             "chainage_m": [0.0, 10.0, 20.0],
-            "clearance_m": [0.7, 0.7, 0.7],
-            "measured_support_state": [
-                support_state.SOURCE_INTERPRETED_FREE_SPAN,
-                support_state.SOURCE_INTERPRETED_FREE_SPAN,
-                support_state.SOURCE_INTERPRETED_FREE_SPAN,
-            ],
+            "clearance_m": [-0.5, -0.5, -0.5],
+            "measured_support_state": [support_state.MEASURED_SUPPORTED] * 3,
+            "source_interpreted_free_span_present": [True, True, True],
         }
     )
     intervals = support_state.extract_measured_free_span_intervals(
@@ -315,13 +644,34 @@ def test_10b_source_interpreted_sample_never_enters_measured_intervals():
     assert intervals.empty
 
 
-def test_10c_synthetic_case_source_interpreted_sample_excluded_from_measured_intervals():
+def test_10c_synthetic_case_source_interpreted_field_is_preserved_and_orthogonal():
     case = synthetic.build_synthetic_free_span_case()
-    source_flagged = case.profile_df[case.profile_df["is_source_interpreted_free_span"]]
-    assert len(source_flagged) == 1
-    source_chainage = float(source_flagged["chainage_m"].iloc[0])
+    source_flagged = case.profile_df[case.profile_df["source_interpreted_free_span_present"]]
+    assert len(source_flagged) == 2
+
+    # the sample inside the existing unsupported run: geometry unaffected, still counted.
+    inside_run = source_flagged[abs(source_flagged["chainage_m"] - 200.0) < 1e-6].iloc[0]
+    assert inside_run["measured_support_state"] == support_state.MEASURED_UNSUPPORTED
+    assert (
+        inside_run["geometry_vs_source_interpretation_status"] == support_state.AGREES_UNSUPPORTED
+    )
+    matched = [
+        interval
+        for _, interval in case.measured_intervals_df.iterrows()
+        if interval["start_chainage_m"] <= 200.0 <= interval["end_chainage_m"]
+    ]
+    assert len(matched) == 1
+    assert int(matched[0]["sample_count"]) == 5  # unchanged: still the full 150-250 run
+
+    # the isolated geometrically-supported sample: never enters a measured interval.
+    isolated = source_flagged[abs(source_flagged["chainage_m"] - 320.0) < 1e-6].iloc[0]
+    assert isolated["measured_support_state"] == support_state.MEASURED_SUPPORTED
+    assert (
+        isolated["geometry_vs_source_interpretation_status"]
+        == support_state.SOURCE_ONLY_FREESPAN_EVIDENCE
+    )
     for _, interval in case.measured_intervals_df.iterrows():
-        assert not (interval["start_chainage_m"] <= source_chainage <= interval["end_chainage_m"])
+        assert not (interval["start_chainage_m"] <= 320.0 <= interval["end_chainage_m"])
 
 
 # --- 11/12: lowering scenario creates a new span and extends an existing span ------------------
@@ -364,6 +714,76 @@ def test_11b_classify_scenario_interval_vs_measured_all_three_outcomes():
         scenario.classify_scenario_interval_vs_measured(90.0, 200.0, measured) == scenario.EXTENDED
     )
     assert scenario.classify_scenario_interval_vs_measured(500.0, 510.0, measured) == scenario.NEW
+
+
+# --- 16.F: source flag cannot alter NEW/EXTENDED/UNCHANGED scenario classification --------------
+
+
+def test_16f_source_flag_does_not_alter_scenario_classification():
+    # scenario screening reads only measured_support_state and clearance -- a source-
+    # interpretation column present (or absent) on the same geometry must produce byte-identical
+    # scenario results.
+    lowering_input = scenario.SeabedLoweringScenarioInput(0.30, scenario.ENGINEERING_SCENARIO)
+
+    def _profile(source_flags: list[bool]) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "chainage_m": [0.0, 10.0, 20.0, 30.0],
+                "clearance_m": [-0.15, -0.15, 0.6, 0.6],
+                "measured_support_state": [
+                    support_state.MEASURED_SUPPORTED,
+                    support_state.MEASURED_SUPPORTED,
+                    support_state.MEASURED_UNSUPPORTED,
+                    support_state.MEASURED_UNSUPPORTED,
+                ],
+                "source_interpreted_free_span_present": source_flags,
+            }
+        )
+
+    measured_intervals = support_state.extract_measured_free_span_intervals(
+        _profile([False, False, False, False]),
+        asset_id="TEST_ASSET",
+        max_measurement_gap_m=50.0,
+        survey_epoch="TEST",
+        classification_threshold_m=0.1,
+        vertical_reference_semantics="TEST",
+    )
+
+    result_with_flags = scenario.build_support_loss_scenario_profile(
+        _profile([True, True, True, True]),
+        asset_id="TEST_ASSET",
+        lowering_input=lowering_input,
+        classification_threshold_m=0.1,
+        max_measurement_gap_m=50.0,
+        survey_epoch="TEST",
+        vertical_reference_semantics="TEST",
+        measured_intervals_df=measured_intervals,
+    )
+    result_without_flags = scenario.build_support_loss_scenario_profile(
+        _profile([False, False, False, False]),
+        asset_id="TEST_ASSET",
+        lowering_input=lowering_input,
+        classification_threshold_m=0.1,
+        max_measurement_gap_m=50.0,
+        survey_epoch="TEST",
+        vertical_reference_semantics="TEST",
+        measured_intervals_df=measured_intervals,
+    )
+    assert result_with_flags["new_span_count"] == result_without_flags["new_span_count"]
+    assert result_with_flags["extended_span_count"] == result_without_flags["extended_span_count"]
+    compare_cols = ["start_chainage_m", "end_chainage_m", "vs_baseline_classification"]
+    pd.testing.assert_frame_equal(
+        result_with_flags["scenario_intervals_df"][compare_cols].reset_index(drop=True),
+        result_without_flags["scenario_intervals_df"][compare_cols].reset_index(drop=True),
+    )
+
+
+def test_16f2_synthetic_scenario_results_unaffected_by_source_flag_presence():
+    # the synthetic case itself carries the flag on two samples (chainage 200, 320) -- confirm
+    # the scenario counts match the hand-derived expectation regardless.
+    case = synthetic.build_synthetic_free_span_case()
+    assert case.scenario_result["new_span_count"] == synthetic.EXPECTED_NEW_SPAN_COUNT
+    assert case.scenario_result["extended_span_count"] == synthetic.EXPECTED_EXTENDED_SPAN_COUNT
 
 
 # --- 13: no pipe vertical motion silently introduced --------------------------------------------
@@ -684,10 +1104,49 @@ def test_nsta_registry_audit_df_and_summary_are_descriptive_only():
     assert summary["unique_pipeline_id_count"] == 1
     assert summary["valid_length_m_count"] == 2  # the -1 length is invalid
     assert summary["valid_mxheight_m_count"] == 2  # record 2's None mxheight_m is the only gap
-    assert summary["duplicated_feature_id_count"] == 2  # both F1 rows
     assert summary["records_missing_pipeline_id_count"] == 1
     # no quality score anywhere in the summary
     assert not any("score" in key.lower() for key in summary)
+
+
+# --- 16.L: NSTA audit distinct duplicate-ID count and duplicate-row count are not conflated ----
+
+
+def test_16l_duplicated_feature_id_distinct_count_vs_records_with_duplicated_feature_id_count():
+    # the fixture has feature_id "F1" appearing twice (one distinct duplicated ID, two rows) and
+    # "F2" appearing once (not a duplicate at all) -- the two counts must differ and neither may
+    # be silently reported as the other.
+    records = _synthetic_nsta_records()
+    audit_df = nsta_registry.build_nsta_registry_audit_df(records)
+    summary = nsta_registry.summarize_registry_audit(audit_df)
+    assert summary["duplicated_feature_id_distinct_count"] == 1  # only "F1"
+    assert summary["records_with_duplicated_feature_id_count"] == 2  # both F1 rows
+    assert (
+        summary["duplicated_feature_id_distinct_count"]
+        != summary["records_with_duplicated_feature_id_count"]
+    )
+    assert "duplicated_feature_id_count" not in summary  # the old, ambiguous key is gone
+
+
+def test_16l2_no_duplicates_yields_zero_for_both_counts():
+    records = [_synthetic_nsta_records()[2]]  # F2 only, appears once
+    audit_df = nsta_registry.build_nsta_registry_audit_df(records)
+    summary = nsta_registry.summarize_registry_audit(audit_df)
+    assert summary["duplicated_feature_id_distinct_count"] == 0
+    assert summary["records_with_duplicated_feature_id_count"] == 0
+
+
+# --- 16.M: no hard-coded pipeline-count prose exists in generic registry module ----------------
+
+
+def test_16m_no_hard_coded_pipeline_count_prose_in_nsta_registry_module():
+    source = inspect.getsource(nsta_registry)
+    assert "222" not in source
+
+
+def test_16m2_no_hard_coded_pipeline_count_prose_in_maps_module():
+    source = inspect.getsource(maps)
+    assert "222" not in source
 
 
 def test_nsta_registry_empty_records_produce_valid_empty_outputs():

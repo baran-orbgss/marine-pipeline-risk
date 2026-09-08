@@ -2313,4 +2313,88 @@ otherwise, never an interactive credential prompt.
   ANALYTICS DEMONSTRATED?` YES; `IS GENERIC SUPPORT-LOSS SUSCEPTIBILITY
   SCREENING DEMONSTRATED?` YES; `IS SITE-SPECIFIC PL854 FREE-SPAN
   SUSCEPTIBILITY DEFENSIBLE?` NO (expected -- PL854 lacks a measured
-  pipe/seabed profile). No further ticket has started.
+  pipe/seabed profile).
+- **MAR-025A (free-span evidence independence & interval-support
+  semantics repair).** A precise correction to the generic engine, not a
+  rewrite: MAR-025's `classify_measured_support_state` let an explicit
+  source-interpretation flag return `SOURCE_INTERPRETED_FREE_SPAN`
+  *before* evaluating clearance at all -- source evidence could silently
+  erase a valid geometric answer and (had a source-flagged sample sat
+  inside an otherwise-unsupported run) could have split a real measured
+  interval in two. Fixed by making MEASURED GEOMETRY and SOURCE
+  INTERPRETATION genuinely orthogonal: `classify_measured_support_state`
+  now takes only `clearance_m` and `classification_threshold_m` --
+  structurally, the function has no parameter through which a source
+  flag could reach it -- and `SOURCE_INTERPRETED_FREE_SPAN` no longer
+  exists anywhere in the measured-state vocabulary. Source-interpreted
+  evidence is preserved as its own orthogonal field,
+  `source_interpreted_free_span_present`, plus a new purely descriptive
+  `geometry_vs_source_interpretation_status`
+  (`AGREES_UNSUPPORTED`/`SOURCE_ONLY_FREESPAN_EVIDENCE`/
+  `GEOMETRY_ONLY_UNSUPPORTED_EVIDENCE`/`NO_FREESPAN_EVIDENCE`/
+  `COMPARISON_NOT_AVAILABLE`) that compares the two dimensions read-only
+  and never feeds back into either one -- a row can now truthfully be
+  `MEASURED_SUPPORTED` *and* carry source freespan evidence at the same
+  time, a real disagreement recorded rather than silently resolved.
+  Since `extract_measured_free_span_intervals` already grouped strictly
+  on `measured_support_state`, removing the source state from that
+  vocabulary automatically makes it structurally impossible for a source
+  flag to create, terminate, bridge, or split a measured interval -- no
+  separate interval-extraction fix was needed, only the upstream
+  classifier repair. A second, independent problem was also repaired:
+  `span_length_m` (first-to-last unsupported sample chainage) was being
+  implicitly treated as an exact physical free-span length, which is
+  only true when the caller has genuine explicit boundary samples --
+  for ordinary discrete sampling it is really an
+  `UNSUPPORTED_SAMPLE_RUN_EXTENT`. Fixed with a new
+  `interval_boundary_semantics` field (`EXPLICIT_BOUNDARY_SAMPLES` /
+  `UNSUPPORTED_SAMPLE_RUN_EXTENT`, defaulted -- never silently assigned
+  the explicit-boundary label / `BOUNDARY_BRACKETED_BY_ADJACENT_MEASUREMENTS`,
+  which records the nearest non-unsupported neighbour on each side as an
+  honest "the true crossing lies somewhere in here" bracket, never
+  linearly interpolated to a precise point), new preferred field names
+  (`unsupported_sample_run_start/end_chainage_m`,
+  `unsupported_sample_run_extent_m`), and `span_length_m` kept only for
+  backward compatibility alongside an explicit `span_length_semantics`
+  caveat. The accepted synthetic engineering case's real numbers were
+  fully preserved -- 3 measured intervals (100/10/10 m), 0.6 m max
+  clearance, 1 new + 1 extended scenario span, all verified byte-
+  identical by real execution -- while its own proof of evidence
+  independence was replaced per the ticket: instead of a source flag
+  overriding geometry, the synthetic case now carries the flag on TWO
+  samples (one already inside the geometric 150-250 m span, one
+  geometrically supported and isolated) and proves, by direct
+  assertion, that measured-interval extraction and scenario
+  new/extended counts are byte-identical whether or not either flag is
+  present -- true independence, not an override. NSTA registry audit
+  terminology was also cleaned up: the ambiguous `duplicated_feature_id_count`
+  (actually a row count) is now reported as two separate, correctly-named
+  fields, `duplicated_feature_id_distinct_count` (real value: 1) and
+  `records_with_duplicated_feature_id_count` (real value: 2), and a
+  hard-coded "222 different real pipelines" observation was replaced
+  with runtime-derived language in both `nsta_registry.py` and
+  `maps.py`. 23 new tests cover every Section 16 proof point (source
+  flag structurally unable to alter measured state, a row simultaneously
+  unsupported-and-source-flagged, a row supported-with-disagreeing-
+  source-evidence with neither value overwritten, the exact
+  chainage-100/125/150-with-a-flag-in-the-middle regression case staying
+  ONE interval, a source flag alone never creating a span, scenario
+  NEW/EXTENDED/UNCHANGED classification proven byte-identical with and
+  without the flag, the generic default staying
+  `UNSUPPORTED_SAMPLE_RUN_EXTENT` while the synthetic case is explicitly
+  `EXPLICIT_BOUNDARY_SAMPLES_BY_SYNTHETIC_CONSTRUCTION`, boundary
+  brackets populated only when explicitly requested, gap governance
+  unchanged, and the NSTA distinct-vs-row duplicate counts never
+  conflated); the full offline suite (1358 tests, up from 1335) and
+  repo-wide `ruff format`/`ruff check` pass clean. Real rerun confirmed
+  fully offline (`already_cached=True` for both NSTA layers, no new
+  network call): PL854's 8/97.42 m/23.16 m/0.41 m evidence, the real
+  978-record NSTA registry (953 current + 25 removed, 212 unique
+  pipelines), and every synthetic numeric answer all unchanged; the new
+  final report explicitly confirms `MEASURED SUPPORT STATE IS DERIVED
+  ONLY FROM PIPE/SEABED GEOMETRY`, `SOURCE-INTERPRETED FREE-SPAN
+  EVIDENCE IS AN ORTHOGONAL EVIDENCE DIMENSION AND NEVER OVERRIDES
+  GEOMETRIC CLASSIFICATION`, `A DISCRETE UNSUPPORTED SAMPLE RUN IS NOT
+  AUTOMATICALLY CLAIMED TO BE AN EXACT PHYSICAL FREE-SPAN LENGTH`, and
+  `EXISTING SYNTHETIC NUMERICAL OUTPUTS ARE UNCHANGED: YES`. No further
+  ticket has started.

@@ -133,7 +133,15 @@ def build_nsta_registry_audit_df(records: list[dict[str, Any]]) -> pd.DataFrame:
 
 
 def summarize_registry_audit(audit_df: pd.DataFrame) -> dict[str, Any]:
-    """Section 20's required report facts. No aggregate quality score anywhere."""
+    """Section 20's required report facts. No aggregate quality score anywhere. All counts are
+    derived from `audit_df` at call time -- never a hard-coded prior observation (MAR-025A
+    Section 15).
+
+    `records.duplicated(keep=False).sum()` on its own is a ROW count (every row that belongs to
+    a group of 2+ sharing a feature_id), not a count of how many DISTINCT feature_id values are
+    duplicated -- MAR-025A Section 15 requires both, reported separately and never conflated:
+    `duplicated_feature_id_distinct_count` (distinct feature_id values appearing more than once)
+    vs. `records_with_duplicated_feature_id_count` (the row count)."""
 
     if audit_df.empty:
         return {
@@ -145,12 +153,14 @@ def summarize_registry_audit(audit_df: pd.DataFrame) -> dict[str, Any]:
             "valid_mxheight_m_count": 0,
             "records_with_survey_or_date_field_count": 0,
             "records_with_geometry_count": 0,
-            "duplicated_feature_id_count": 0,
+            "duplicated_feature_id_distinct_count": 0,
+            "records_with_duplicated_feature_id_count": 0,
             "records_missing_pipeline_id_count": 0,
         }
 
     current_df = audit_df[audit_df["registry_layer"] == nsta_freespan.CURRENT_REGISTRY_LAYER]
     removed_df = audit_df[audit_df["registry_layer"] == nsta_freespan.REMOVED_REGISTRY_LAYER]
+    feature_id_counts = audit_df["feature_id"].value_counts(dropna=True)
     return {
         "total_record_count": int(len(audit_df)),
         "total_current_records": int(len(current_df)),
@@ -160,14 +170,18 @@ def summarize_registry_audit(audit_df: pd.DataFrame) -> dict[str, Any]:
         "valid_mxheight_m_count": int(audit_df["has_valid_mxheight_m"].sum()),
         "records_with_survey_or_date_field_count": int(audit_df["has_survey_or_date_field"].sum()),
         "records_with_geometry_count": int(audit_df["has_geometry"].sum()),
-        "duplicated_feature_id_count": int(audit_df["feature_id"].duplicated(keep=False).sum()),
+        "duplicated_feature_id_distinct_count": int((feature_id_counts > 1).sum()),
+        "records_with_duplicated_feature_id_count": int(
+            audit_df["feature_id"].duplicated(keep=False).sum()
+        ),
         "records_missing_pipeline_id_count": int((~audit_df["has_pipeline_number"]).sum()),
     }
 
 
 def build_nsta_registry_gdf(records: list[dict[str, Any]]) -> gpd.GeoDataFrame:
     """Section 28's real-evidence GIS layer: every real parsed NSTA feature, WGS84, no route
-    projection -- there is no single route spanning 222 different real pipelines."""
+    projection -- there is no single route spanning the many distinct real pipelines the
+    registry covers (a runtime-derived count, never hard-coded here -- MAR-025A Section 15)."""
 
     if not records:
         return gpd.GeoDataFrame(

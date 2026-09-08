@@ -62,12 +62,21 @@ SCENARIO_LOWERING_M = 0.30
 SCENARIO_EVIDENCE_TYPE = freespan_scenario.ENGINEERING_SCENARIO
 
 # --- Section 17: hand-authored, analytically-known sample table ----------------------------------
-# (nominal_chainage_m_for_placement, raw_seabed_elevation_m, is_source_interpreted_free_span, note)
-# raw_pipe_centreline_elevation_m is constant (RAW_PIPE_CENTRELINE_ELEVATION_M) for every sample --
-# a flat synthetic pipe, since Section 13 fixes pipe vertical position for the screening scenario
-# anyway. chainage_m itself is never hand-assigned: every sample's (x, y) is placed exactly on the
-# route and chainage is DERIVED by `generic_route.project_measurements_to_chainage`, exactly as a
-# real dataset would be processed.
+# (nominal_chainage_m_for_placement, raw_seabed_elevation_m, source_interpreted_free_span_present,
+# note). raw_pipe_centreline_elevation_m is constant (RAW_PIPE_CENTRELINE_ELEVATION_M) for every
+# sample -- a flat synthetic pipe, since Section 13 fixes pipe vertical position for the
+# screening scenario anyway. chainage_m itself is never hand-assigned: every sample's (x, y) is
+# placed exactly on the route and chainage is DERIVED by
+# `generic_route.project_measurements_to_chainage`, exactly as a real dataset would be processed.
+#
+# MAR-025A: the source-interpreted flag is carried on TWO samples, deliberately proving
+# independence from geometric classification in both directions (Section 13):
+#   - chainage 200 sits INSIDE the already-geometrically-unsupported 150-250 run -- the flag
+#     must neither change its measured_support_state (still MEASURED_UNSUPPORTED) nor split the
+#     measured interval (still one continuous 150-250 span, AGREES_UNSUPPORTED).
+#   - chainage 320 is geometrically supported -- the flag must neither promote it to
+#     MEASURED_UNSUPPORTED nor create a new measured interval there (SOURCE_ONLY_FREESPAN_EVIDENCE,
+#     a real evidence disagreement, preserved rather than silently resolved).
 _SAMPLES: tuple[tuple[float, float, bool, str], ...] = (
     (0.0, -9.5, False, "supported region"),
     (25.0, -9.5, False, "supported region"),
@@ -77,12 +86,23 @@ _SAMPLES: tuple[tuple[float, float, bool, str], ...] = (
     (125.0, -10.05, False, "support transition"),
     (150.0, -10.6, False, "known existing free span -- start"),
     (175.0, -10.6, False, "known existing free span"),
-    (200.0, -10.6, False, "known existing free span"),
+    (
+        200.0,
+        -10.6,
+        True,
+        "known existing free span -- also source-interpreted (AGREES_UNSUPPORTED)",
+    ),
     (225.0, -10.6, False, "known existing free span"),
     (250.0, -10.6, False, "known existing free span -- end"),
     (260.0, -9.85, False, "supported at baseline -- extends the existing span under the scenario"),
     (275.0, -9.4, False, "supported at baseline -- remains supported under the scenario"),
-    (320.0, -9.3, True, "source-interpreted free span, independent of geometric clearance"),
+    (
+        320.0,
+        -9.3,
+        True,
+        "geometrically supported, also source-interpreted -- a real evidence "
+        "disagreement (SOURCE_ONLY_FREESPAN_EVIDENCE), never silently resolved",
+    ),
     (390.0, -10.6, False, "unsurveyed-gap span A -- start"),
     (400.0, -10.6, False, "unsurveyed-gap span A -- end"),
     (460.0, -10.6, False, "unsurveyed-gap span B -- start"),
@@ -100,6 +120,12 @@ EXPECTED_MAX_CLEARANCE_M = 0.6
 EXPECTED_GAP_SPLIT_MEASURED_SPAN_COUNT = 2  # the two 390-400 / 460-470 halves
 EXPECTED_NEW_SPAN_COUNT = 1
 EXPECTED_EXTENDED_SPAN_COUNT = 1
+
+# MAR-025A Section 12: every sample's chainage was hand-placed and every expected boundary is
+# known exactly by construction -- an honest, explicit label, never the generic engine's default
+# (`support_state.UNSUPPORTED_SAMPLE_RUN_EXTENT`) and never silently assigned
+# `support_state.EXPLICIT_BOUNDARY_SAMPLES` without this note explaining why it applies here.
+SYNTHETIC_BOUNDARY_SEMANTICS_NOTE = "EXPLICIT_BOUNDARY_SAMPLES_BY_SYNTHETIC_CONSTRUCTION"
 
 
 @dataclass(frozen=True)
@@ -141,7 +167,7 @@ def build_synthetic_free_span_case() -> SyntheticFreeSpanCase:
             "y_m": y,
             "raw_pipe_centreline_elevation_m": [RAW_PIPE_CENTRELINE_ELEVATION_M for _ in _SAMPLES],
             "raw_seabed_elevation_m": [s[1] for s in _SAMPLES],
-            "is_source_interpreted_free_span": [s[2] for s in _SAMPLES],
+            "source_interpreted_free_span_present": [s[2] for s in _SAMPLES],
             "note": [s[3] for s in _SAMPLES],
         }
     )
@@ -162,13 +188,19 @@ def build_synthetic_free_span_case() -> SyntheticFreeSpanCase:
         freespan_clearance.compute_pipe_underside_clearance_m(pb, float(ss))
         for pb, ss in zip(pipe_bottom_elevation_m, seabed_support_elevation_m, strict=True)
     ]
+    # MAR-025A Section 3: measured geometry depends ONLY on clearance + threshold -- the source
+    # flag is never passed in here at all.
     measured_support_state = [
         freespan_support_state.classify_measured_support_state(
-            c,
-            is_source_interpreted_free_span=bool(flag),
-            classification_threshold_m=CLASSIFICATION_THRESHOLD_M,
+            c, classification_threshold_m=CLASSIFICATION_THRESHOLD_M
         )
-        for c, flag in zip(clearance_m, records_df["is_source_interpreted_free_span"], strict=True)
+        for c in clearance_m
+    ]
+    geometry_vs_source_interpretation_status = [
+        freespan_support_state.compute_geometry_vs_source_interpretation_status(state, bool(flag))
+        for state, flag in zip(
+            measured_support_state, records_df["source_interpreted_free_span_present"], strict=True
+        )
     ]
 
     profile_df = records_df.copy()
@@ -177,6 +209,9 @@ def build_synthetic_free_span_case() -> SyntheticFreeSpanCase:
     profile_df["seabed_support_elevation_m"] = seabed_support_elevation_m
     profile_df["clearance_m"] = clearance_m
     profile_df["measured_support_state"] = measured_support_state
+    profile_df["geometry_vs_source_interpretation_status"] = (
+        geometry_vs_source_interpretation_status
+    )
     profile_df["survey_epoch"] = SYNTHETIC_SURVEY_EPOCH
     profile_df["classification_threshold_m"] = CLASSIFICATION_THRESHOLD_M
     profile_df["evidence_type"] = SYNTHETIC_EVIDENCE_TYPE
@@ -193,6 +228,7 @@ def build_synthetic_free_span_case() -> SyntheticFreeSpanCase:
         survey_epoch=SYNTHETIC_SURVEY_EPOCH,
         classification_threshold_m=CLASSIFICATION_THRESHOLD_M,
         vertical_reference_semantics=vertical_reference_semantics,
+        interval_boundary_semantics=freespan_support_state.EXPLICIT_BOUNDARY_SAMPLES,
     )
 
     lowering_input = freespan_scenario.SeabedLoweringScenarioInput(
@@ -207,6 +243,7 @@ def build_synthetic_free_span_case() -> SyntheticFreeSpanCase:
         survey_epoch=SYNTHETIC_SURVEY_EPOCH,
         vertical_reference_semantics=vertical_reference_semantics,
         measured_intervals_df=measured_intervals_df,
+        interval_boundary_semantics=freespan_support_state.EXPLICIT_BOUNDARY_SAMPLES,
     )
 
     return SyntheticFreeSpanCase(
@@ -224,15 +261,19 @@ def summarize_synthetic_case(case: SyntheticFreeSpanCase) -> dict[str, Any]:
     """Section 34's required synthetic-validation report facts: expected vs. recovered."""
 
     intervals = case.measured_intervals_df
+    source_flagged = case.profile_df[case.profile_df["source_interpreted_free_span_present"]]
     return {
         "scientific_role": SCIENTIFIC_ROLE,
         "disclaimer": PROMINENT_DISCLAIMER,
+        "boundary_semantics_note": SYNTHETIC_BOUNDARY_SEMANTICS_NOTE,
         "sample_count": int(len(case.profile_df)),
         "expected_measured_span_count": EXPECTED_MEASURED_SPAN_COUNT,
         "recovered_measured_span_count": int(len(intervals)),
         "expected_measured_span_lengths_m": list(EXPECTED_MEASURED_SPAN_LENGTHS_M),
         "recovered_measured_span_lengths_m": (
-            sorted(float(v) for v in intervals["span_length_m"]) if not intervals.empty else []
+            sorted(float(v) for v in intervals["unsupported_sample_run_extent_m"])
+            if not intervals.empty
+            else []
         ),
         "expected_max_clearance_m": EXPECTED_MAX_CLEARANCE_M,
         "recovered_max_clearance_m": (
@@ -241,10 +282,19 @@ def summarize_synthetic_case(case: SyntheticFreeSpanCase) -> dict[str, Any]:
         "gap_split_interval_count": int(
             intervals["limitations"].notna().sum() if not intervals.empty else 0
         ),
+        "interval_boundary_semantics": (
+            sorted(intervals["interval_boundary_semantics"].unique().tolist())
+            if not intervals.empty
+            else []
+        ),
         "expected_scenario_new_span_count": EXPECTED_NEW_SPAN_COUNT,
         "recovered_scenario_new_span_count": case.scenario_result["new_span_count"],
         "expected_scenario_extended_span_count": EXPECTED_EXTENDED_SPAN_COUNT,
         "recovered_scenario_extended_span_count": case.scenario_result["extended_span_count"],
+        "source_interpreted_free_span_sample_count": int(len(source_flagged)),
+        "source_interpreted_geometry_vs_source_statuses": sorted(
+            source_flagged["geometry_vs_source_interpretation_status"].unique().tolist()
+        ),
         "seabed_lowering_m": case.lowering_input.seabed_lowering_m,
         "seabed_lowering_evidence_type": case.lowering_input.evidence_type,
         "classification_threshold_m": CLASSIFICATION_THRESHOLD_M,
