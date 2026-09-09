@@ -139,7 +139,12 @@ from marine_engine.scour import (
 from marine_engine.scour import (
     poc_report as scour_poc_report,
 )
-from marine_engine.sediment import evidence, noncohesive_mobility, noncohesive_mobility_map
+from marine_engine.sediment import (
+    evidence,
+    noncohesive_mobility,
+    noncohesive_mobility_map,
+    transport_intensity,
+)
 from marine_engine.terrain import canonical as terrain_canonical
 from marine_engine.terrain import contract as terrain_contract
 from marine_engine.terrain import derivatives as terrain_derivatives
@@ -3129,6 +3134,118 @@ def _cmd_build_noncohesive_mobility(args: argparse.Namespace) -> int:
         png_dimensions=png_dimensions,
         profile_path=profile_path,
         profile_dimensions=profile_dimensions,
+    )
+    return 0
+
+
+def _cmd_build_sediment_transport_intensity(args: argparse.Namespace) -> int:
+    """MAR-030: relative excess Shields transport-potential intensity on top of MAR-013.
+
+    Consumes the accepted MAR-013 canonical outputs already on disk (3-hourly
+    mobility table, stats, capacity segments); performs NO network request and
+    never recomputes MAR-012/MAR-013 science. Missing MAR-013 products are
+    reported, never silently rebuilt.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    _pipeline_gpkg_path, _aoi_gpkg_path, _chainage_gpkg_path, interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    sediment_interim_dir = interim_dir / "sediment"
+    sediment_processed_dir = study_dir / "sediment"
+    maps_dir = study_dir / "maps"
+
+    mobility_hourly_path = sediment_interim_dir / "noncohesive_mobility_3hourly.parquet"
+    mobility_stats_path = sediment_processed_dir / "noncohesive_mobility_stats.parquet"
+    mobility_segments_path = sediment_processed_dir / "noncohesive_mobility_capacity_segments.gpkg"
+    required_paths = (mobility_hourly_path, mobility_stats_path, mobility_segments_path)
+    missing = [str(p) for p in required_paths if not p.exists()]
+    if missing:
+        print(
+            "error: missing required accepted MAR-013 output(s) -- run "
+            f"build-noncohesive-mobility first: {missing}",
+            file=sys.stderr,
+        )
+        return 1
+
+    mobility_df = pd.read_parquet(mobility_hourly_path)
+    mobility_stats_df = pd.read_parquet(mobility_stats_path)
+    mobility_segments_gdf = gpd.read_file(
+        mobility_segments_path, layer="noncohesive_mobility_capacity_segments"
+    )
+
+    # --- MAR-030 core: validate source, independent algebraic QA, derive -----
+    try:
+        intensity_df = transport_intensity.build_transport_intensity_3hourly(mobility_df)
+        stats_df = transport_intensity.compute_transport_intensity_stats(intensity_df)
+        cross_checked = transport_intensity.cross_check_against_mobility_stats(
+            stats_df, mobility_stats_df
+        )
+        segments_gdf = transport_intensity.build_transport_intensity_segments(
+            mobility_segments_gdf, stats_df
+        )
+    except (
+        transport_intensity.TransportIntensitySchemaError,
+        transport_intensity.TransportIntensitySourceRoleError,
+        transport_intensity.MobilityRatioConsistencyError,
+        transport_intensity.MobilityStatsCrossCheckError,
+    ) as exc:
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    # --- write outputs -----------------------------------------------------------
+    intensity_hourly_path = metocean_evidence.write_parquet(
+        intensity_df, sediment_interim_dir / "noncohesive_transport_intensity_3hourly.parquet"
+    )
+    stats_path = metocean_evidence.write_parquet(
+        stats_df, sediment_processed_dir / "noncohesive_transport_intensity_stats.parquet"
+    )
+    segments_path = transport_intensity.write_transport_intensity_segments_gpkg(
+        segments_gdf, sediment_processed_dir / "noncohesive_transport_intensity_segments.gpkg"
+    )
+    png_path = transport_intensity.render_transport_intensity_scenario_matrix(
+        segments_gdf,
+        output_path=maps_dir / "noncohesive_transport_intensity_scenario_matrix.png",
+        title_prefix=pipeline_id,
+    )
+
+    metadata_path = sediment_processed_dir / "noncohesive_transport_intensity_metadata.json"
+    metadata = transport_intensity.build_transport_intensity_metadata(
+        outputs={
+            "source_noncohesive_mobility_3hourly": str(mobility_hourly_path),
+            "source_noncohesive_mobility_stats": str(mobility_stats_path),
+            "source_noncohesive_mobility_capacity_segments": str(mobility_segments_path),
+            "noncohesive_transport_intensity_3hourly": str(intensity_hourly_path),
+            "noncohesive_transport_intensity_stats": str(stats_path),
+            "noncohesive_transport_intensity_segments": str(segments_path),
+            "noncohesive_transport_intensity_scenario_matrix_png": str(png_path),
+        },
+        row_count=int(len(intensity_df)),
+        hydro_pair_count=int(intensity_df["hydro_pair_id"].nunique()) if len(intensity_df) else 0,
+        cross_checked_group_count=cross_checked,
+    )
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+
+    print(f"Transport intensity (3-hourly): {len(intensity_df)} row(s) -> {intensity_hourly_path}")
+    print(f"Transport intensity stats: {len(stats_df)} row(s) -> {stats_path}")
+    print(
+        f"Transport intensity scenario segments: {len(segments_gdf)} feature(s) -> {segments_path}"
+    )
+    print(f"Transport intensity scenario matrix: {png_path}")
+    print(f"Metadata: {metadata_path}")
+    print()
+    transport_intensity.print_transport_intensity_report(
+        intensity_df=intensity_df,
+        stats_df=stats_df,
+        segments_gdf=segments_gdf,
+        cross_checked_group_count=cross_checked,
     )
     return 0
 
@@ -11099,6 +11216,22 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_noncohesive_mobility_parser.set_defaults(func=_cmd_build_noncohesive_mobility)
+
+    build_sediment_transport_intensity_parser = subparsers.add_parser(
+        "build-sediment-transport-intensity",
+        help=(
+            "Build the dimensionless noncohesive relative excess Shields transport-potential "
+            "intensity (MAR-030) for the tested D50 scenarios on top of the accepted MAR-013 "
+            "mobility outputs -- no network, no transport rate, requires "
+            "build-noncohesive-mobility to have already run."
+        ),
+    )
+    build_sediment_transport_intensity_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_sediment_transport_intensity_parser.set_defaults(
+        func=_cmd_build_sediment_transport_intensity
+    )
 
     build_scour_onset_screening_parser = subparsers.add_parser(
         "build-scour-onset-screening",

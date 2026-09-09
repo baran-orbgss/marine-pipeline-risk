@@ -2891,3 +2891,117 @@ otherwise, never an interactive credential prompt.
   check` clean, offline suite 1572 passed (up from 1550), 3 skipped, 25 live
   deselected, `uv audit --frozen` clean (87 packages). No further ticket has
   started.
+- **MAR-030 (relative excess Shields sediment transport-potential intensity
+  POC, `src/marine_engine/sediment/transport_intensity.py`,
+  `build-sediment-transport-intensity`).** A dimensionless noncohesive
+  sediment transport-POTENTIAL intensity layer consuming the accepted
+  MAR-013 mobility product; MAR-012 hydrodynamics and MAR-013
+  grain-consistent skin stress / Soulsby-Whitehouse thresholds are never
+  recomputed (`combined_bed_shear.py`, `noncohesive_mobility.py`,
+  `noncohesive_mobility_map.py`, `change/*`, `scour/*`, `burial/*`,
+  `freespan/*`, `project/*` verified byte-identical to the canonical base;
+  the dependency is one-way, `transport_intensity` -> `noncohesive_mobility`).
+  Scientific role
+  `NONCOHESIVE_RELATIVE_EXCESS_SHIELDS_TRANSPORT_POTENTIAL_INTENSITY`,
+  source role `NONCOHESIVE_SEDIMENT_MOBILITY_CAPACITY`. Fixed definition, for
+  every MAR-013 row with `M = mobility_ratio = tau_max_grain_skin_pa /
+  tau_critical_pa`: signed diagnostic `relative_shields_stage = M - 1` and
+  canonical `relative_excess_shields_intensity = max(M - 1, 0)` (=
+  `max((tau_max - tau_cr)/tau_cr, 0)` for `tau_cr > 0`); an undefined ratio
+  stays null, never zero; MAR-013's `>= 1` incipient-motion convention is
+  untouched, so an exactly-at-threshold sample is `ABOVE_OR_AT_...` with
+  zero excess. The intensity is algebraically equivalent to the
+  relative-excess structure of the Van Rijn (1984) transport-stage parameter
+  when formed from consistent grain-related and critical stresses, used ONLY
+  as a dimensionless forcing-exceedance diagnostic -- the Van Rijn bed-load
+  transport-rate formula is NOT applied, and no MPM / Van Rijn 2007 /
+  Soulsby-Van Rijn / Ribberink / Camenen-Larson rate or new empirical
+  coefficient is introduced (no continuous site D50/D90, grain-size
+  distribution, intrawave phase-resolved transport, suspended concentration,
+  settling velocity, or direction model exists; none is manufactured from
+  BGS Folk class, nearest PSA point, tested D50 scenarios, or MAR-012
+  roughness scenarios). Stress basis is MAR-013's Soulsby-algebraic MAXIMUM
+  combined grain-skin stress, so every timestamp is the representative-
+  wave-cycle PEAK relative excess -- never wave-cycle-mean, phase-resolved,
+  net-flux, onshore/offshore, or along-route transport direction. D50
+  semantics are MAR-013's unchanged (`TESTED_D50_SCENARIOS_MM`,
+  `TESTED_NONCOHESIVE_GRAIN_SIZE_SCENARIOS_NOT_SITE_SPECIFIC_D50`): nine
+  independent tested scenarios, no preferred/default/local D50, no
+  averaging or weighting across scenarios, no Folk -> D50 conversion, no PSA
+  interpolation, no intensity classes (zero means only "no positive excess
+  above the MAR-013 threshold at that timestamp / tested scenario"). Every
+  source row is independently QA'd (`mobility_ratio ~= tau_max/tau_cr`,
+  definedness, and the stress form of the intensity within rtol 1e-9 /
+  atol 1e-12; `MobilityRatioConsistencyError` otherwise), the source
+  schema/role is validated (`TransportIntensitySchemaError` /
+  `TransportIntensitySourceRoleError`), and per `hydro_pair_id x
+  tested_d50_mm` statistics (valid count, at-or-above count/fraction,
+  strict-positive count/fraction, mean/p50/p90/p95/p99/max,
+  mean-when-positive) are computed from the timestamp-level derived series
+  -- never by subtracting 1 from MAR-013 percentiles -- with every fraction
+  labelled `VALID_CONTEMPORANEOUS_MATCHED_TIMESTAMPS` (not a probability),
+  and cross-checked against MAR-013 `valid_count` /
+  `threshold_exceedance_count` for exact agreement
+  (`MobilityStatsCrossCheckError` otherwise). Outputs:
+  `interim/.../sediment/noncohesive_transport_intensity_3hourly.parquet`
+  (one row per MAR-013 row, identity/timestamp/D50/ratio/status preserved),
+  `processed/.../sediment/noncohesive_transport_intensity_{stats.parquet,
+  segments.gpkg,metadata.json}` (the GPKG is a LONG scenario layer: one
+  feature per accepted MAR-013 hydro-pair route segment x tested D50, geometry
+  and chainage/KP inherited, no nearest-PSA or capacity field that could read
+  as a local D50), and `maps/noncohesive_transport_intensity_scenario_matrix.png`
+  (route section x tested-D50 matrix of `relative_excess_intensity_p95`,
+  single-hue sequential scale from zero, every scenario its own row, footer
+  "tested D50 scenarios, not observed local sediment assignments"; no map
+  silently picks one D50). Metadata records definition, units, stress /
+  threshold basis, Van Rijn relation, combined wave-current limitation,
+  zero semantics, invalid-data policy, the three references (van Rijn 1984
+  DOI 10.1061/(ASCE)0733-9429(1984)110:10(1431); van Rijn 2007 DOI
+  10.1061/(ASCE)0733-9429(2007)133:6(649); Ribberink 1998 DOI
+  10.1016/S0378-3839(98)00013-1) and explicit `false` for transport rate,
+  bedload / suspended / total load, net direction, erosion/deposition,
+  morphological change rate, scour, burial-loss rate, probability, risk
+  score, Van Rijn rate formula, preferred D50, cross-D50 aggregation, and
+  intensity classes. Tests: 61 added (57 in
+  `tests/test_transport_intensity.py` covering the Section 26 core vector
+  [NaN, 0, 0.5, 0.999, 1, 1.001, 1.25, 2, 5] -> [NaN, 0, 0, 0, 0, 0.001,
+  0.25, 1, 4], signed stage, no negative / no upper clip / tiny excess kept,
+  algebraic QA pass/fail incl. finite ratio with invalid tau_cr, MAR-013
+  preservation and non-mutation, one-way dependency, statistics from the
+  derived series with M=1 counted at-or-above but zero positive excess,
+  null rows never zero observations, MAR-013 cross-check pass/fail, nine
+  separate scenarios, AST scan for Folk/PSA/interpolation identifiers, no
+  rate/flux/direction/risk/class fields, GIS segment x D50 layer with
+  inherited geometry and nine features per segment, matrix rendering without
+  scenario selection, tabular and metadata determinism, report wording; 4
+  CLI tests in `tests/test_cli.py` incl. missing-MAR-013 message "run
+  build-noncohesive-mobility first" with nothing rebuilt, an end-to-end run
+  chained after the real MAR-013 command on the synthetic study with every
+  MAR-013 artefact SHA-256-identical afterwards, and offline determinism).
+  Real PL854 regression (cached data only, no network): MAR-013 re-run
+  reproduced 655,074 rows / 126 stats / 14 sections with the 3-hourly and
+  stats parquet byte-identical (SHA-256 `480d49a5...`, `d65cd159...`; the
+  segments GPKG differs only in its embedded `gpkg_contents.last_change`
+  write timestamp, attributes unchanged); MAR-030 then produced 655,074
+  intensity rows (14 hydro pairs x 9 tested D50 x 5,199 contemporaneous
+  3-hourly timestamps, 2024-07-20 03:00 .. 2026-04-30 21:00 UTC, 0 nulls,
+  intensity 0.0 .. 7.971, 157,796 strictly positive rows, independent stress-
+  form check max abs difference 8.9e-16), 126 stats groups all agreeing
+  exactly with MAR-013 valid/exceedance counts, per-scenario p95 intensity
+  across sections 1.188-3.240 (0.063 mm), 0.888-2.605 (0.125 mm),
+  0.689-2.253 (0.25 mm), 0.434-1.760 (0.5 mm), 0.000-0.836 (1 mm), 0.000 for
+  2-16 mm (maximum single-timestamp intensity 2.094 at 2 mm, 0.633 at 4 mm,
+  0.000 at 8 and 16 mm), strict-positive fractions 0.430-0.705 (0.063 mm)
+  down to 0.000 (8-16 mm), 126 EPSG:32631 LineString features (14 segments
+  x 9 scenarios, KP 0+000 .. KP 23+480.67, geometry inherited), and a
+  1950x975 matrix PNG. Real-proof wording: REAL HYDRODYNAMIC FORCING = YES;
+  REAL CONTEMPORANEOUS WAVE-CURRENT RECORD = YES; GENERIC TESTED-D50
+  TRANSPORT-POTENTIAL INTENSITY = YES; REAL SITE-SPECIFIC SEDIMENT
+  TRANSPORT INTENSITY ALONG PL854 = NO (no defensible continuous D50 field);
+  REAL SEDIMENT TRANSPORT RATE = NO. Backlog: Sediment Transport Intensity
+  = GREEN / qualified POC; Dimensional Sediment Transport Rate, Net
+  Transport Direction, Morphodynamic Prediction = NOT IMPLEMENTED. Local
+  verification: `uv lock --check` clean, repo-wide `ruff format` (217 files
+  unchanged) / `ruff check` clean, offline suite 1633 passed (up from 1572),
+  3 skipped, 25 live deselected, `uv audit --frozen` clean (87 packages).
+  No further ticket has started.

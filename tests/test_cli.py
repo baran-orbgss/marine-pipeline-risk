@@ -2010,6 +2010,186 @@ def test_build_noncohesive_mobility_command_is_idempotent_offline(tmp_path: Path
     assert second_exit_code == 0
 
 
+# --- build-sediment-transport-intensity (MAR-030) -------------------------------------
+
+
+def test_build_sediment_transport_intensity_command_requires_pipeline_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "no_pipeline.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-sediment-transport-intensity", str(config_path)])
+
+    assert exit_code == 1
+    assert "pipeline.pipeline_id" in capsys.readouterr().err
+
+
+def test_build_sediment_transport_intensity_command_requires_mar013_outputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Missing MAR-013 products are reported, never silently rebuilt."""
+
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-sediment-transport-intensity", str(config_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "run build-noncohesive-mobility first" in err
+    assert "noncohesive_mobility_3hourly.parquet" in err
+    assert not (interim_dir / "pl854" / "sediment").exists()  # nothing rebuilt
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_build_sediment_transport_intensity_command_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MAR-030 consumes the accepted MAR-013 outputs produced by the real MAR-013 command
+    on the same synthetic study, leaving every MAR-013 artefact byte-identical."""
+
+    config_path = _write_noncohesive_mobility_fixture(tmp_path)
+    assert main(["build-noncohesive-mobility", str(config_path)]) == 0
+    capsys.readouterr()
+
+    processed_dir = tmp_path / "processed" / "pl854"
+    interim_dir = tmp_path / "interim" / "pl854"
+    mar013_paths = (
+        interim_dir / "sediment" / "noncohesive_mobility_3hourly.parquet",
+        processed_dir / "sediment" / "noncohesive_mobility_stats.parquet",
+        processed_dir / "sediment" / "noncohesive_mobility_capacity_segments.gpkg",
+        processed_dir / "sediment" / "noncohesive_mobility_metadata.json",
+    )
+    mar013_hashes_before = [_sha256(p) for p in mar013_paths]
+
+    exit_code = main(["build-sediment-transport-intensity", str(config_path)])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "NONCOHESIVE_RELATIVE_EXCESS_SHIELDS_TRANSPORT_POTENTIAL_INTENSITY" in output
+    assert "SEDIMENT TRANSPORT RATE / BEDLOAD / SUSPENDED LOAD     = NO" in output
+    assert "PREFERRED / ASSIGNED ACTUAL D50                        = NO" in output
+    assert "Van Rijn bed-load transport-rate formula is NOT applied" in output
+    assert "MAR-013 cross-check: 18 hydro-pair x D50 group(s) agree exactly" in output
+
+    # 17: accepted MAR-013 artefacts untouched.
+    assert [_sha256(p) for p in mar013_paths] == mar013_hashes_before
+
+    intensity_path = interim_dir / "sediment" / "noncohesive_transport_intensity_3hourly.parquet"
+    stats_path = processed_dir / "sediment" / "noncohesive_transport_intensity_stats.parquet"
+    segments_path = processed_dir / "sediment" / "noncohesive_transport_intensity_segments.gpkg"
+    png_path = processed_dir / "maps" / "noncohesive_transport_intensity_scenario_matrix.png"
+    metadata_path = processed_dir / "sediment" / "noncohesive_transport_intensity_metadata.json"
+    for path in (intensity_path, stats_path, segments_path, png_path, metadata_path):
+        assert path.exists(), path
+
+    mobility_df = pd.read_parquet(mar013_paths[0])
+    intensity_df = pd.read_parquet(intensity_path)
+    assert len(intensity_df) == len(mobility_df) == 3 * 2 * 9
+    assert intensity_df["hydro_pair_id"].tolist() == mobility_df["hydro_pair_id"].tolist()
+    assert (intensity_df["time_utc"].to_numpy() == mobility_df["time_utc"].to_numpy()).all()
+    assert intensity_df["tested_d50_mm"].tolist() == mobility_df["tested_d50_mm"].tolist()
+    assert (
+        intensity_df["mobility_ratio"].to_numpy() == mobility_df["mobility_ratio"].to_numpy()
+    ).all()
+    assert (
+        intensity_df["incipient_motion_status"].tolist()
+        == mobility_df["incipient_motion_status"].tolist()
+    )
+    expected = (mobility_df["mobility_ratio"] - 1.0).clip(lower=0.0)
+    assert intensity_df["relative_excess_shields_intensity"].to_numpy() == pytest.approx(
+        expected.to_numpy()
+    )
+    assert (intensity_df["relative_excess_shields_intensity"] >= 0).all()
+    assert set(intensity_df["scientific_role"]) == {
+        "NONCOHESIVE_RELATIVE_EXCESS_SHIELDS_TRANSPORT_POTENTIAL_INTENSITY"
+    }
+    assert set(intensity_df["source_scientific_role"]) == {"NONCOHESIVE_SEDIMENT_MOBILITY_CAPACITY"}
+
+    stats_df = pd.read_parquet(stats_path)
+    assert len(stats_df) == 2 * 9
+    assert (stats_df["valid_intensity_timestamp_count"] == 3).all()
+    mar013_stats = pd.read_parquet(mar013_paths[1])
+    merged = stats_df.merge(mar013_stats, on=["hydro_pair_id", "tested_d50_mm"])
+    assert (
+        merged["at_or_above_incipient_motion_count"] == merged["threshold_exceedance_count"]
+    ).all()
+
+    segments_gdf = gpd.read_file(segments_path, layer="noncohesive_transport_intensity_segments")
+    assert len(segments_gdf) == 2 * 9  # two MAR-013 sections x nine tested scenarios
+    assert segments_gdf.crs.to_epsg() == 32631
+    assert segments_gdf.groupby("segment_id")["tested_d50_mm"].nunique().tolist() == [9, 9]
+    mar013_segments = gpd.read_file(mar013_paths[2], layer="noncohesive_mobility_capacity_segments")
+    for _, seg in mar013_segments.iterrows():
+        scenario_rows = segments_gdf[segments_gdf["segment_id"] == seg["segment_id"]]
+        assert all(g.equals(seg.geometry) for g in scenario_rows.geometry)
+    assert "nearest_valid_psa_d50_mm" not in segments_gdf.columns
+    assert "largest_tested_d50_with_p95_mobility_ratio_ge_1_mm" not in segments_gdf.columns
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["scientific_role"] == (
+        "NONCOHESIVE_RELATIVE_EXCESS_SHIELDS_TRANSPORT_POTENTIAL_INTENSITY"
+    )
+    assert metadata["source_scientific_role"] == "NONCOHESIVE_SEDIMENT_MOBILITY_CAPACITY"
+    assert metadata["units"] == "dimensionless"
+    assert metadata["transport_rate_computed"] is False
+    assert metadata["bedload_flux_computed"] is False
+    assert metadata["suspended_load_computed"] is False
+    assert metadata["net_transport_direction_computed"] is False
+    assert metadata["erosion_deposition_prediction_computed"] is False
+    assert metadata["scour_computed"] is False
+    assert metadata["risk_score_computed"] is False
+    assert metadata["mar_013_cross_check"]["groups_cross_checked"] == 18
+    assert len(metadata["tested_d50_scenarios_mm"]) == 9
+    assert png_path.stat().st_size > 0
+
+
+def test_build_sediment_transport_intensity_command_is_deterministic_offline(
+    tmp_path: Path,
+) -> None:
+    """Identical accepted MAR-013 input -> identical tabular output and metadata (43-44)."""
+
+    config_path = _write_noncohesive_mobility_fixture(tmp_path)
+    assert main(["build-noncohesive-mobility", str(config_path)]) == 0
+    processed_dir = tmp_path / "processed" / "pl854"
+    interim_dir = tmp_path / "interim" / "pl854"
+    intensity_path = interim_dir / "sediment" / "noncohesive_transport_intensity_3hourly.parquet"
+    stats_path = processed_dir / "sediment" / "noncohesive_transport_intensity_stats.parquet"
+    metadata_path = processed_dir / "sediment" / "noncohesive_transport_intensity_metadata.json"
+
+    assert main(["build-sediment-transport-intensity", str(config_path)]) == 0
+    first = (
+        pd.read_parquet(intensity_path),
+        pd.read_parquet(stats_path),
+        metadata_path.read_text(encoding="utf-8"),
+    )
+    assert main(["build-sediment-transport-intensity", str(config_path)]) == 0
+    second = (
+        pd.read_parquet(intensity_path),
+        pd.read_parquet(stats_path),
+        metadata_path.read_text(encoding="utf-8"),
+    )
+    pd.testing.assert_frame_equal(first[0], second[0])
+    pd.testing.assert_frame_equal(first[1], second[1])
+    assert first[2] == second[2]
+
+
 # --- build-scour-onset-screening (MAR-014) -------------------------------------------
 
 
