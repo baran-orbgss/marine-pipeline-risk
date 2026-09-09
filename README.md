@@ -2733,3 +2733,98 @@ otherwise, never an interactive credential prompt.
   in 87 packages, `ruff format --check` 212 files already formatted, `ruff
   check` clean, offline suite 1497 passed, 3 skipped, 25 live deselected.
   No further ticket has started.
+- **MAR-029 (route-referenced observed seabed change evidence POC,
+  `src/marine_engine/change/route_evidence.py`,
+  `src/marine_engine/change/route_evidence_manifest.py`, CLI command
+  `build-route-seabed-change-evidence`).** A generic bridge between the
+  accepted MAR-021/021A observed multi-epoch DoD and the accepted MAR-027
+  canonical route-reference grid -- an integration of accepted components,
+  redesigning neither: `change/dod.py`, `change/uncertainty.py`,
+  `change/epoch_compatibility.py`, `change/alignment.py`,
+  `change/common_support.py`, `project/route_reference.py`,
+  `project/model.py`, `scour/*`, `burial/*`, and `freespan/*` are untouched
+  (verified byte-identical to the canonical base). Output scientific role
+  `ROUTE_REFERENCED_OBSERVED_SEABED_ELEVATION_CHANGE`: for every canonical
+  route-reference point, the DoD value of the single raster cell CONTAINING
+  that point (`RASTER_CELL_CONTAINING_ROUTE_REFERENCE_POINT`, floor of the
+  inverse-affine pixel coordinates) -- no interpolation, no neighbour
+  averaging, no smoothing; GeoPackage point geometry is the canonical
+  MAR-027 point itself, never snapped to the cell centre (cell row/col,
+  centre coordinates, and point-to-centre distance are attributes only, and
+  the distance is spatial support geometry, not survey uncertainty). The
+  route <-> DoD association is EXPLICIT: a small typed
+  `RouteChangeEvidenceManifest` (`extra="forbid"`, paths relative to itself)
+  names the project manifest, the route asset ID (which must be the MAR-027
+  primary route whose grid was built -- otherwise `ROUTE_ASSET_ID_MISMATCH`),
+  the DoD raster, its source change-study identity, and an optional
+  provenance artefact (content-hashed, never copied). It is never inferred
+  from spatial overlap, shared CRS, directory, filename, or route uniqueness,
+  and is deliberately kept OUTSIDE the generic `ProjectManifest` so the
+  project layer accumulates no hazard-specific configuration. Declared DoD
+  facts (CRS, epochs, source scientific role) stay structurally separate
+  from observed raster facts (embedded CRS, width/height, pixel size, dtype,
+  nodata, band count, bounds, tags, byte size, SHA-256); a declared-vs-
+  observed conflict is blocking and never resolved by the software. The DoD
+  CRS must be semantically equivalent (`pyproj.CRS`) to the grid CRS or the
+  run stops with `DOD_CRS_MISMATCH`; the DoD is consumed read-only (never
+  reprojected, resampled, smoothed, thresholded, median-normalized, or
+  bias-corrected -- the post-run SHA-256 is re-computed and reported as
+  `WAS THE DoD SOURCE MODIFIED DURING THE RUN?`). Direction labels reuse
+  `change.dod.classify_change_direction` verbatim
+  (`OBSERVED_SEABED_RAISING` / `OBSERVED_SEABED_LOWERING` / no label for an
+  exact zero) and are raw observed sign labels only: no erosion / deposition
+  / scour attribution, no burial-loss / exposure / free-span state, no
+  significance boolean, generic threshold kept at
+  `GENERIC_DOD_UNCERTAINTY_THRESHOLD_NOT_DEMONSTRATED` with
+  `generic_change_significance_threshold_m = null` (MAR-021A remains
+  authoritative; Fugro's source-specific 0.3 m analyst criterion and the
+  nominal 0.2 m / 0.283 m RSS figures are never applied as filters), tiny
+  values preserved, nodata and outside-extent samples stay unavailable
+  (`CHANGE_VALUE_NODATA` / `ROUTE_POINT_OUTSIDE_DOD_EXTENT`, never 0 m), no
+  contiguous raising/lowering intervals or zone boundaries, sample COUNTS
+  only (explicitly not route-length or area coverage), total observed
+  change only (no annualization, no future rate, no persistence claim).
+  Controlled not-available reason codes (`NO_PRIMARY_ROUTE`,
+  `ROUTE_REFERENCE_NOT_BUILT`, `ROUTE_ASSET_ID_MISMATCH`,
+  `SOURCE_PROVENANCE_NOT_FOUND`, `DOD_NOT_FOUND`, `DOD_NOT_READABLE`,
+  `DOD_NOT_SINGLE_BAND_ANALYTICAL_RASTER`, `DOD_ROTATED_GRID_UNSUPPORTED`,
+  `DOD_CRS_MISSING`, `DOD_DECLARED_CRS_CONFLICT`, `DOD_SOURCE_ROLE_MISMATCH`,
+  `DOD_CRS_MISMATCH`, `NO_ROUTE_POINTS_ON_VALID_DOD_SUPPORT`) write truthful
+  metadata/validation/report only and remove any stale point product from an
+  earlier run. Outputs under `data/processed/<project_id>/change_route/`:
+  `route_observed_seabed_change.{parquet,gpkg}` (only when available; layer
+  `route_observed_seabed_change_points`, one row/point per canonical
+  route-reference station, in the canonical route CRS),
+  `route_observed_seabed_change_metadata.json`,
+  `route_observed_seabed_change_validation.json`,
+  `route_observed_seabed_change_report.html`. Proof status, stated
+  separately: REAL MULTI-EPOCH CHANGE ENGINE = YES (Sheringham Shoal
+  2018/2020; the accepted `build-seabed-change-poc` was re-run from cached
+  data only -- `INTEGER_PIXEL_OFFSET_ALIGNMENT` (row -10, col 3, no
+  interpolation), 75,918,562 common valid cells, generic threshold NOT
+  DEMONSTRATED, `route_kp_status =
+  NOT_APPLICABLE_NO_AUTHORITATIVE_ROUTE_SUPPLIED`, real DoD min -5.464 m /
+  median -0.041 m / P05 -0.184 m / P95 0.112 m / max 5.846 m, and the
+  accepted DoD GeoTIFF's SHA-256 identical before and after the re-run);
+  REAL ROUTE-REFERENCE ENGINE = YES (PL854; the accepted
+  `build-project-model` re-run reproduces `PRIMARY_ROUTE_AVAILABLE`,
+  `ROUTE_REFERENCE_BUILT`, 941 stations, 23,480.669 m, all seven MAR-027
+  answers unchanged); GENERIC COMBINED ROUTE + DoD INTEGRATION = YES
+  (synthetic proof only: `tests/test_route_change_evidence.py`, 53 tests
+  over an analytical 12x10 DoD with known positive / negative / exact-zero /
+  nodata cells, +/-100 m neighbouring rows to prove no interpolation, a
+  15-station 10 m grid with three stations outside the raster, and the real
+  MAR-026/027 registration + route-reference code path end to end); REAL
+  SAME-PROJECT ROUTE + MULTI-EPOCH DoD PROOF = NO -- Sheringham's accepted
+  benchmark has no authoritative canonical pipeline/cable centreline (no
+  bounding-box, transect, synthetic, PL854, or Barrow line was fabricated
+  through its DoD) and PL854 has no defensible same-project multi-epoch DoD
+  (the Sheringham DoD was NOT attached to the PL854 route). Backlog
+  distinction kept visible: route-referenced observed seabed
+  raising/lowering EVIDENCE is implemented; erosion/deposition PREDICTION,
+  future change rate, and persistence are not, and are not claimed. Local
+  verification: `uv lock --check` clean, repo-wide `ruff format` (215 files
+  unchanged) / `ruff check` clean, offline suite 1550 passed (up from 1497),
+  3 skipped, 25 live deselected, `uv audit --frozen` found no known
+  vulnerabilities and no adverse project statuses in 87 packages. No
+  further ticket has started.

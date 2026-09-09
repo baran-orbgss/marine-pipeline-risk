@@ -47,6 +47,7 @@ from marine_engine.change import dod as change_dod
 from marine_engine.change import epoch_compatibility as change_epoch_compatibility
 from marine_engine.change import maps as change_maps
 from marine_engine.change import report as change_report
+from marine_engine.change import route_evidence as change_route_evidence
 from marine_engine.change import uncertainty as change_uncertainty
 from marine_engine.config import load_study_config
 from marine_engine.evidence_atlas import core as evidence_atlas_core
@@ -10617,6 +10618,97 @@ def _cmd_build_project_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_route_seabed_change_evidence(args: argparse.Namespace) -> int:
+    """MAR-029: route-referenced observed seabed elevation-change evidence POC. Loads an EXPLICIT
+    route <-> DoD linkage manifest, runs the real MAR-026/026A registration and the real MAR-027
+    canonical project model (unchanged), consumes the accepted MAR-021/021A DoD raster read-only,
+    and samples the DoD cell containing each canonical route-reference point. Raw observed sign
+    labels only; no significance threshold, no causal attribution, no prediction, no score.
+    """
+
+    try:
+        result, model = change_route_evidence.run_route_change_evidence(args.manifest)
+    except Exception as exc:
+        print(f"error: route-change evidence inputs are invalid: {exc}", file=sys.stderr)
+        return 1
+
+    rr = model.route_reference
+    print(f"Project {result.project_id!r}: working CRS {result.working_crs}")
+    print(f"  Primary route: {rr.primary_route.status} ({rr.primary_route.primary_route_asset_id})")
+    print(f"  Route reference: {rr.status} ({rr.station_count} station(s))")
+    print(f"  Declared route asset for change evidence: {result.route_manifest.route_asset_id}")
+    print(f"  DoD source: {result.dod_resolved_path}")
+    if result.dod_identity is not None:
+        print(f"  DoD SHA-256: {result.dod_identity.sha256}")
+    if result.dod_observed is not None:
+        obs = result.dod_observed
+        print(
+            f"  DoD observed: crs={obs.observed_crs} {obs.width}x{obs.height} "
+            f"pixel=({obs.pixel_size_x:g},{obs.pixel_size_y:g}) dtype={obs.dtype} "
+            f"bands={obs.band_count} nodata={obs.nodata}"
+        )
+
+    output_dir = Path("data/processed") / result.project_id / "change_route"
+    final = change_route_evidence.write_route_change_evidence_outputs(result, output_dir)
+    for key in ("parquet", "gpkg", "metadata", "validation", "report"):
+        if key in final.output_paths:
+            print(f"  {key} -> {final.output_paths[key]}")
+    if not final.products_written:
+        print("  Point products: not written (evidence not available; see findings)")
+
+    validation = change_route_evidence.build_route_change_evidence_validation(final)
+    metadata = change_route_evidence.build_route_change_evidence_metadata(final)
+    counts = metadata["sample_counts"]
+
+    print()
+    print("=== Route-Referenced Observed Seabed Elevation Change (MAR-029) ===")
+    print()
+    print(f"Scientific role: {change_route_evidence.SCIENTIFIC_ROLE}")
+    print(f"Status: {final.status}" + (f" ({final.reason_code})" if final.reason_code else ""))
+    for finding in final.findings:
+        print(f"  FINDING: {finding}")
+    print(f"Sample support: {change_route_evidence.SAMPLE_SUPPORT_SEMANTICS}")
+    print("Sample counts (route-reference SAMPLES, not route-length coverage):")
+    for key, value in counts.items():
+        if key != "note":
+            print(f"  {key}: {value}")
+    print(
+        "Generic change significance: "
+        f"{metadata['generic_change_significance']['generic_change_significance_status']} "
+        "(threshold_m = null)"
+    )
+    print()
+    print(change_route_evidence.DIRECTION_LABEL_DISCLAIMER)
+    print()
+    labels = {
+        "question_a_does_mar029_reuse_the_accepted_mar021_dod_definition": (
+            "DOES MAR-029 REUSE THE ACCEPTED MAR-021 DoD DEFINITION?"
+        ),
+        "question_b_can_a_positive_dod_sample_be_called_definitive_deposition": (
+            "CAN A POSITIVE DoD SAMPLE BE CALLED DEFINITIVE DEPOSITION?"
+        ),
+        "question_c_can_a_negative_dod_sample_be_called_definitive_erosion_or_scour": (
+            "CAN A NEGATIVE DoD SAMPLE BE CALLED DEFINITIVE EROSION OR SCOUR?"
+        ),
+        "question_d_does_mar029_apply_a_generic_change_significance_threshold": (
+            "DOES MAR-029 APPLY A GENERIC CHANGE-SIGNIFICANCE THRESHOLD?"
+        ),
+        "question_e_does_nodata_become_zero_change": "DOES NODATA BECOME ZERO CHANGE?",
+        "question_f_is_the_dod_raster_interpolated_or_smoothed_during_route_sampling": (
+            "IS THE DoD RASTER INTERPOLATED OR SMOOTHED DURING ROUTE SAMPLING?"
+        ),
+        "question_g_is_route_referenced_observed_change_available_for_this_run": (
+            "IS ROUTE-REFERENCED OBSERVED CHANGE AVAILABLE FOR THIS RUN?"
+        ),
+        "question_h_was_the_dod_source_modified_during_the_run": (
+            "WAS THE DoD SOURCE MODIFIED DURING THE RUN?"
+        ),
+    }
+    for key, label in labels.items():
+        print(f"{label} {validation[key]}")
+    return 0
+
+
 def _cmd_build_project_readiness(args: argparse.Namespace) -> int:
     """MAR-026: generic local operator-project registration and asset-readiness layer. Sits
     above raw operator files and below the independent scientific geohazard engines -- performs
@@ -11324,6 +11416,29 @@ def build_parser() -> argparse.ArgumentParser:
         "manifest", type=Path, help="Path to an operator project manifest YAML file."
     )
     build_project_model_parser.set_defaults(func=_cmd_build_project_model)
+
+    build_route_seabed_change_evidence_parser = subparsers.add_parser(
+        "build-route-seabed-change-evidence",
+        help=(
+            "MAR-029: route-referenced observed seabed elevation-change evidence POC -- takes an "
+            "EXPLICIT route <-> DoD linkage manifest (never inferred from overlap, CRS, directory, "
+            "or filename), runs the existing MAR-026/026A registration and MAR-027 canonical "
+            "project model unchanged, consumes the accepted MAR-021/021A DoD raster read-only, "
+            "and records the DoD value of the raster cell containing each canonical "
+            "route-reference point (no interpolation, no smoothing, nodata never becomes zero). "
+            "Raw OBSERVED_SEABED_RAISING/LOWERING sign labels only: no generic significance "
+            "threshold, no erosion/deposition/scour attribution, no burial/free-span coupling, "
+            "no future change rate, no score. Emits route_observed_seabed_change.{parquet,gpkg} "
+            "(only when available), plus metadata/validation JSON and an HTML report under "
+            "data/processed/<project_id>/change_route/. Fully offline."
+        ),
+    )
+    build_route_seabed_change_evidence_parser.add_argument(
+        "manifest", type=Path, help="Path to a route-change evidence manifest YAML file."
+    )
+    build_route_seabed_change_evidence_parser.set_defaults(
+        func=_cmd_build_route_seabed_change_evidence
+    )
 
     return parser
 
