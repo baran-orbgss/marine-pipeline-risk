@@ -2496,5 +2496,66 @@ otherwise, never an interactive credential prompt.
   THROUGH THE GENERIC PROJECT LAYER?` YES (Barrow run); `DOES MAR-026
   CLAIM THE PROJECT IS READY FOR EVERY MARINE GEOHAZARD?` NO (required,
   and structurally enforced by an asserted pure function mirroring this
-  project's established validation-question pattern). No further ticket
-  has started.
+  project's established validation-question pattern).
+- **MAR-026A (project CRS integrity & registration fail-safe repair,
+  `src/marine_engine/project/registry.py`,
+  `src/marine_engine/project/bathymetry_adapter.py`).** A narrow repair of
+  two MAR-026 integrity defects -- no new geohazard physics, no
+  architectural refactor. Problem A: bathymetry declared-vs-observed CRS
+  comparison used a coarse `_crs_kind_conflict` (geographic-vs-projected
+  only), so e.g. declared `EPSG:32632` against a real embedded `EPSG:32631`
+  silently passed as "no conflict" since both are projected.
+  `bathymetry_adapter.inspect_bathymetry_raster` now also returns the
+  raster's exact embedded CRS (`crs.to_string()`, mirroring the existing
+  `preprocessing.bathymetry` convention) without touching `RasterFacts` or
+  `assess_bathymetry_readiness` at all, and the registry now compares it
+  with the same exact `pyproj.CRS`-equality `_crs_conflict` already used
+  for routes -- which was also hardened so a syntactically invalid declared
+  CRS is itself reported as a conflict rather than silently swallowed by a
+  caught `CRSError`. Every asset now carries both a
+  `readiness_status_intrinsic` (the delegated MAR-020/MAR-024/route-adapter
+  module's own conclusion, never mutated) and a `readiness_status_effective`
+  (forced to `NOT_READY` whenever an unresolved conflict exists) --
+  `readiness_status` is kept as a read-only property alias of the effective
+  value for backward compatibility, so no existing caller was silently left
+  reading only the intrinsic half. Problem B: `_register_route` used to
+  attempt `build_canonical_project_route` (and therefore
+  `GeoDataFrame.to_crs(working_crs)`) whenever a route resolved to one
+  continuous line with a known source CRS, regardless of whether the
+  project's own `working_crs` was even valid -- a manifest with
+  `working_crs: NOT_A_REAL_CRS` (or any other genuinely broken value) could
+  turn an already-correctly-computed `NOT_READY` readiness result into an
+  unhandled `pyproj`/`CRSError` exception. Canonical route construction is
+  now gated structurally (no broad `try/except`) on every reprojection
+  prerequisite together -- a resolved line, a known source CRS, a working
+  CRS that is both valid and projected/metric, and no unresolved
+  declared-vs-observed conflict. A new `working_crs` validity check also
+  runs centrally once per project in `register_project` (valid, projected,
+  metric), independent of whether any route asset is present, so a
+  bathymetry-only or burial-only project can no longer carry an obviously
+  broken working CRS unnoticed -- surfaced as `working_crs_findings` in
+  `project_readiness.json`/`ProjectRegistrationSummary` and folded into the
+  HTML report's Blocking Issues. 22 new tests cover every Section 8 proof
+  point (matching/equivalent/conflicting/missing/invalid declared CRS
+  against a real observed raster CRS, a route CRS conflict forcing
+  `NOT_READY` with no canonical route emitted, `register_asset` never
+  throwing for `working_crs="NOT_A_REAL_CRS"` or building a canonical route
+  for a geographic `working_crs="EPSG:4326"`, and a bathymetry-only project
+  centrally flagging both an invalid and a geographic working CRS). Real
+  regression, re-run fully offline against the already-cached data: the
+  real Sheringham 2020 raster's exact embedded CRS (`EPSG:32631`) now
+  appears as a distinct `observed_crs` fact matching its declared
+  `EPSG:32631` exactly, `conflicts: []`, intrinsic and effective readiness
+  both still `READY`; Barrow 2016 is untouched (no CRS-conflict logic
+  applies to `BURIAL_PROFILE`), still `READY_WITH_LIMITATIONS` with the
+  identical unresolved burial-reference limitation and the same 1
+  duplicate-KP finding as MAR-026's own run; both projects'
+  `working_crs_findings` are empty. The full offline suite (1428 tests, up
+  from 1415) and repo-wide `ruff format`/`ruff check` pass clean. Final
+  answers: `CAN TWO DIFFERENT PROJECTED CRSs SILENTLY PASS AS THE SAME
+  RASTER CRS?` NO; `CAN A MATERIAL DECLARED-vs-OBSERVED CRS CONFLICT REMAIN
+  EFFECTIVELY READY?` NO; `CAN AN INVALID PROJECT WORKING CRS CAUSE AN
+  UNHANDLED CANONICAL-ROUTE REPROJECTION?` NO; `ARE THE ACCEPTED MAR-020
+  AND MAR-024 READINESS FUNCTIONS STILL UNMODIFIED?` YES (neither
+  `terrain/readiness.py` nor `burial/readiness.py` was touched). No further
+  ticket has started.

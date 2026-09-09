@@ -14,6 +14,18 @@ Two-tier status, kept structurally distinct:
 
 This module never computes an aggregate project-wide hazard-readiness score -- see
 `PROJECT_HAZARD_READINESS_DISCLAIMER` (Section 13).
+
+MAR-026A adds a THIRD distinction on top of readiness: intrinsic vs. effective. The delegated
+readiness modules (`terrain.readiness.assess_bathymetry_readiness`,
+`burial.readiness.assess_burial_profile_readiness`) and the new `route_adapter.
+assess_route_readiness` each answer one question in isolation -- is *this file's own data*
+usable. That is the INTRINSIC result, and it is never mutated (`readiness_status_intrinsic`,
+`readiness_result`). Project-level integration concerns -- e.g. a declared CRS that contradicts
+the file's own observed/embedded CRS -- sit ABOVE that delegated result and can force an asset's
+EFFECTIVE readiness (`readiness_status_effective`, and the backward-compatible
+`readiness_status` alias) to `NOT_READY` even when the intrinsic result was `READY`. Both values
+are always exposed side by side -- a material conflict is never resolved by silently falsifying
+the delegated module's own conclusion.
 """
 
 from __future__ import annotations
@@ -65,38 +77,64 @@ PROJECT_HAZARD_READINESS_DISCLAIMER = (
 
 
 def _crs_conflict(declared: str | None, observed: str | None) -> str | None:
-    """Section 5: a material declared-vs-observed CRS conflict is recorded explicitly, never
-    silently resolved by picking one or reprojecting."""
+    """Section 5 / MAR-026A Problem A: a material declared-vs-observed CRS conflict is recorded
+    explicitly, never silently resolved by picking one or reprojecting. Comparison is by
+    `pyproj.CRS` equality, never raw string equality, so two different textual representations
+    of the same CRS never produce a false conflict -- while two different projected CRSs (e.g.
+    `EPSG:32631` vs `EPSG:32632`) are always caught, even though neither is geographic.
+
+    A missing declared or observed value is NOT itself a conflict (there is nothing to compare
+    against; a missing embedded CRS is its own, separately handled readiness concern). A
+    declared value that fails to parse as a CRS at all is never silently ignored, though -- it is
+    itself reported as a conflict against a known observed CRS, rather than treated as "no
+    conflict found"."""
 
     if not declared or not observed:
         return None
     try:
         declared_crs = CRS.from_user_input(declared)
-        observed_crs = CRS.from_user_input(observed)
     except CRSError:
-        return None
+        return f"declared CRS {declared!r} is not a valid/recognized CRS identifier"
+    try:
+        observed_crs = CRS.from_user_input(observed)
+    except CRSError:  # pragma: no cover -- defensive; observed values are always adapter-derived
+        return f"observed CRS {observed!r} could not be parsed for comparison"
     if declared_crs != observed_crs:
         return f"declared CRS {declared!r} does not match observed/embedded CRS {observed!r}"
     return None
 
 
-def _crs_kind_conflict(declared: str | None, *, observed_is_geographic: bool | None) -> str | None:
-    """A coarser conflict check usable even when the observed side is only known as
-    geographic-vs-projected (e.g. a raster's embedded CRS, not exposed as a full string by
-    `RasterFacts`) -- still a real, honestly-detectable conflict, never fabricated."""
+def _effective_readiness_status(intrinsic_status: str, conflicts: list[str]) -> str:
+    """MAR-026A Section 3: an unresolved declared-vs-observed conflict is a BLOCKING
+    project-integration condition -- the asset's EFFECTIVE readiness becomes `NOT_READY`
+    regardless of what the delegated/intrinsic readiness module concluded on the file's data
+    alone. The intrinsic result itself is never mutated or falsified to reach this; it stays
+    available separately as `readiness_status_intrinsic`/`readiness_result`."""
 
-    if not declared or observed_is_geographic is None:
-        return None
-    try:
-        declared_crs = CRS.from_user_input(declared)
-    except CRSError:
-        return None
-    if declared_crs.is_geographic != observed_is_geographic:
-        return (
-            f"declared CRS {declared!r} is_geographic={declared_crs.is_geographic} but observed "
-            f"source CRS is_geographic={observed_is_geographic}"
+    if conflicts:
+        return terrain_readiness.NOT_READY
+    return intrinsic_status
+
+
+def _project_working_crs_findings(working_crs: str) -> list[str]:
+    """MAR-026A Section 6: the project's declared `working_crs` must be a valid, projected,
+    metric CRS. Checked centrally, once per project, rather than only incidentally through a
+    route asset's own readiness checks (`route_adapter.assess_route_readiness` already has its
+    own `working_crs_valid`/`working_crs_projected_metric` checks, but those only run when a
+    route asset happens to be present) -- so a bathymetry-only or burial-only project can never
+    carry an obviously invalid working CRS unnoticed. Never infers or falls back to a
+    replacement CRS: an invalid working_crs is only ever reported, so the operator corrects the
+    manifest."""
+
+    findings: list[str] = []
+    if not route_adapter.is_valid_crs(working_crs):
+        findings.append(f"project working_crs {working_crs!r} is not a valid CRS identifier")
+    elif not route_adapter.is_projected_metric_crs(working_crs):
+        findings.append(
+            f"project working_crs {working_crs!r} is not a projected, metric CRS -- required "
+            "for pipeline engineering operations"
         )
-    return None
+    return findings
 
 
 @dataclass(frozen=True)
@@ -113,8 +151,17 @@ class AssetRegistration:
     provenance_declared: dict[str, Any]
     observed_facts: dict[str, Any]
     conflicts: list[str]
-    readiness_status: str
+    readiness_status_intrinsic: str
+    readiness_status_effective: str
     readiness_result: dict[str, Any] | None
+
+    @property
+    def readiness_status(self) -> str:
+        """Backward-compatible alias (MAR-026A Section 9): equals `readiness_status_effective`,
+        i.e. it already accounts for any project-level declared-vs-observed CRS conflict --
+        never only the delegated/intrinsic result in isolation. Use
+        `readiness_status_intrinsic` for the untouched, delegated module's own conclusion."""
+        return self.readiness_status_effective
 
 
 @dataclass(frozen=True)
@@ -147,7 +194,8 @@ def _failed_registration(
             provenance_declared=provenance_declared,
             observed_facts={},
             conflicts=[],
-            readiness_status=terrain_readiness.NOT_READY,
+            readiness_status_intrinsic=terrain_readiness.NOT_READY,
+            readiness_status_effective=terrain_readiness.NOT_READY,
             readiness_result=None,
         )
     )
@@ -185,8 +233,22 @@ def _register_route(
         "feature_count": int(len(gdf)) if gdf is not None else None,
     }
 
+    # MAR-026A Problem B: canonical route construction is gated structurally on every
+    # prerequisite the reprojection itself needs -- a resolved line, a known source CRS, a
+    # working CRS that is both valid and projected/metric -- plus (Section 3) no unresolved
+    # declared-vs-observed CRS conflict. This is checked BEFORE `build_canonical_project_route`
+    # is ever called, so an invalid `working_crs` (e.g. "NOT_A_REAL_CRS") or a non-metric one
+    # (e.g. "EPSG:4326") can never reach `GeoDataFrame.to_crs(...)` and never needs a broad
+    # try/except around the reprojection to stay safe.
+    can_build_canonical_route = (
+        canonical_line is not None
+        and source_crs is not None
+        and facts.working_crs_valid
+        and facts.working_crs_is_projected_metric
+        and not conflicts
+    )
     canonical_route_gdf = None
-    if canonical_line is not None and source_crs is not None:
+    if can_build_canonical_route:
         canonical_route_gdf = route_adapter.build_canonical_project_route(
             canonical_line,
             asset_id=asset.asset_id,
@@ -208,7 +270,8 @@ def _register_route(
         provenance_declared=provenance_declared,
         observed_facts=observed_facts,
         conflicts=conflicts,
-        readiness_status=result.status,
+        readiness_status_intrinsic=result.status,
+        readiness_status_effective=_effective_readiness_status(result.status, conflicts),
         readiness_result=result.to_dict(),
     )
     return AssetRegistrationResult(
@@ -224,7 +287,7 @@ def _register_bathymetry(
     provenance_declared: dict[str, Any],
 ) -> AssetRegistrationResult:
     try:
-        facts = bathymetry_adapter.inspect_bathymetry_raster(
+        facts, observed_crs = bathymetry_adapter.inspect_bathymetry_raster(
             resolved_path,
             declared_vertical_datum=asset.provenance.vertical_datum_declared,
             declared_survey_epoch=asset.provenance.survey_epoch,
@@ -241,10 +304,11 @@ def _register_bathymetry(
 
     result = terrain_readiness.assess_bathymetry_readiness(facts)
 
+    # MAR-026A Problem A: compared by exact `pyproj.CRS` identity (`_crs_conflict`), not merely
+    # geographic-vs-projected -- two different projected CRSs (e.g. EPSG:32631 vs EPSG:32632)
+    # must conflict even though neither is geographic.
     conflicts = []
-    conflict = _crs_kind_conflict(
-        asset.provenance.horizontal_crs_declared, observed_is_geographic=facts.crs_is_geographic
-    )
+    conflict = _crs_conflict(asset.provenance.horizontal_crs_declared, observed_crs)
     if conflict:
         conflicts.append(conflict)
 
@@ -260,6 +324,7 @@ def _register_bathymetry(
         "crs_is_present": facts.crs_is_present,
         "crs_is_geographic": facts.crs_is_geographic,
         "crs_linear_units": facts.crs_linear_units,
+        "observed_crs": observed_crs,
         "data_min": facts.data_min,
         "data_max": facts.data_max,
         "valid_cell_fraction": facts.valid_cell_fraction,
@@ -278,7 +343,8 @@ def _register_bathymetry(
         provenance_declared=provenance_declared,
         observed_facts=observed_facts,
         conflicts=conflicts,
-        readiness_status=result.status,
+        readiness_status_intrinsic=result.status,
+        readiness_status_effective=_effective_readiness_status(result.status, conflicts),
         readiness_result=result.to_dict(),
     )
     return AssetRegistrationResult(registration=registration)
@@ -348,7 +414,8 @@ def _register_burial(
         provenance_declared=provenance_declared,
         observed_facts=observed_facts,
         conflicts=[],
-        readiness_status=result.status,
+        readiness_status_intrinsic=result.status,
+        readiness_status_effective=_effective_readiness_status(result.status, []),
         readiness_result=result.to_dict(),
     )
     return AssetRegistrationResult(registration=registration, burial_table_df=df)
@@ -408,7 +475,8 @@ def register_asset(
         provenance_declared=provenance_declared,
         observed_facts={},
         conflicts=[],
-        readiness_status=REGISTERED_READINESS_NOT_IMPLEMENTED,
+        readiness_status_intrinsic=REGISTERED_READINESS_NOT_IMPLEMENTED,
+        readiness_status_effective=REGISTERED_READINESS_NOT_IMPLEMENTED,
         readiness_result=None,
     )
     return AssetRegistrationResult(registration=registration)
@@ -421,6 +489,7 @@ class ProjectRegistrationSummary:
     working_crs: str
     primary_route_asset_id: str | None
     asset_results: list[AssetRegistrationResult] = field(default_factory=list)
+    working_crs_findings: list[str] = field(default_factory=list)
 
     def readiness_status_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -439,6 +508,10 @@ class ProjectRegistrationSummary:
 
 def register_project(manifest: ProjectManifest, manifest_dir: Path) -> ProjectRegistrationSummary:
     working_crs = manifest.project.working_crs
+    # MAR-026A Section 6: checked centrally, once, regardless of which (if any) asset categories
+    # are present -- a bathymetry-only or burial-only project must not carry an obviously
+    # invalid working CRS unnoticed just because no route asset happened to trigger the check.
+    working_crs_findings = _project_working_crs_findings(working_crs)
     asset_results = [
         register_asset(asset, manifest_dir=manifest_dir, working_crs=working_crs)
         for asset in manifest.assets
@@ -449,6 +522,7 @@ def register_project(manifest: ProjectManifest, manifest_dir: Path) -> ProjectRe
         working_crs=working_crs,
         primary_route_asset_id=manifest.primary_route_asset_id,
         asset_results=asset_results,
+        working_crs_findings=working_crs_findings,
     )
 
 
@@ -473,6 +547,8 @@ def build_asset_registry_df(summary: ProjectRegistrationSummary) -> pd.DataFrame
                 "observed_facts_json": json.dumps(reg.observed_facts, default=str),
                 "conflicts": "; ".join(reg.conflicts) or None,
                 "readiness_status": reg.readiness_status,
+                "readiness_status_intrinsic": reg.readiness_status_intrinsic,
+                "readiness_status_effective": reg.readiness_status_effective,
             }
         )
     columns = [
@@ -489,6 +565,8 @@ def build_asset_registry_df(summary: ProjectRegistrationSummary) -> pd.DataFrame
         "observed_facts_json",
         "conflicts",
         "readiness_status",
+        "readiness_status_intrinsic",
+        "readiness_status_effective",
     ]
     if not rows:
         return pd.DataFrame(columns=columns)
@@ -503,6 +581,8 @@ def build_project_readiness_dict(summary: ProjectRegistrationSummary) -> dict[st
         "scientific_role": "PROJECT_STRUCTURAL_REGISTRATION_AND_PER_ASSET_READINESS",
         "project_id": summary.project_id,
         "project_hazard_readiness_disclaimer": PROJECT_HAZARD_READINESS_DISCLAIMER,
+        "working_crs": summary.working_crs,
+        "working_crs_findings": summary.working_crs_findings,
         "registration_status_counts": summary.registration_status_counts(),
         "readiness_status_counts": summary.readiness_status_counts(),
         "assets": {
@@ -513,6 +593,8 @@ def build_project_readiness_dict(summary: ProjectRegistrationSummary) -> dict[st
                 "registration_detail": r.registration.registration_detail,
                 "conflicts": r.registration.conflicts,
                 "readiness_status": r.registration.readiness_status,
+                "readiness_status_intrinsic": r.registration.readiness_status_intrinsic,
+                "readiness_status_effective": r.registration.readiness_status_effective,
                 "readiness_result": r.registration.readiness_result,
             }
             for r in summary.asset_results

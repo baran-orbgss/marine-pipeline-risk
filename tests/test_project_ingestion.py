@@ -18,6 +18,7 @@ import pandas as pd
 import pydantic
 import pytest
 import rasterio
+from pyproj import CRS
 from rasterio.transform import from_origin
 from shapely.geometry import LineString, Point
 
@@ -453,7 +454,7 @@ def test_bathymetry_readiness_is_delegated_to_terrain_readiness(tmp_path: Path):
     # produces the result -- not a re-implementation.
     raster_path = tmp_path / "bathy.tif"
     _write_bathymetry_tif(raster_path)
-    facts = bathymetry_adapter.inspect_bathymetry_raster(
+    facts, _observed_crs = bathymetry_adapter.inspect_bathymetry_raster(
         raster_path, declared_vertical_datum="LAT", declared_survey_epoch="2024-06"
     )
     assert isinstance(facts, terrain_readiness.RasterFacts)
@@ -469,7 +470,7 @@ def test_bathymetry_declared_provenance_flows_through_not_embedded(tmp_path: Pat
     # to be embedded raster metadata.
     raster_path = tmp_path / "bathy.tif"
     _write_bathymetry_tif(raster_path)
-    facts = bathymetry_adapter.inspect_bathymetry_raster(
+    facts, _observed_crs = bathymetry_adapter.inspect_bathymetry_raster(
         raster_path,
         declared_vertical_datum="A_DECLARED_DATUM",
         declared_survey_epoch="A_DECLARED_EPOCH",
@@ -481,7 +482,7 @@ def test_bathymetry_declared_provenance_flows_through_not_embedded(tmp_path: Pat
 def test_bathymetry_missing_declared_metadata_stays_missing(tmp_path: Path):
     raster_path = tmp_path / "bathy.tif"
     _write_bathymetry_tif(raster_path)
-    facts = bathymetry_adapter.inspect_bathymetry_raster(
+    facts, _observed_crs = bathymetry_adapter.inspect_bathymetry_raster(
         raster_path, declared_vertical_datum=None, declared_survey_epoch=None
     )
     assert facts.vertical_datum is None
@@ -497,6 +498,21 @@ def test_missing_bathymetry_raster_raises_registration_error(tmp_path: Path):
             declared_vertical_datum=None,
             declared_survey_epoch=None,
         )
+
+
+# --- MAR-026A Problem A: exact observed raster CRS is preserved and compared exactly -----------
+
+
+def test_bathymetry_observed_crs_is_exposed_as_a_separate_exact_fact(tmp_path: Path):
+    # MAR-026A: `RasterFacts` itself only exposes crs_is_geographic/crs_linear_units --
+    # `inspect_bathymetry_raster` must additionally expose the exact embedded CRS.
+    raster_path = tmp_path / "bathy.tif"
+    _write_bathymetry_tif(raster_path, crs="EPSG:32631")
+    _facts, observed_crs = bathymetry_adapter.inspect_bathymetry_raster(
+        raster_path, declared_vertical_datum=None, declared_survey_epoch=None
+    )
+    assert observed_crs is not None
+    assert CRS.from_user_input(observed_crs) == CRS.from_epsg(32631)
 
 
 # --- burial adapter: Section 11, 16.A, 18.11 ------------------------------------------------------
@@ -645,6 +661,14 @@ def test_declared_vs_observed_crs_conflict_is_recorded_not_silently_reprojected(
     assert "EPSG:32631" in result.registration.conflicts[0]
     # the conflict is recorded, never silently resolved -- registration still proceeds honestly
     assert result.registration.registration_status == project_registry.REGISTERED
+    # MAR-026A Section 3/8.6: the route's own facts are otherwise fine intrinsically (no
+    # declared survey_epoch here, so intrinsic is READY_WITH_LIMITATIONS, never NOT_READY), but
+    # an unresolved declared-vs-observed conflict forces EFFECTIVE readiness to NOT_READY, and
+    # no canonical route is emitted from the unresolved contradictory metadata.
+    assert result.registration.readiness_status_intrinsic == route_adapter.READY_WITH_LIMITATIONS
+    assert result.registration.readiness_status_effective == route_adapter.NOT_READY
+    assert result.registration.readiness_status == route_adapter.NOT_READY
+    assert result.canonical_route_gdf is None
 
 
 def test_missing_declared_metadata_remains_missing(tmp_path: Path):
@@ -670,6 +694,347 @@ def test_missing_declared_metadata_remains_missing(tmp_path: Path):
     )
     assert result.registration.provenance_declared["survey_epoch"] is None
     assert result.registration.readiness_status == route_adapter.READY_WITH_LIMITATIONS
+
+
+# --- MAR-026A Problem A: exact declared-vs-observed CRS conflict semantics ----------------------
+
+
+def test_bathymetry_declared_and_observed_crs_match_no_conflict(tmp_path: Path):
+    raster_path = tmp_path / "bathy.tif"
+    _write_bathymetry_tif(raster_path, crs="EPSG:32631")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        _minimal_manifest_yaml(
+            """  - asset_id: b
+    category: BATHYMETRY_RASTER
+    evidence_role: MEASURED
+    path: ./bathy.tif
+    provenance:
+      source_name: x
+      horizontal_crs_declared: EPSG:32631
+"""
+        ),
+        encoding="utf-8",
+    )
+    m, mdir = project_manifest.load_project_manifest(manifest_path)
+    result = project_registry.register_asset(
+        m.assets[0], manifest_dir=mdir, working_crs="EPSG:32631"
+    )
+    assert result.registration.conflicts == []
+    assert (
+        result.registration.readiness_status_effective
+        == result.registration.readiness_status_intrinsic
+    )
+
+
+def test_bathymetry_equivalent_declared_crs_representation_is_not_a_false_conflict(
+    tmp_path: Path,
+):
+    # a different textual representation (WKT) of the exact same CRS as "EPSG:32631" -- must
+    # compare equal via pyproj.CRS, never via raw string equality.
+    raster_path = tmp_path / "bathy.tif"
+    _write_bathymetry_tif(raster_path, crs="EPSG:32631")
+    equivalent_wkt = CRS.from_epsg(32631).to_wkt()
+    asset = project_manifest.AssetEntry(
+        asset_id="b",
+        category=categories.BATHYMETRY_RASTER,
+        evidence_role=categories.MEASURED,
+        path=Path("bathy.tif"),
+        provenance=project_manifest.DeclaredProvenance(
+            source_name="x", horizontal_crs_declared=equivalent_wkt
+        ),
+    )
+    result = project_registry.register_asset(asset, manifest_dir=tmp_path, working_crs="EPSG:32631")
+    assert result.registration.conflicts == [], (
+        f"expected no conflict for an equivalent CRS representation, got "
+        f"{result.registration.conflicts}"
+    )
+
+
+def test_bathymetry_two_different_projected_crs_values_conflict_despite_neither_geographic(
+    tmp_path: Path,
+):
+    # MAR-026A Problem A: the exact defect being repaired -- two different PROJECTED CRSs must
+    # conflict, which the old geographic-vs-projected-only check could never detect.
+    raster_path = tmp_path / "bathy.tif"
+    _write_bathymetry_tif(raster_path, crs="EPSG:32631")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        _minimal_manifest_yaml(
+            """  - asset_id: b
+    category: BATHYMETRY_RASTER
+    evidence_role: MEASURED
+    path: ./bathy.tif
+    provenance:
+      source_name: x
+      horizontal_crs_declared: EPSG:32632
+      vertical_datum_declared: LAT
+      survey_epoch: "2024-06"
+"""
+        ),
+        encoding="utf-8",
+    )
+    m, mdir = project_manifest.load_project_manifest(manifest_path)
+    result = project_registry.register_asset(
+        m.assets[0], manifest_dir=mdir, working_crs="EPSG:32631"
+    )
+    assert result.registration.conflicts, "two different projected CRSs must conflict"
+    assert "EPSG:32632" in result.registration.conflicts[0]
+    assert "EPSG:32631" in result.registration.conflicts[0]
+    # intrinsic (delegated, unmodified MAR-020) readiness is untouched by the project conflict
+    assert result.registration.readiness_status_intrinsic == terrain_readiness.READY
+    assert result.registration.readiness_result["status"] == terrain_readiness.READY
+    # the EFFECTIVE, project-integrated readiness must not remain READY
+    assert result.registration.readiness_status_effective == terrain_readiness.NOT_READY
+    assert result.registration.readiness_status == terrain_readiness.NOT_READY
+
+
+def test_bathymetry_declared_geographic_vs_observed_projected_still_conflicts(tmp_path: Path):
+    raster_path = tmp_path / "bathy.tif"
+    _write_bathymetry_tif(raster_path, crs="EPSG:32631")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        _minimal_manifest_yaml(
+            """  - asset_id: b
+    category: BATHYMETRY_RASTER
+    evidence_role: MEASURED
+    path: ./bathy.tif
+    provenance:
+      source_name: x
+      horizontal_crs_declared: EPSG:4326
+"""
+        ),
+        encoding="utf-8",
+    )
+    m, mdir = project_manifest.load_project_manifest(manifest_path)
+    result = project_registry.register_asset(
+        m.assets[0], manifest_dir=mdir, working_crs="EPSG:32631"
+    )
+    assert result.registration.conflicts, "declared geographic vs observed projected must conflict"
+
+
+def test_bathymetry_missing_declared_crs_is_not_a_fabricated_conflict(tmp_path: Path):
+    raster_path = tmp_path / "bathy.tif"
+    _write_bathymetry_tif(raster_path, crs="EPSG:32631")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        _minimal_manifest_yaml(
+            """  - asset_id: b
+    category: BATHYMETRY_RASTER
+    evidence_role: MEASURED
+    path: ./bathy.tif
+    provenance:
+      source_name: x
+      vertical_datum_declared: LAT
+      survey_epoch: "2024-06"
+"""
+        ),
+        encoding="utf-8",
+    )
+    m, mdir = project_manifest.load_project_manifest(manifest_path)
+    result = project_registry.register_asset(
+        m.assets[0], manifest_dir=mdir, working_crs="EPSG:32631"
+    )
+    assert result.registration.conflicts == []
+    assert result.registration.readiness_status_intrinsic == terrain_readiness.READY
+    assert result.registration.readiness_status_effective == terrain_readiness.READY
+
+
+def test_bathymetry_invalid_declared_crs_is_not_silently_ignored(tmp_path: Path):
+    # Problem A repair requirement: "invalid declared CRS must not be silently ignored" -- a
+    # declared value that fails to parse must not be treated as "no conflict found" when a real
+    # observed CRS exists to compare against.
+    raster_path = tmp_path / "bathy.tif"
+    _write_bathymetry_tif(raster_path, crs="EPSG:32631")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        _minimal_manifest_yaml(
+            """  - asset_id: b
+    category: BATHYMETRY_RASTER
+    evidence_role: MEASURED
+    path: ./bathy.tif
+    provenance:
+      source_name: x
+      horizontal_crs_declared: NOT_A_REAL_CRS
+"""
+        ),
+        encoding="utf-8",
+    )
+    m, mdir = project_manifest.load_project_manifest(manifest_path)
+    result = project_registry.register_asset(
+        m.assets[0], manifest_dir=mdir, working_crs="EPSG:32631"
+    )
+    assert result.registration.conflicts, (
+        "a syntactically invalid declared CRS must not be silently ignored when an observed "
+        "CRS is available to compare against"
+    )
+    assert result.registration.readiness_status_effective == terrain_readiness.NOT_READY
+
+
+def test_readiness_status_alias_always_equals_effective_status(tmp_path: Path):
+    # Section 9: `readiness_status` is kept for backward compatibility, but must represent the
+    # EFFECTIVE status -- a consumer reading only the old field name must never silently see an
+    # intrinsic-only result once a project-level conflict exists.
+    raster_path = tmp_path / "bathy.tif"
+    _write_bathymetry_tif(raster_path, crs="EPSG:32631")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        _minimal_manifest_yaml(
+            """  - asset_id: b
+    category: BATHYMETRY_RASTER
+    evidence_role: MEASURED
+    path: ./bathy.tif
+    provenance:
+      source_name: x
+      horizontal_crs_declared: EPSG:32632
+      vertical_datum_declared: LAT
+      survey_epoch: "2024-06"
+"""
+        ),
+        encoding="utf-8",
+    )
+    m, mdir = project_manifest.load_project_manifest(manifest_path)
+    result = project_registry.register_asset(
+        m.assets[0], manifest_dir=mdir, working_crs="EPSG:32631"
+    )
+    assert result.registration.conflicts
+    assert result.registration.readiness_status == result.registration.readiness_status_effective
+    assert result.registration.readiness_status != result.registration.readiness_status_intrinsic
+
+
+# --- MAR-026A Problem B: invalid project working CRS never crashes registration -----------------
+
+
+def test_register_asset_with_invalid_working_crs_does_not_throw(tmp_path: Path):
+    # This reproduces the exact MAR-026A defect: a valid, single-continuous route with a known
+    # source CRS used to reach `GeoDataFrame.to_crs("NOT_A_REAL_CRS")` completely unguarded.
+    route_path = tmp_path / "route.gpkg"
+    _write_route_gpkg(route_path, crs="EPSG:32631")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        _minimal_manifest_yaml(
+            """  - asset_id: r
+    category: PIPELINE_ROUTE
+    evidence_role: PROJECT_GEOMETRY
+    path: ./route.gpkg
+    layer: route
+    provenance:
+      source_name: x
+"""
+        ),
+        encoding="utf-8",
+    )
+    m, mdir = project_manifest.load_project_manifest(manifest_path)
+    result = project_registry.register_asset(
+        m.assets[0], manifest_dir=mdir, working_crs="NOT_A_REAL_CRS"
+    )
+    assert result.registration.registration_status == project_registry.REGISTERED
+    assert result.registration.readiness_status_effective == route_adapter.NOT_READY
+    assert result.canonical_route_gdf is None
+
+
+def test_register_asset_with_geographic_working_crs_does_not_build_canonical_route(
+    tmp_path: Path,
+):
+    route_path = tmp_path / "route.gpkg"
+    _write_route_gpkg(route_path, crs="EPSG:32631")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        _minimal_manifest_yaml(
+            """  - asset_id: r
+    category: PIPELINE_ROUTE
+    evidence_role: PROJECT_GEOMETRY
+    path: ./route.gpkg
+    layer: route
+    provenance:
+      source_name: x
+"""
+        ),
+        encoding="utf-8",
+    )
+    m, mdir = project_manifest.load_project_manifest(manifest_path)
+    result = project_registry.register_asset(
+        m.assets[0], manifest_dir=mdir, working_crs="EPSG:4326"
+    )
+    assert result.registration.registration_status == project_registry.REGISTERED
+    assert result.registration.readiness_status_effective == route_adapter.NOT_READY
+    assert result.canonical_route_gdf is None
+
+
+def test_bathymetry_only_project_with_invalid_working_crs_is_flagged_centrally(tmp_path: Path):
+    # Section 6: no route asset exists to trigger the per-asset working_crs checks -- the
+    # invalid working_crs must still be visible, checked centrally by `register_project`.
+    raster_path = tmp_path / "bathy.tif"
+    _write_bathymetry_tif(raster_path, crs="EPSG:32631")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        _minimal_manifest_yaml(
+            """  - asset_id: b
+    category: BATHYMETRY_RASTER
+    evidence_role: MEASURED
+    path: ./bathy.tif
+    provenance:
+      source_name: x
+""",
+            working_crs="NOT_A_REAL_CRS",
+        ),
+        encoding="utf-8",
+    )
+    m, mdir = project_manifest.load_project_manifest(manifest_path)
+    summary = project_registry.register_project(m, mdir)
+    assert summary.working_crs_findings, "an invalid project working_crs must be flagged centrally"
+    # the bathymetry asset itself does not depend on working_crs -- it still registers/assesses
+    reg = summary.asset_results[0].registration
+    assert reg.registration_status == project_registry.REGISTERED
+    assert reg.readiness_status_intrinsic in (
+        terrain_readiness.READY,
+        terrain_readiness.READY_WITH_LIMITATIONS,
+    )
+
+
+def test_bathymetry_only_project_with_geographic_working_crs_is_flagged_centrally(
+    tmp_path: Path,
+):
+    raster_path = tmp_path / "bathy.tif"
+    _write_bathymetry_tif(raster_path, crs="EPSG:32631")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        _minimal_manifest_yaml(
+            """  - asset_id: b
+    category: BATHYMETRY_RASTER
+    evidence_role: MEASURED
+    path: ./bathy.tif
+    provenance:
+      source_name: x
+""",
+            working_crs="EPSG:4326",
+        ),
+        encoding="utf-8",
+    )
+    m, mdir = project_manifest.load_project_manifest(manifest_path)
+    summary = project_registry.register_project(m, mdir)
+    assert summary.working_crs_findings, "a geographic (non-metric) working_crs must be flagged"
+
+
+def test_valid_working_crs_produces_no_project_level_findings(tmp_path: Path):
+    raster_path = tmp_path / "bathy.tif"
+    _write_bathymetry_tif(raster_path, crs="EPSG:32631")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        _minimal_manifest_yaml(
+            """  - asset_id: b
+    category: BATHYMETRY_RASTER
+    evidence_role: MEASURED
+    path: ./bathy.tif
+    provenance:
+      source_name: x
+"""
+        ),
+        encoding="utf-8",
+    )
+    m, mdir = project_manifest.load_project_manifest(manifest_path)
+    summary = project_registry.register_project(m, mdir)
+    assert summary.working_crs_findings == []
 
 
 def test_source_files_are_never_mutated_by_registration(tmp_path: Path):

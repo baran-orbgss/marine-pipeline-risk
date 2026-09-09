@@ -6,8 +6,11 @@ generic, local-file operator-project registration and readiness layer
 (`src/marine_engine.project`, CLI command `build-project-readiness`). It implements a
 meaningful first slice of Sections 2-4 below for local files only -- it is explicitly NOT a
 complete implementation of every stage described in this document, and several stages (5-9)
-remain concept-only. See the "Current implementation boundary" section for the precise
-line between what exists in code today and what is still future work.
+remain concept-only. MAR-026A (see the "MAR-026A update" note under Section 3) then repaired
+two project-integration integrity gaps in that layer -- exact declared-vs-observed CRS conflict
+detection, and invalid-working-CRS fail-safe orchestration -- without changing this scope. See
+the "Current implementation boundary" section for the precise line between what exists in code
+today and what is still future work.
 
 The PL854 work completed so far (MAR-002 through MAR-018) demonstrates every
 stage of this architecture end-to-end for exactly one fixed, public-data
@@ -74,6 +77,23 @@ Status vocabulary (`READY`/`READY_WITH_LIMITATIONS`/`NOT_READY`,
 readiness score, percentage, or confidence index exists anywhere in this
 layer, and there is no aggregate "project is ready for marine hazard
 analysis" claim (see `project.registry.PROJECT_HAZARD_READINESS_DISCLAIMER`).
+
+**MAR-026A update:** repaired two project-integration integrity gaps. First,
+`BATHYMETRY_RASTER` and `PIPELINE_ROUTE` declared-vs-observed CRS comparison
+is now exact (`pyproj.CRS` equality on the raster's true embedded CRS,
+preserved as a new `observed_crs` fact) rather than only geographic-vs-
+projected, so e.g. a declared `EPSG:32632` against an embedded `EPSG:32631`
+is now caught. Second, every registered asset now carries both a
+`readiness_status_intrinsic` (the delegated/unmodified module's own
+conclusion) and a `readiness_status_effective` (the same conclusion, but
+forced to `NOT_READY` if an unresolved declared-vs-observed conflict
+exists) -- the intrinsic result is never mutated to produce this, both are
+always visible side by side, and the backward-compatible `readiness_status`
+field now always means the effective value. A project's `working_crs` is
+also now validated centrally (valid, projected, metric) as part of
+registration, independent of whether any route asset is present, so an
+invalid working CRS can never silently pass unnoticed nor crash canonical
+route generation.
 
 ## 4. Canonical Project Model
 
@@ -173,10 +193,13 @@ convention; those remain future work.
 
 ---
 
-## Current implementation boundary (as of MAR-026)
+## Current implementation boundary (as of MAR-026A)
 
 MAR-026 (`src/marine_engine/project/`, CLI command `build-project-readiness`)
-implemented the first real slice of this architecture:
+implemented the first real slice of this architecture; MAR-026A repaired two
+project-integration integrity gaps in it (exact CRS-conflict detection and
+invalid-working-CRS fail-safe orchestration -- see the MAR-026A update note
+under Section 3 above).
 
 **Implemented:**
 - A typed, validated operator project manifest (`project.manifest.ProjectManifest`,
@@ -193,8 +216,13 @@ implemented the first real slice of this architecture:
   `project.bathymetry_adapter`), `BURIAL_PROFILE` (reuses
   `burial.readiness.assess_burial_profile_readiness`,
   `project.burial_adapter`).
-- Declared-vs-observed separation for every asset, with explicit conflict
-  recording (never a silent reprojection or silently-picked value).
+- Declared-vs-observed separation for every asset, with explicit,
+  `pyproj.CRS`-exact conflict recording (never a silent reprojection or
+  silently-picked value); a material conflict forces an asset's EFFECTIVE
+  readiness to `NOT_READY` while the delegated module's own INTRINSIC
+  conclusion stays visible and untouched (MAR-026A); the project's
+  `working_crs` is validated centrally (valid, projected, metric),
+  independent of whether a route asset is present.
 - A deterministic per-project output package (normalized manifest, asset
   registry parquet, structured readiness JSON, canonical route GeoPackage
   when applicable, HTML report) with no numeric readiness score and no

@@ -7,6 +7,12 @@ RasterFacts`; the caller passes those facts to the existing, unmodified
 vertical datum come from manifest provenance (Section 10: "survey epoch and vertical datum
 often come from provenance rather than GeoTIFF metadata") -- this module never claims they were
 embedded in the raster when they were, in fact, declared.
+
+MAR-026A: `RasterFacts` itself is never modified (it only exposes the coarser
+`crs_is_present`/`crs_is_geographic`/`crs_linear_units`) -- `inspect_bathymetry_raster` also
+returns the raster's exact embedded CRS as a separate observed fact, mirroring the existing
+`preprocessing.bathymetry` convention of `crs.to_string()`, so the project layer can perform an
+exact declared-vs-observed CRS comparison instead of only a geographic/projected-kind check.
 """
 
 from __future__ import annotations
@@ -31,11 +37,15 @@ def inspect_bathymetry_raster(
     *,
     declared_vertical_datum: str | None,
     declared_survey_epoch: str | None,
-) -> terrain_readiness.RasterFacts:
+) -> tuple[terrain_readiness.RasterFacts, str | None]:
     """Section 10 steps 1-2: inspect the operator raster and build the existing `RasterFacts`.
     Raises `RasterOpenError` if the file cannot be opened at all -- callers must treat that as a
     registration failure (see `project.registry`), since `assess_bathymetry_readiness` itself
-    always assumes a successfully-opened raster (its own `file_readable` check is unconditional)."""
+    always assumes a successfully-opened raster (its own `file_readable` check is unconditional).
+
+    Returns `(facts, observed_crs)`. `observed_crs` (MAR-026A) is the raster's exact embedded
+    CRS, e.g. `"EPSG:32631"`, or `None` if the raster carries no CRS at all -- that absence is
+    still handled by `assess_bathymetry_readiness`'s own `crs_present` check, unchanged here."""
 
     if not path.is_file():
         raise RasterOpenError(f"bathymetry raster not found: {path}")
@@ -61,7 +71,7 @@ def inspect_bathymetry_raster(
     )
     valid_values = band[valid_mask]
 
-    return terrain_readiness.RasterFacts(
+    facts = terrain_readiness.RasterFacts(
         band_count=band_count,
         dtype=str(dtype),
         color_interpretations=color_interp,
@@ -81,3 +91,5 @@ def inspect_bathymetry_raster(
         data_std=float(valid_values.std()) if valid_values.size else None,
         valid_cell_fraction=float(valid_mask.mean()) if valid_mask.size else None,
     )
+    observed_crs = crs.to_string() if crs is not None else None
+    return facts, observed_crs

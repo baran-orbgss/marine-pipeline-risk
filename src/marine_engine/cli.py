@@ -10395,11 +10395,15 @@ def _cmd_build_project_readiness(args: argparse.Namespace) -> int:
 
     print(f"Registering project {project_id!r} (Section 6)...")
     summary = project_registry.register_project(manifest, manifest_dir)
+    for finding in summary.working_crs_findings:
+        print(f"  PROJECT WORKING CRS ISSUE: {finding}")
     for r in summary.asset_results:
         reg = r.registration
         print(
             f"  {reg.asset_id}: category={reg.category} evidence_role={reg.evidence_role} "
-            f"registration={reg.registration_status} readiness={reg.readiness_status}"
+            f"registration={reg.registration_status} "
+            f"readiness(intrinsic={reg.readiness_status_intrinsic}, "
+            f"effective={reg.readiness_status_effective})"
         )
         for conflict in reg.conflicts:
             print(f"    CONFLICT: {conflict}")
@@ -10444,7 +10448,8 @@ def _cmd_build_project_readiness(args: argparse.Namespace) -> int:
             "category": r.registration.category,
             "evidence_role": r.registration.evidence_role,
             "registration_status": r.registration.registration_status,
-            "readiness_status": r.registration.readiness_status,
+            "readiness_status_intrinsic": r.registration.readiness_status_intrinsic,
+            "readiness_status_effective": r.registration.readiness_status_effective,
             "filename": r.registration.filename,
             "byte_size": r.registration.byte_size,
             "sha256": (r.registration.sha256[:16] + "...") if r.registration.sha256 else None,
@@ -10454,7 +10459,11 @@ def _cmd_build_project_readiness(args: argparse.Namespace) -> int:
     ]
 
     evidence_role_summary: dict[str, int] = {}
-    blocking_issues: list[str] = []
+    # MAR-026A: a project-level working_crs problem is a blocking integration issue even though
+    # it is not tied to any single asset (Section 6) -- surfaced first so it is never missed.
+    blocking_issues: list[str] = [
+        f"PROJECT WORKING CRS: {finding}" for finding in summary.working_crs_findings
+    ]
     limitations_list: list[str] = []
     unsupported_categories_list: list[str] = []
     for r in summary.asset_results:
@@ -10473,6 +10482,11 @@ def _cmd_build_project_readiness(args: argparse.Namespace) -> int:
                 f"{reg.asset_id}: {detail}"
                 for detail in reg.readiness_result.get("limitation_reasons", [])
             )
+        # MAR-026A Section 3: a declared-vs-observed conflict is itself a BLOCKING
+        # project-integration condition, even when the delegated/intrinsic readiness result
+        # (above) reported no blocking reason of its own -- it lives outside that result on
+        # purpose, since the intrinsic result is never mutated to reflect it.
+        blocking_issues.extend(f"{reg.asset_id}: {conflict}" for conflict in reg.conflicts)
         if reg.readiness_status == project_categories.REGISTERED_READINESS_NOT_IMPLEMENTED:
             unsupported_categories_list.append(f"{reg.asset_id} ({reg.category})")
 
