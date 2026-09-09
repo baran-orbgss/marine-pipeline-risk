@@ -88,8 +88,10 @@ from marine_engine.preprocessing.chainage import (
 )
 from marine_engine.project import categories as project_categories
 from marine_engine.project import manifest as project_manifest
+from marine_engine.project import model as project_model
 from marine_engine.project import registry as project_registry
 from marine_engine.project import report as project_report
+from marine_engine.project import route_reference as project_route_reference
 from marine_engine.providers import barrow_2016 as barrow_2016_provider
 from marine_engine.providers import bgs_offshore_surveys, nsta_freespan
 from marine_engine.providers.bathymetry import acquisition, bgs, emodnet, inventory, ukho
@@ -10375,6 +10377,246 @@ def _derive_project_readiness_validation_questions(
     }
 
 
+def _derive_project_model_validation_questions(
+    *,
+    route_reference_grid_built: bool,
+    linked_without_declared_relationship: bool,
+    burial_chainage_correlated_without_linear_reference: bool,
+    linkage_modified_evidence_role_or_intrinsic_readiness: bool,
+    raster_bounds_reported_as_valid_data_coverage: bool,
+    universal_project_score_present: bool,
+    accepted_readiness_semantics_preserved: bool,
+) -> dict[str, str]:
+    """MAR-027 Section 30: the required proof questions, derived from the actual run's facts --
+    never asserted as constants."""
+
+    return {
+        "question_a_does_mar027_create_a_deterministic_canonical_route_reference_grid": (
+            "YES" if route_reference_grid_built else "NO"
+        ),
+        "question_b_can_an_asset_become_route_linked_without_an_explicit_manifest_relationship": (
+            "YES" if linked_without_declared_relationship else "NO"
+        ),
+        "question_c_can_a_burial_numeric_kp_chainage_column_be_assumed_to_match_canonical_"
+        "project_chainage_without_explicit_linear_reference_semantics": (
+            "YES" if burial_chainage_correlated_without_linear_reference else "NO"
+        ),
+        "question_d_does_route_linkage_modify_evidence_role_or_intrinsic_readiness": (
+            "YES" if linkage_modified_evidence_role_or_intrinsic_readiness else "NO"
+        ),
+        "question_e_does_mar027_claim_raster_bound_intersection_is_valid_data_coverage": (
+            "YES" if raster_bounds_reported_as_valid_data_coverage else "NO"
+        ),
+        "question_f_does_mar027_create_a_universal_project_hazard_or_readiness_score": (
+            "YES" if universal_project_score_present else "NO"
+        ),
+        "question_g_are_mar020_mar024_mar026a_scientific_readiness_semantics_preserved": (
+            "YES" if accepted_readiness_semantics_preserved else "NO"
+        ),
+    }
+
+
+def _dict_keys_recursive(obj: Any) -> list[str]:
+    keys: list[str] = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            keys.append(str(key))
+            keys.extend(_dict_keys_recursive(value))
+    elif isinstance(obj, list):
+        for value in obj:
+            keys.extend(_dict_keys_recursive(value))
+    return keys
+
+
+def _cmd_build_project_model(args: argparse.Namespace) -> int:
+    """MAR-027: canonical project route-reference model and cross-asset linkage POC. Calls the
+    real, unmodified MAR-026/026A registration (`project_registry.register_project`), then
+    operationalizes the declared primary route, builds a deterministic canonical route-reference
+    grid when every prerequisite holds, and represents manifest-declared asset -> route
+    relationships as a separate LINKAGE axis. No hazard science, no fusion, no scores, fully
+    offline.
+    """
+
+    try:
+        manifest, manifest_dir = project_manifest.load_project_manifest(args.manifest)
+    except Exception as exc:
+        print(f"error: project manifest is invalid: {exc}", file=sys.stderr)
+        return 1
+
+    project_id = manifest.project.id
+    output_dir = Path("data/processed") / project_id / "project"
+
+    print(f"Registering project {project_id!r} via MAR-026/026A registration...")
+    summary = project_registry.register_project(manifest, manifest_dir)
+    for finding in summary.working_crs_findings:
+        print(f"  PROJECT WORKING CRS ISSUE: {finding}")
+
+    print("Building canonical project model (MAR-027)...")
+    model = project_model.build_canonical_project_model(manifest, summary)
+    rr = model.route_reference
+    print(f"  Primary route: {rr.primary_route.status} ({rr.primary_route.primary_route_asset_id})")
+    for finding in rr.primary_route.findings:
+        print(f"    FINDING: {finding}")
+    print(f"  Route reference: {rr.status}")
+    for finding in rr.findings:
+        print(f"    FINDING: {finding}")
+    for linkage in model.asset_linkages:
+        print(
+            f"  {linkage.asset_id}: category={linkage.category} "
+            f"evidence_role={linkage.evidence_role} "
+            f"registration={linkage.registration_status} "
+            f"readiness(intrinsic={linkage.readiness_status_intrinsic}, "
+            f"effective={linkage.readiness_status_effective}) "
+            f"declared_route={linkage.declared_route_asset_id} "
+            f"linkage={linkage.route_linkage_status}"
+        )
+        for finding in linkage.route_linkage_findings:
+            print(f"    LINKAGE FINDING: {finding}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model_dict = project_model.build_canonical_project_model_dict(model)
+    model_path = output_dir / "canonical_project_model.json"
+    model_path.write_text(json.dumps(model_dict, indent=2, default=str), encoding="utf-8")
+    print(f"  Canonical project model -> {model_path}")
+
+    linkage_df = project_model.build_asset_linkage_df(model)
+    linkage_path = metocean_evidence.write_parquet(
+        linkage_df, output_dir / "project_asset_linkage.parquet"
+    )
+    print(f"  Asset linkage ({len(linkage_df)} row(s)) -> {linkage_path}")
+
+    # Section 22: a GeoPackage exists ONLY when a grid was actually built -- a stale grid from an
+    # earlier run of this same command must never survive a run that could not build one.
+    grid_path = output_dir / "project_route_reference.gpkg"
+    if grid_path.exists():
+        grid_path.unlink()
+    if rr.grid_gdf is not None:
+        project_route_reference.write_route_reference_gpkg(rr.grid_gdf, grid_path)
+        print(
+            f"  Route-reference grid ({len(rr.grid_gdf)} station(s), layer "
+            f"{project_route_reference.ROUTE_REFERENCE_LAYER!r}) -> {grid_path}"
+        )
+    else:
+        print("  Route-reference grid: not built (see findings above); no GeoPackage written")
+
+    registrations = {r.registration.asset_id: r.registration for r in summary.asset_results}
+    linkage_altered_registration_facts = any(
+        linkage.evidence_role != registrations[linkage.asset_id].evidence_role
+        or linkage.readiness_status_intrinsic
+        != registrations[linkage.asset_id].readiness_status_intrinsic
+        for linkage in model.asset_linkages
+    )
+    effective_preserved = all(
+        linkage.readiness_status_effective
+        == registrations[linkage.asset_id].readiness_status_effective
+        and registrations[linkage.asset_id].readiness_status
+        == registrations[linkage.asset_id].readiness_status_effective
+        for linkage in model.asset_linkages
+    )
+    model_keys_lower = [key.lower() for key in _dict_keys_recursive(model_dict)]
+    validation = _derive_project_model_validation_questions(
+        route_reference_grid_built=(
+            rr.status == project_route_reference.ROUTE_REFERENCE_BUILT and rr.grid_gdf is not None
+        ),
+        linked_without_declared_relationship=any(
+            linkage.route_linkage_status != project_model.NOT_APPLICABLE
+            and linkage.declared_route_asset_id is None
+            for linkage in model.asset_linkages
+        ),
+        burial_chainage_correlated_without_linear_reference=any(
+            linkage.category == project_categories.BURIAL_PROFILE
+            and linkage.declared_linear_reference is None
+            and "chainage_range_overlap_fraction" in linkage.linkage_facts
+            for linkage in model.asset_linkages
+        ),
+        linkage_modified_evidence_role_or_intrinsic_readiness=linkage_altered_registration_facts,
+        raster_bounds_reported_as_valid_data_coverage=any(
+            linkage.category == project_categories.BATHYMETRY_RASTER
+            and any(
+                "coverage" in key.lower()
+                for key in linkage.linkage_facts
+                if key != "raster_extent_note"
+            )
+            for linkage in model.asset_linkages
+        ),
+        universal_project_score_present=any(
+            "score" in key or "project_ready" in key for key in model_keys_lower
+        ),
+        accepted_readiness_semantics_preserved=(
+            effective_preserved and not linkage_altered_registration_facts
+        ),
+    )
+    validation_path = output_dir / "project_model_validation.json"
+    validation_path.write_text(json.dumps(validation, indent=2, default=str), encoding="utf-8")
+    print(f"  Validation -> {validation_path}")
+
+    print()
+    print("=== Canonical Project Route-Reference Model & Cross-Asset Linkage (MAR-027) ===")
+    print()
+    print(f"Project: {manifest.project.id} ({manifest.project.name})")
+    print(f"Working CRS: {model.working_crs}  findings={model.working_crs_findings}")
+    print(f"Primary route: {rr.primary_route.status} ({rr.primary_route.primary_route_asset_id})")
+    print(f"Route reference: {rr.status}")
+    if rr.grid_gdf is not None:
+        print(f"  interval: {rr.configured_interval_m} m (indexing resolution)")
+        print(f"  chainage origin basis: {rr.chainage_origin_basis}")
+        print(f"  route length: {rr.route_length_m:,.3f} m")
+        print(
+            f"  stations: {rr.station_count} (regular {rr.regular_station_count}, terminal "
+            f"residual {rr.terminal_residual_m:.3f} m)"
+        )
+    print(f"Assets: {len(model.asset_linkages)}")
+    print(f"Evidence role counts: {model.evidence_role_counts()}")
+    print(f"Route linkage status counts: {model.route_linkage_status_counts()}")
+    print()
+    print(project_route_reference.ROUTE_REFERENCE_GRID_DISCLAIMER)
+    print()
+    print(project_model.ROUTE_LINKAGE_STATUS_DISCLAIMER)
+    print()
+    print(project_registry.PROJECT_HAZARD_READINESS_DISCLAIMER)
+    print()
+    print(
+        "DOES MAR-027 CREATE A DETERMINISTIC CANONICAL ROUTE-REFERENCE GRID? "
+        f"{validation['question_a_does_mar027_create_a_deterministic_canonical_route_reference_grid']}"
+    )
+    print(
+        "CAN AN ASSET BECOME ROUTE-LINKED WITHOUT AN EXPLICIT MANIFEST RELATIONSHIP? "
+        + validation[
+            "question_b_can_an_asset_become_route_linked_without_an_explicit_manifest_relationship"
+        ]
+    )
+    print(
+        "CAN A BURIAL PROFILE'S NUMERIC KP/CHAINAGE COLUMN BE ASSUMED TO MATCH CANONICAL PROJECT "
+        "CHAINAGE WITHOUT EXPLICIT LINEAR-REFERENCE SEMANTICS? "
+        + validation[
+            "question_c_can_a_burial_numeric_kp_chainage_column_be_assumed_to_match_canonical_"
+            "project_chainage_without_explicit_linear_reference_semantics"
+        ]
+    )
+    print(
+        "DOES ROUTE LINKAGE MODIFY EVIDENCE ROLE OR INTRINSIC READINESS? "
+        + validation["question_d_does_route_linkage_modify_evidence_role_or_intrinsic_readiness"]
+    )
+    print(
+        "DOES MAR-027 CLAIM RASTER-BOUND INTERSECTION IS VALID-DATA COVERAGE? "
+        + validation[
+            "question_e_does_mar027_claim_raster_bound_intersection_is_valid_data_coverage"
+        ]
+    )
+    print(
+        "DOES MAR-027 CREATE A UNIVERSAL PROJECT HAZARD/READINESS SCORE? "
+        + validation["question_f_does_mar027_create_a_universal_project_hazard_or_readiness_score"]
+    )
+    print(
+        "ARE MAR-020, MAR-024, MAR-026A SCIENTIFIC/READINESS SEMANTICS PRESERVED? "
+        + validation[
+            "question_g_are_mar020_mar024_mar026a_scientific_readiness_semantics_preserved"
+        ]
+    )
+    return 0
+
+
 def _cmd_build_project_readiness(args: argparse.Namespace) -> int:
     """MAR-026: generic local operator-project registration and asset-readiness layer. Sits
     above raw operator files and below the independent scientific geohazard engines -- performs
@@ -11063,6 +11305,25 @@ def build_parser() -> argparse.ArgumentParser:
         "manifest", type=Path, help="Path to an operator project manifest YAML file."
     )
     build_project_readiness_parser.set_defaults(func=_cmd_build_project_readiness)
+
+    build_project_model_parser = subparsers.add_parser(
+        "build-project-model",
+        help=(
+            "MAR-027: canonical project route-reference model and cross-asset linkage POC -- "
+            "runs the existing MAR-026/026A registration, operationalizes the manifest-declared "
+            "primary route (never guessed), builds a deterministic canonical route-reference "
+            "grid (a linear indexing framework, not pipeline supports) when every prerequisite "
+            "holds, and represents manifest-declared asset -> route relationships as a separate "
+            "linkage axis (never inferred from filenames, directories, or CRS). Emits "
+            "canonical_project_model.json, project_asset_linkage.parquet, and -- only when a "
+            "grid was built -- project_route_reference.gpkg. No hazard science, no fusion, no "
+            "scores, fully offline."
+        ),
+    )
+    build_project_model_parser.add_argument(
+        "manifest", type=Path, help="Path to an operator project manifest YAML file."
+    )
+    build_project_model_parser.set_defaults(func=_cmd_build_project_model)
 
     return parser
 

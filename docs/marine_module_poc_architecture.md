@@ -8,9 +8,13 @@ meaningful first slice of Sections 2-4 below for local files only -- it is expli
 complete implementation of every stage described in this document, and several stages (5-9)
 remain concept-only. MAR-026A (see the "MAR-026A update" note under Section 3) then repaired
 two project-integration integrity gaps in that layer -- exact declared-vs-observed CRS conflict
-detection, and invalid-working-CRS fail-safe orchestration -- without changing this scope. See
-the "Current implementation boundary" section for the precise line between what exists in code
-today and what is still future work.
+detection, and invalid-working-CRS fail-safe orchestration -- without changing this scope.
+MAR-027 (see the "MAR-027 update" notes under Sections 4 and 9, and the "Implementation boundary
+additions (as of MAR-027)" section at the end) then added the canonical route-reference grid,
+explicit primary-route operationalization, and explicit cross-asset route linkage on top of that
+layer (CLI command `build-project-model`) -- still no hazard fusion, scores, or new geohazard
+engines. See the implementation-boundary sections for the precise line between what exists in
+code today and what is still future work.
 
 The PL854 work completed so far (MAR-002 through MAR-018) demonstrates every
 stage of this architecture end-to-end for exactly one fixed, public-data
@@ -118,6 +122,49 @@ coverage relative to a linked route), a shared section/support-grid
 concept, and typed ingestion for any category beyond the three implemented
 so far.
 
+**MAR-027 update:** the "shared section/support-grid concept" above now
+exists -- deliberately renamed -- as the CANONICAL ROUTE-REFERENCE GRID
+(`marine_engine.project.route_reference`, CLI command `build-project-model`):
+a deterministic linear/spatial indexing framework along the canonical route
+for downstream data alignment, built from the accepted MAR-004 chainage
+primitives (`compute_chainage_stations`, `format_kp_label`; never
+re-implemented). Its points are an indexing framework only -- never "pipe
+supports" or support locations, and its interval is an indexing resolution,
+not a survey accuracy. Chainage 0 is the canonical route geometry start
+(`SOURCE_GEOMETRY_ORDER`); the exact route terminus is always included;
+`chainage_m` stays unrounded and `kp_label` is display-only. The grid is
+built ONLY when the manifest declares a `primary_route_asset_id` (never
+auto-selected even if exactly one route exists, never substituted when the
+declared route is unusable), that route is usable (registered, effectively
+`READY`/`READY_WITH_LIMITATIONS`, no declared-vs-observed CRS conflict, valid
+projected metric working CRS, canonical route produced), and an explicit
+positive `route_reference.interval_m` is configured (no default spacing is
+invented). Cross-asset relationships are represented ONLY as an explicit,
+manifest-declared `route_relationship` (`ROUTE_REFERENCED`) -- never
+inferred from a filename, shared directory, matching CRS, or category -- and
+carried on a separate route-LINKAGE axis (`marine_engine.project.model`:
+`LINKED` / `LINKED_WITH_LIMITATIONS` / `UNRESOLVED` / `NOT_APPLICABLE`) that
+never overloads intrinsic/effective readiness and is never a score. A burial
+profile's numeric chainage/KP column is correlated with canonical chainage
+ONLY under an explicit `linear_reference` declaration
+(`CANONICAL_ROUTE_FROM_GEOMETRY_START`, `m`); the result is a min/max
+`chainage_range_overlap_*`, explicitly not continuous coverage, and the
+accepted MAR-024 intrinsic `coverage_fraction` is left untouched. Raster
+facts are extent-only (`raster_extent_intersects_route`,
+`raster_extent_route_overlap_length_m`), explicitly not valid-cell coverage.
+Declared survey epochs are reported side by side; temporal compatibility is
+never asserted. The canonical project model is emitted as metadata
+(`canonical_project_model.json`, `project_asset_linkage.parquet`, and
+`project_route_reference.gpkg` only when a grid was actually built).
+Implemented after MAR-027: explicit primary-route operationalization;
+optional route-reference configuration; deterministic canonical
+route-reference grid; explicit asset -> route relationship; route-linkage
+status/facts; canonical project-model metadata output. Still future:
+generic valid-cell bathymetry route coverage; coordinate-based projection of
+burial records onto the route; automatic temporal correlation; broad
+asset-category ingestion; hazard fusion; route suitability; new geohazard
+engines.
+
 ## 5. Measured Data
 
 Direct physical observations, supplied by the operator or their surveyors.
@@ -177,6 +224,13 @@ first static demonstrator of this view for one fixed project.
 
 Aligned along-route engineering evidence, chainage/KP-referenced. The
 MAR-018/019 evidence strip is the first static demonstrator of this view.
+
+**MAR-027 update:** the generic project layer now provides the shared linear
+reference this view would align to -- the canonical route-reference grid
+(`station_index`, unrounded `chainage_m`, display-only `kp_label`,
+`fraction_along_route`, `is_terminal`, `chainage_origin_basis`, in the
+project working CRS; see Section 4) -- but no KP/route VIEW itself. The view
+remains future work.
 
 ## 10. Reporting / GIS Export
 
@@ -251,3 +305,63 @@ does **not** claim any registered project is ready for scour, free-span,
 liquefaction, shallow gas, or any other specific marine geohazard analysis
 -- only that its registered assets' structural registration and (for the
 three implemented categories) data readiness have been assessed.
+
+## Implementation boundary additions (as of MAR-027)
+
+MAR-027 (`src/marine_engine/project/route_reference.py`,
+`src/marine_engine/project/model.py`, manifest extensions in
+`src/marine_engine/project/manifest.py`, CLI command `build-project-model`)
+adds the canonical route-reference model and cross-asset linkage POC ABOVE
+the unchanged MAR-026/026A registration layer (which it calls, never
+re-implements). It is a bridge to future route-referenced geohazard engines,
+not a new geohazard model.
+
+**Implemented after MAR-027:**
+- Explicit primary-route operationalization: `primary_route_asset_id` is
+  the only source of primary-route identity -- never auto-selected (even if
+  exactly one route exists), never substituted when the declared route is
+  unusable; an unusable primary route produces a controlled
+  `PRIMARY_ROUTE_UNUSABLE` finding, never a crash or a fallback.
+- Optional `route_reference.interval_m` configuration (finite, strictly
+  positive, metres; no default spacing invented when absent).
+- Deterministic canonical route-reference grid
+  (`project_route_reference.gpkg`, layer `route_reference_points`, project
+  working CRS): chainage 0 at the canonical route geometry start
+  (`SOURCE_GEOMETRY_ORDER`), regular stations plus the exact terminus,
+  strictly increasing, no duplicates, unrounded `chainage_m`, display-only
+  `kp_label` -- built only from the accepted MAR-004 chainage primitives.
+  Grid points are an indexing framework, never pipeline supports.
+- Explicit asset -> route relationship (`route_relationship`, controlled
+  vocabulary `ROUTE_REFERENCED`; referenced asset must exist and be a
+  `PIPELINE_ROUTE`; self-reference rejected) with an optional explicit
+  `linear_reference` declaration (`CANONICAL_ROUTE_FROM_GEOMETRY_START`,
+  units `m` only).
+- Route-linkage status/facts on a separate axis (`LINKED` /
+  `LINKED_WITH_LIMITATIONS` / `UNRESOLVED` / `NOT_APPLICABLE`): burial
+  numeric-chainage range correlation only under an explicit linear-reference
+  declaration (out-of-route and duplicate values reported, never clipped or
+  collapsed; range overlap explicitly not continuous coverage); raster
+  extent-vs-route facts explicitly not valid-cell coverage; declared epochs
+  side by side with no temporal-compatibility claim. Linkage never modifies
+  evidence role, intrinsic readiness, or MAR-026A effective readiness.
+- Canonical project-model metadata output (`canonical_project_model.json`,
+  `project_asset_linkage.parquet` with one row per manifest asset) exposing
+  component findings (primary route, route reference, working CRS, per-asset
+  linkage) -- no aggregate project status, no numeric score.
+- Real demonstration: the accepted MAR-002 canonical PL854 route registered
+  as primary route with a 25 m grid (cross-checked against the accepted
+  MAR-004 chainage build) and the accepted MAR-006 EMODnet baseline raster
+  declared `ROUTE_REFERENCED` to it; Sheringham Shoal 2020 and Barrow 2016
+  honestly report no primary route / no grid rather than a failed project.
+
+**Still future (explicitly NOT implemented by MAR-027):**
+- Generic valid-cell (nodata-aware) bathymetry coverage along the route.
+- Coordinate-based projection of burial records onto the route
+  (`project_point_to_route`) and any acceptable-distance threshold.
+- Automatic temporal correlation or any `TEMPORALLY_COMPATIBLE` rule.
+- Broad asset-category ingestion beyond `PIPELINE_ROUTE` /
+  `BATHYMETRY_RASTER` / `BURIAL_PROFILE`.
+- Hazard fusion, route suitability, project/route/hazard scores, automatic
+  hazard weighting.
+- New geohazard engines, and the map view / KP-route view / multi-project GIS
+  export convention of Sections 8-10.

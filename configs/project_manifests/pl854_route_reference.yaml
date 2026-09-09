@@ -1,0 +1,67 @@
+# MAR-027 real route-reference demonstration: the accepted MAR-002 canonical PL854 pipeline
+# route and the accepted MAR-006 canonical EMODnet baseline raster -- both genuinely PL854
+# artefacts -- registered through the generic project layer, with PL854's route declared as the
+# project's primary route and a 25 m canonical route-reference grid configured (the same indexing
+# interval as the accepted MAR-004 chainage build, so the two can be cross-checked). Paths are
+# relative to THIS file's own directory. Nothing from Barrow or Sheringham Shoal is combined in.
+#
+# Provenance is declared only where the accepted artefacts' own metadata supports it:
+# - the route's `survey_epoch` is DELIBERATELY unset: the NSTA registry geometry has a retrieval
+#   timestamp (2026-09-03), which is not a survey/digitization epoch -- declaring it would
+#   misrepresent that fact, so the route honestly registers READY_WITH_LIMITATIONS;
+# - the raster's `survey_epoch` is DELIBERATELY unset: EMODnet DTM 2024 is a compilation product,
+#   not a single survey epoch. Its declared CRS, vertical datum, units and sign convention come
+#   from the MAR-006 sidecar (emodnet_baseline_lat_100m.json) that produced it.
+
+project:
+  id: pl854
+  name: "PL854 Anglia A -> LOGGS canonical route-reference model (MAR-027 demo)"
+  description: >
+    Operationalizes the real, already-accepted MAR-002 canonical PL854 pipeline route as the
+    project's primary route and builds the canonical route-reference grid on it, with the
+    accepted MAR-006 EMODnet baseline raster declared ROUTE_REFERENCED to that route.
+  working_crs: "EPSG:32631"
+
+primary_route_asset_id: pl854_route
+
+route_reference:
+  interval_m: 25.0
+
+assets:
+  - asset_id: pl854_route
+    category: PIPELINE_ROUTE
+    evidence_role: PROJECT_GEOMETRY
+    path: ../../data/processed/pl854/pipeline.gpkg
+    layer: pipeline
+    provenance:
+      source_name: >-
+        PL854 (LOGGS PP TO ANGLIA YD GAS LINE) route geometry from the NSTA UKCS offshore
+        infrastructure pipeline linear dataset, ingested and reprojected to EPSG:32631 by the
+        accepted MAR-002 canonical pipeline build
+      supplier: "North Sea Transition Authority (NSTA) open data, via marine-engine MAR-002"
+      horizontal_crs_declared: "EPSG:32631"
+      licence_note: >-
+        NSTA open data -- see the NSTA Open Data licence terms. Route direction semantics are
+        SOURCE_GEOMETRY_ORDER only; no installation direction is inferred from the pipe name.
+
+  - asset_id: pl854_emodnet_baseline_100m
+    category: BATHYMETRY_RASTER
+    evidence_role: DERIVED
+    path: ../../data/processed/pl854/bathymetry/emodnet_baseline_lat_100m.tif
+    route_relationship:
+      route_asset_id: pl854_route
+      relationship_type: ROUTE_REFERENCED
+    provenance:
+      source_name: >-
+        EMODnet Digital Bathymetry (DTM 2024) canonical PL854 baseline: 100 m analysis grid
+        resampled (bilinear) from the ~115 m-class regional source by the accepted MAR-006 build
+        (positive-down depth below LAT)
+      supplier: "EMODnet Bathymetry, processed by marine-engine MAR-006"
+      horizontal_crs_declared: "EPSG:32631"
+      vertical_datum_declared: "LAT"
+      units_declared: "m"
+      sign_convention_declared: "positive_down_depth_lat_m"
+      licence_note: >-
+        EMODnet Bathymetry -- see the EMODnet data licence terms. Regional ~115 m-class
+        bathymetry: NOT sufficient by itself for pipeline-scale local scour, metre-scale
+        sand-wave geometry, or free-span detection (MAR-006 stated limitation).

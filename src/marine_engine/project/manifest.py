@@ -16,7 +16,14 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from marine_engine.project.categories import ASSET_CATEGORIES, EVIDENCE_ROLES
+from marine_engine.project.categories import (
+    ASSET_CATEGORIES,
+    EVIDENCE_ROLES,
+    LINEAR_REFERENCE_BASES,
+    LINEAR_REFERENCE_UNITS,
+    PIPELINE_ROUTE,
+    ROUTE_RELATIONSHIP_TYPES,
+)
 
 
 class ProjectIdentity(BaseModel):
@@ -64,6 +71,66 @@ class BurialColumnMapping(BaseModel):
     uncertainty_column: str | None = None
 
 
+class RouteReferenceConfig(BaseModel):
+    """MAR-027 Section 7: optional project-level canonical route-reference grid configuration.
+    `interval_m` is an INDEXING resolution along the canonical route (metres), never a survey
+    accuracy or engineering resolution -- and there is no hidden default: when this section is
+    absent, no grid interval is invented."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    interval_m: float = Field(gt=0, allow_inf_nan=False)
+
+
+class LinearReferenceDeclaration(BaseModel):
+    """MAR-027 Section 16: an explicit, manifest-declared statement of what an asset's numeric
+    chainage/KP values MEAN. The only supported `basis` means exactly: distances along the
+    referenced canonical project route measured from that route's geometry-start origin. Never
+    inferred from a column name or from `units_declared` (which describes the measured burial
+    value, not the chainage column)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    basis: str
+    units: str
+
+    @model_validator(mode="after")
+    def _validate_vocabulary(self) -> LinearReferenceDeclaration:
+        if self.basis not in LINEAR_REFERENCE_BASES:
+            raise ValueError(
+                f"unknown linear_reference basis {self.basis!r} -- must be one of "
+                f"{sorted(LINEAR_REFERENCE_BASES)}"
+            )
+        if self.units not in LINEAR_REFERENCE_UNITS:
+            raise ValueError(
+                f"unsupported linear_reference units {self.units!r} -- must be one of "
+                f"{sorted(LINEAR_REFERENCE_UNITS)}"
+            )
+        return self
+
+
+class RouteRelationship(BaseModel):
+    """MAR-027 Section 8: an explicit, manifest-declared asset -> route relationship. Declaring
+    it states only that the asset is referenced to that route; it never proves the asset covers
+    the whole route, is representative everywhere along it, or is temporally compatible with
+    any other asset (Section 5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    route_asset_id: str
+    relationship_type: str
+    linear_reference: LinearReferenceDeclaration | None = None
+
+    @model_validator(mode="after")
+    def _validate_vocabulary(self) -> RouteRelationship:
+        if self.relationship_type not in ROUTE_RELATIONSHIP_TYPES:
+            raise ValueError(
+                f"unknown relationship_type {self.relationship_type!r} -- must be one of "
+                f"{sorted(ROUTE_RELATIONSHIP_TYPES)}"
+            )
+        return self
+
+
 class AssetEntry(BaseModel):
     """One registered operator asset (Section 6)."""
 
@@ -75,6 +142,7 @@ class AssetEntry(BaseModel):
     path: Path
     layer: str | None = None
     burial_columns: BurialColumnMapping | None = None
+    route_relationship: RouteRelationship | None = None
     provenance: DeclaredProvenance
 
     @model_validator(mode="after")
@@ -89,6 +157,14 @@ class AssetEntry(BaseModel):
                 f"asset {self.asset_id!r}: unknown evidence_role {self.evidence_role!r} -- must "
                 f"be one of {sorted(EVIDENCE_ROLES)}"
             )
+        if (
+            self.route_relationship is not None
+            and self.route_relationship.route_asset_id == self.asset_id
+        ):
+            raise ValueError(
+                f"asset {self.asset_id!r}: route_relationship.route_asset_id may not reference "
+                "the asset itself"
+            )
         return self
 
 
@@ -99,6 +175,7 @@ class ProjectManifest(BaseModel):
 
     project: ProjectIdentity
     primary_route_asset_id: str | None = None
+    route_reference: RouteReferenceConfig | None = None
     assets: list[AssetEntry] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -115,6 +192,25 @@ class ProjectManifest(BaseModel):
                 f"primary_route_asset_id {self.primary_route_asset_id!r} does not match any "
                 "registered asset_id"
             )
+        # MAR-027 Section 8: structurally impossible route relationships are caught here --
+        # the referenced route must exist and must actually be a PIPELINE_ROUTE asset.
+        by_id = {a.asset_id: a for a in self.assets}
+        for asset in self.assets:
+            rel = asset.route_relationship
+            if rel is None:
+                continue
+            target = by_id.get(rel.route_asset_id)
+            if target is None:
+                raise ValueError(
+                    f"asset {asset.asset_id!r}: route_relationship.route_asset_id "
+                    f"{rel.route_asset_id!r} does not match any registered asset_id"
+                )
+            if target.category != PIPELINE_ROUTE:
+                raise ValueError(
+                    f"asset {asset.asset_id!r}: route_relationship.route_asset_id "
+                    f"{rel.route_asset_id!r} has category {target.category!r}, not "
+                    f"{PIPELINE_ROUTE!r}"
+                )
         return self
 
 
