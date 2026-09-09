@@ -10621,7 +10621,9 @@ def _cmd_build_project_model(args: argparse.Namespace) -> int:
 def _cmd_build_route_seabed_change_evidence(args: argparse.Namespace) -> int:
     """MAR-029: route-referenced observed seabed elevation-change evidence POC. Loads an EXPLICIT
     route <-> DoD linkage manifest, runs the real MAR-026/026A registration and the real MAR-027
-    canonical project model (unchanged), consumes the accepted MAR-021/021A DoD raster read-only,
+    canonical project model (unchanged), consumes a DoD source satisfying the explicit
+    canonical-definition contract read-only (MAR-029A: definition and source role must be
+    declared),
     and samples the DoD cell containing each canonical route-reference point. Raw observed sign
     labels only; no significance threshold, no causal attribution, no prediction, no score.
     """
@@ -10668,6 +10670,10 @@ def _cmd_build_route_seabed_change_evidence(args: argparse.Namespace) -> int:
     for finding in final.findings:
         print(f"  FINDING: {finding}")
     print(f"Sample support: {change_route_evidence.SAMPLE_SUPPORT_SEMANTICS}")
+    print(
+        f"DoD definition evidence basis: {final.definition_evidence_basis or 'n/a'}; "
+        f"source role evidence basis: {final.source_role_evidence_basis or 'n/a'}"
+    )
     print("Sample counts (route-reference SAMPLES, not route-length coverage):")
     for key, value in counts.items():
         if key != "note":
@@ -10703,6 +10709,7 @@ def _cmd_build_route_seabed_change_evidence(args: argparse.Namespace) -> int:
         "question_h_was_the_dod_source_modified_during_the_run": (
             "WAS THE DoD SOURCE MODIFIED DURING THE RUN?"
         ),
+        "question_i_dod_definition_evidence_basis": "DoD DEFINITION EVIDENCE BASIS:",
     }
     for key, label in labels.items():
         print(f"{label} {validation[key]}")
@@ -11423,7 +11430,9 @@ def build_parser() -> argparse.ArgumentParser:
             "MAR-029: route-referenced observed seabed elevation-change evidence POC -- takes an "
             "EXPLICIT route <-> DoD linkage manifest (never inferred from overlap, CRS, directory, "
             "or filename), runs the existing MAR-026/026A registration and MAR-027 canonical "
-            "project model unchanged, consumes the accepted MAR-021/021A DoD raster read-only, "
+            "project model unchanged, consumes a DoD source satisfying the explicit "
+            "canonical-definition contract read-only (the DoD definition and source scientific "
+            "role must be declared; an embedded tag that disagrees blocks), "
             "and records the DoD value of the raster cell containing each canonical "
             "route-reference point (no interpolation, no smoothing, nodata never becomes zero). "
             "Raw OBSERVED_SEABED_RAISING/LOWERING sign labels only: no generic significance "

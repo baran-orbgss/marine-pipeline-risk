@@ -53,6 +53,9 @@ NODATA_STATION = 3
 ZERO_STATION = 2
 EXPECTED_RAISING = [0, 4, 6, 8, 10]
 EXPECTED_LOWERING = [1, 5, 7, 9, 11]
+# MAR-029A: the only interpretable definition, taken from the accepted MAR-021 module itself.
+CANONICAL_DEFINITION = dod.DoDResult.__dataclass_fields__["definition"].default
+REVERSED_DEFINITION = "delta_bed_elevation_m = bed_elevation_epoch1_m - bed_elevation_epoch2_m"
 
 
 def _f32(value: float) -> float:
@@ -152,6 +155,7 @@ def _route_change_yaml(
     provenance_path: str | None = "./prov.json",
     declared_crs: str | None = WORKING_CRS,
     declared_role: str | None = "MULTI_EPOCH_SEABED_CHANGE_POC",
+    declared_definition: str | None = CANONICAL_DEFINITION,
 ) -> str:
     text = f"""project_manifest: {project_manifest_path}
 route_asset_id: {route_asset_id}
@@ -167,6 +171,8 @@ dod:
         text += f"  horizontal_crs_declared: {declared_crs}\n"
     if declared_role is not None:
         text += f"  source_scientific_role_declared: {declared_role}\n"
+    if declared_definition is not None:
+        text += f'  dod_definition_declared: "{declared_definition}"\n'
     return text
 
 
@@ -240,7 +246,16 @@ def test_01_explicit_route_change_relationship_required():
     with pytest.raises(pydantic.ValidationError):
         rem.RouteChangeEvidenceManifest.model_validate(
             {"project_manifest": "p.yaml", "route_asset_id": "route_a", "dod": {"path": "d.tif"}}
-        )  # no source change study identity
+        )  # no source change study identity, no definition, no role
+    complete = {
+        "path": "d.tif",
+        "source_change_study_id": "s",
+        "dod_definition_declared": CANONICAL_DEFINITION,
+        "source_scientific_role_declared": "MULTI_EPOCH_SEABED_CHANGE_POC",
+    }
+    assert rem.DoDSourceDeclaration.model_validate(complete).dod_definition_declared == (
+        CANONICAL_DEFINITION
+    )
     with pytest.raises(pydantic.ValidationError):
         rem.RouteChangeEvidenceManifest.model_validate(
             {
@@ -932,8 +947,9 @@ def test_provenance_artifact_identified_by_content(tmp_path: Path):
     final, _ = _run_and_write(tmp_path, _fixture(tmp_path))
     metadata = route_evidence.build_route_change_evidence_metadata(final)
     prov = metadata["source_provenance_artifact"]
-    assert prov["sha256"] == _sha(tmp_path / "prov.json")
-    assert prov["byte_size"] == (tmp_path / "prov.json").stat().st_size
+    assert prov["status"] == route_evidence.PROVENANCE_ARTIFACT_IDENTITY_CAPTURED
+    assert prov["identity"]["sha256"] == _sha(tmp_path / "prov.json")
+    assert prov["identity"]["byte_size"] == (tmp_path / "prov.json").stat().st_size
     assert final.route_manifest.dod.provenance_path is not None
     # Optional: without a declared provenance artefact nothing is invented.
     result2, _ = _run(_fixture(tmp_path, route_change_kwargs={"provenance_path": None}))
@@ -944,9 +960,12 @@ def test_not_available_source_role_mismatch_and_missing_crs_and_rotation(tmp_pat
     path = _fixture(tmp_path, dod_kwargs={"tags": {"scientific_role": "SOMETHING_ELSE"}})
     result, _ = _run(path)
     assert result.reason_code == route_evidence.DOD_SOURCE_ROLE_MISMATCH
-    # Untagged rasters are not a mismatch (nothing observed to compare against).
+    # Untagged rasters are not a mismatch (nothing observed to compare against) -- but MAR-029A
+    # records that both facts rest on the manifest declaration only.
     result_untagged, _ = _run(_fixture(tmp_path, dod_kwargs={"tags": {}}))
     assert result_untagged.available
+    assert result_untagged.definition_evidence_basis == route_evidence.MANIFEST_DECLARED_ONLY
+    assert result_untagged.source_role_evidence_basis == route_evidence.MANIFEST_DECLARED_ONLY
     result_nocrs, _ = _run(
         _fixture(tmp_path, dod_kwargs={"crs": None}, route_change_kwargs={"declared_crs": None})
     )
@@ -1014,7 +1033,12 @@ def test_output_scientific_role_and_metadata_facts(tmp_path: Path):
     metadata = route_evidence.build_route_change_evidence_metadata(final)
     assert metadata["scientific_role"] == "ROUTE_REFERENCED_OBSERVED_SEABED_ELEVATION_CHANGE"
     assert metadata["status"] == route_evidence.ROUTE_CHANGE_EVIDENCE_AVAILABLE
-    assert metadata["dod_definition"]["definition"] == route_evidence.ACCEPTED_DOD_DEFINITION
+    assert metadata["dod_definition"]["effective"] == route_evidence.ACCEPTED_DOD_DEFINITION
+    assert metadata["dod_definition"]["declared"] == CANONICAL_DEFINITION
+    assert metadata["dod_definition"]["observed_embedded"] == CANONICAL_DEFINITION
+    assert metadata["dod_definition"]["evidence_basis"] == (
+        route_evidence.MANIFEST_AND_EMBEDDED_TAG_AGREE
+    )
     assert metadata["dod_definition"]["zero_label"] is None
     obs = metadata["dod_observed_facts"]
     assert (obs["width"], obs["height"], obs["band_count"], obs["dtype"]) == (12, 10, 1, "float32")
@@ -1106,8 +1130,10 @@ def test_cli_writes_outputs_under_project_change_route_dir(tmp_path: Path, monke
         "question_f_is_the_dod_raster_interpolated_or_smoothed_during_route_sampling": "NO",
         "question_g_is_route_referenced_observed_change_available_for_this_run": "YES",
         "question_h_was_the_dod_source_modified_during_the_run": "NO",
+        "question_i_dod_definition_evidence_basis": route_evidence.MANIFEST_AND_EMBEDDED_TAG_AGREE,
     }
     stdout = capsys.readouterr().out
+    assert "DoD DEFINITION EVIDENCE BASIS: MANIFEST_AND_EMBEDDED_TAG_AGREE" in stdout
     assert "ROUTE_CHANGE_EVIDENCE_AVAILABLE" in stdout
     assert "route_reference_sample_count: 15" in stdout
     assert "DOES NODATA BECOME ZERO CHANGE? NO" in stdout
@@ -1141,3 +1167,260 @@ def test_project_model_command_output_unchanged_by_mar029(tmp_path: Path, monkey
     assert model["route_reference"]["station_count"] == 15
     text = json.dumps(model)
     assert "delta_bed_elevation" not in text and "ROUTE_REFERENCED_OBSERVED" not in text
+
+
+# --- MAR-029A Section 15: DoD semantic provenance integrity --------------------------------------
+
+
+def _semantic_fixture(tmp_path: Path, *, tags: dict[str, str] | None, **route_change_kwargs):
+    return _fixture(
+        tmp_path,
+        dod_kwargs={"tags": tags} if tags is not None else None,
+        route_change_kwargs={"provenance_path": None, **route_change_kwargs},
+    )
+
+
+def test_029a_01_missing_dod_definition_declared_fails_validation(tmp_path: Path):
+    path = _fixture(tmp_path, route_change_kwargs={"declared_definition": None})
+    with pytest.raises(pydantic.ValidationError):
+        rem.load_route_change_evidence_manifest(path)
+    with pytest.raises(pydantic.ValidationError):
+        rem.DoDSourceDeclaration.model_validate(
+            {
+                "path": "d.tif",
+                "source_change_study_id": "s",
+                "dod_definition_declared": "   ",
+                "source_scientific_role_declared": "X",
+            }
+        )  # blank is not a declaration
+
+
+def test_029a_02_missing_source_scientific_role_declared_fails_validation(tmp_path: Path):
+    path = _fixture(tmp_path, route_change_kwargs={"declared_role": None})
+    with pytest.raises(pydantic.ValidationError):
+        rem.load_route_change_evidence_manifest(path)
+    with pytest.raises(pydantic.ValidationError):
+        rem.DoDSourceDeclaration.model_validate(
+            {
+                "path": "d.tif",
+                "source_change_study_id": "s",
+                "dod_definition_declared": CANONICAL_DEFINITION,
+                "source_scientific_role_declared": "",
+            }
+        )
+
+
+def test_029a_03_canonical_declared_definition_accepted(tmp_path: Path):
+    result, _ = _run(_semantic_fixture(tmp_path, tags=None))
+    assert result.available
+    assert result.effective_dod_definition == route_evidence.ACCEPTED_DOD_DEFINITION
+    # Whitespace-only differences in the declaration are still the same definition.
+    spaced = "delta_bed_elevation_m  =  bed_elevation_epoch2_m  -  bed_elevation_epoch1_m"
+    result2, _ = _run(_semantic_fixture(tmp_path, tags=None, declared_definition=spaced))
+    assert result2.available and result2.definition_evidence_basis == (
+        route_evidence.MANIFEST_AND_EMBEDDED_TAG_AGREE
+    )
+
+
+def test_029a_04_reversed_definition_is_controlled_not_available(tmp_path: Path):
+    final, _ = _run_and_write(
+        tmp_path, _semantic_fixture(tmp_path, tags={}, declared_definition=REVERSED_DEFINITION)
+    )
+    assert final.status == route_evidence.ROUTE_CHANGE_EVIDENCE_NOT_AVAILABLE
+    assert final.reason_code == route_evidence.DOD_DECLARED_DEFINITION_UNSUPPORTED
+    assert final.samples is None and not final.products_written
+    assert final.effective_dod_definition is None
+    metadata = route_evidence.build_route_change_evidence_metadata(final)
+    assert metadata["dod_definition"]["declared"] == REVERSED_DEFINITION
+    assert metadata["dod_definition"]["effective"] is None
+    assert metadata["dod_definition"]["evidence_basis"] is None
+    assert "not flipped" in final.findings[-1]
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        "delta_bed_elevation_m = bed_elevation_epoch2_m + bed_elevation_epoch1_m",
+        "depth_epoch2_m - depth_epoch1_m",
+        "difference of the two surveys",
+        "bed_elevation_epoch2_m - bed_elevation_epoch1_m",  # missing the named result variable
+    ],
+)
+def test_029a_05_arbitrary_unsupported_definition_is_controlled_not_available(
+    tmp_path: Path, declared: str
+):
+    result, _ = _run(_semantic_fixture(tmp_path, tags={}, declared_definition=declared))
+    assert result.reason_code == route_evidence.DOD_DECLARED_DEFINITION_UNSUPPORTED
+    assert result.samples is None
+
+
+def test_029a_06_embedded_and_declared_canonical_definition_agree(tmp_path: Path):
+    result, _ = _run(_semantic_fixture(tmp_path, tags=None))  # default tags carry the definition
+    assert result.available
+    assert result.definition_evidence_basis == route_evidence.MANIFEST_AND_EMBEDDED_TAG_AGREE
+    assert not any("declaration only" in f for f in result.findings)
+
+
+def test_029a_07_embedded_definition_mismatch_blocks(tmp_path: Path):
+    tags = {"scientific_role": "MULTI_EPOCH_SEABED_CHANGE_POC", "definition": REVERSED_DEFINITION}
+    final, _ = _run_and_write(tmp_path, _semantic_fixture(tmp_path, tags=tags))
+    assert final.reason_code == route_evidence.DOD_DEFINITION_MISMATCH
+    assert final.samples is None and not final.products_written
+    assert not (tmp_path / "out" / "route_observed_seabed_change.gpkg").exists()
+    metadata = route_evidence.build_route_change_evidence_metadata(final)
+    assert metadata["dod_definition"]["declared"] == CANONICAL_DEFINITION
+    assert metadata["dod_definition"]["observed_embedded"] == REVERSED_DEFINITION
+    assert metadata["dod_definition"]["effective"] is None
+    assert "does not choose a side" in final.findings[-1]
+
+
+def test_029a_08_absent_embedded_definition_with_declaration_is_declared_only(tmp_path: Path):
+    tags = {"scientific_role": "MULTI_EPOCH_SEABED_CHANGE_POC"}  # no definition tag
+    final, _ = _run_and_write(tmp_path, _semantic_fixture(tmp_path, tags=tags))
+    assert final.available
+    assert final.definition_evidence_basis == route_evidence.MANIFEST_DECLARED_ONLY
+    assert final.source_role_evidence_basis == route_evidence.MANIFEST_AND_EMBEDDED_TAG_AGREE
+    metadata = route_evidence.build_route_change_evidence_metadata(final)
+    assert metadata["dod_definition"]["observed_embedded"] is None
+    assert metadata["dod_definition"]["evidence_basis"] == route_evidence.MANIFEST_DECLARED_ONLY
+    assert route_evidence.DEFINITION_DECLARED_ONLY_LIMITATION in metadata["explicit_limitations"]
+    assert route_evidence.DEFINITION_DECLARED_ONLY_LIMITATION in final.findings
+    validation = route_evidence.build_route_change_evidence_validation(final)
+    assert validation["question_i_dod_definition_evidence_basis"] == (
+        route_evidence.MANIFEST_DECLARED_ONLY
+    )
+    html = (tmp_path / "out" / "route_observed_seabed_change_report.html").read_text("utf-8")
+    assert "DoD definition (observed embedded tag): absent" in html
+    assert "MANIFEST_DECLARED_ONLY" in html
+
+
+def test_029a_09_observed_role_matches_declaration(tmp_path: Path):
+    result, _ = _run(_semantic_fixture(tmp_path, tags=None))
+    assert result.source_role_evidence_basis == route_evidence.MANIFEST_AND_EMBEDDED_TAG_AGREE
+
+
+def test_029a_10_observed_role_differs_blocks(tmp_path: Path):
+    tags = {"scientific_role": "SOMETHING_ELSE", "definition": CANONICAL_DEFINITION}
+    result, _ = _run(_semantic_fixture(tmp_path, tags=tags))
+    assert result.reason_code == route_evidence.DOD_SOURCE_ROLE_MISMATCH
+    assert result.samples is None
+
+
+def test_029a_11_observed_role_absent_with_declaration_is_declared_only(tmp_path: Path):
+    tags = {"definition": CANONICAL_DEFINITION}  # no scientific_role tag
+    final, _ = _run_and_write(tmp_path, _semantic_fixture(tmp_path, tags=tags))
+    assert final.available
+    assert final.source_role_evidence_basis == route_evidence.MANIFEST_DECLARED_ONLY
+    assert final.definition_evidence_basis == route_evidence.MANIFEST_AND_EMBEDDED_TAG_AGREE
+    metadata = route_evidence.build_route_change_evidence_metadata(final)
+    assert metadata["source_scientific_role"]["observed_embedded"] is None
+    assert metadata["source_scientific_role"]["declared"] == "MULTI_EPOCH_SEABED_CHANGE_POC"
+    assert route_evidence.ROLE_DECLARED_ONLY_LIMITATION in metadata["explicit_limitations"]
+
+
+def test_029a_12_untagged_float_raster_without_explicit_definition_cannot_become_evidence(
+    tmp_path: Path,
+):
+    # The pre-repair defect: an arbitrary untagged float raster with no declared definition. It is
+    # now rejected at manifest validation -- it never reaches sampling.
+    path = _semantic_fixture(tmp_path, tags={}, declared_definition=None)
+    with pytest.raises(pydantic.ValidationError):
+        _run(path)
+    assert cli.main(["build-route-seabed-change-evidence", str(path)]) == 1
+    # And with a NON-canonical declaration it is a controlled not-available, never AVAILABLE.
+    result, _ = _run(_semantic_fixture(tmp_path, tags={}, declared_definition="my_diff"))
+    assert result.status == route_evidence.ROUTE_CHANGE_EVIDENCE_NOT_AVAILABLE
+    assert result.effective_dod_definition is None
+
+
+def test_029a_13_metadata_separates_declared_observed_effective_definition(tmp_path: Path):
+    final, _ = _run_and_write(tmp_path, _semantic_fixture(tmp_path, tags=None))
+    block = route_evidence.build_route_change_evidence_metadata(final)["dod_definition"]
+    assert set(block) >= {"declared", "observed_embedded", "effective", "evidence_basis"}
+    assert block["declared"] == CANONICAL_DEFINITION
+    assert block["observed_embedded"] == CANONICAL_DEFINITION
+    assert block["effective"] == route_evidence.ACCEPTED_DOD_DEFINITION
+    assert block["evidence_basis"] == route_evidence.MANIFEST_AND_EMBEDDED_TAG_AGREE
+    assert "definition" not in block  # the old unconditional field is gone
+
+
+def test_029a_14_metadata_separates_declared_and_observed_role(tmp_path: Path):
+    final, _ = _run_and_write(tmp_path, _semantic_fixture(tmp_path, tags=None))
+    block = route_evidence.build_route_change_evidence_metadata(final)["source_scientific_role"]
+    assert block == {
+        "declared": "MULTI_EPOCH_SEABED_CHANGE_POC",
+        "observed_embedded": "MULTI_EPOCH_SEABED_CHANGE_POC",
+        "evidence_basis": route_evidence.MANIFEST_AND_EMBEDDED_TAG_AGREE,
+    }
+
+
+def test_029a_15_provenance_hash_is_not_a_scientific_verification_claim(tmp_path: Path):
+    final, _ = _run_and_write(tmp_path, _fixture(tmp_path))
+    metadata = route_evidence.build_route_change_evidence_metadata(final)
+    prov = metadata["source_provenance_artifact"]
+    assert prov["status"] == route_evidence.PROVENANCE_ARTIFACT_IDENTITY_CAPTURED
+    assert "NOT a claim that provenance was verified" in prov["note"]
+    text = json.dumps(metadata).lower()
+    html = (tmp_path / "out" / "route_observed_seabed_change_report.html").read_text("utf-8")
+    for forbidden in ("provenance verified", "provenance validated", "scientifically verified"):
+        assert forbidden not in text
+        assert forbidden not in html.lower()
+
+
+def test_029a_16_no_provenance_artifact_is_explicit_not_declared(tmp_path: Path):
+    final, _ = _run_and_write(tmp_path, _semantic_fixture(tmp_path, tags=None))
+    prov = route_evidence.build_route_change_evidence_metadata(final)["source_provenance_artifact"]
+    assert prov["status"] == route_evidence.PROVENANCE_ARTIFACT_NOT_DECLARED
+    assert prov["identity"] is None
+    assert final.provenance_identity is None
+
+
+def test_029a_17_18_19_sampling_values_unchanged_by_repair(tmp_path: Path):
+    s = _run(_fixture(tmp_path))[0].samples.set_index("station_index")
+    for k in INSIDE_STATIONS:
+        if k == NODATA_STATION:
+            assert pd.isna(s.loc[k, "delta_bed_elevation_m"])  # nodata never zero
+            assert s.loc[k, "sample_status"] == route_evidence.CHANGE_VALUE_NODATA
+        else:
+            assert s.loc[k, "delta_bed_elevation_m"] == _f32(ROW4_VALUES[k])
+    assert s.loc[4, "delta_bed_elevation_m"] == _f32(0.001)
+    assert s.loc[7, "delta_bed_elevation_m"] == _f32(-0.001)
+    assert s.loc[4, "observed_change_direction"] == dod.OBSERVED_SEABED_RAISING
+    assert s.loc[7, "observed_change_direction"] == dod.OBSERVED_SEABED_LOWERING
+    for k in OUTSIDE_STATIONS:
+        assert s.loc[k, "sample_status"] == route_evidence.ROUTE_POINT_OUTSIDE_DOD_EXTENT
+        assert pd.isna(s.loc[k, "delta_bed_elevation_m"])
+    assert len(s) == 15
+
+
+def test_029a_20_21_no_threshold_and_no_sign_conversion_introduced():
+    source = inspect.getsource(route_evidence)
+    assert re.search(r"[<>]=?\s*0\.\d", source) is None
+    assert "threshold_m=" not in source.replace("generic_change_significance_threshold_m", "")
+    # No sign conversion: the sampled value is never negated, multiplied, or reordered.
+    for forbidden in ("-value", "value * -1", "-1 *", "* -1", "np.negative", "epoch1_m - bed"):
+        assert forbidden not in source, forbidden
+    assert "_represents_canonical_definition" in source
+    assert route_evidence.ACCEPTED_DOD_DEFINITION == CANONICAL_DEFINITION
+    assert route_evidence.ACCEPTED_DOD_DEFINITION.count(" = ") == 1  # one literal, from change.dod
+
+
+def test_029a_semantic_helper_on_facts_without_a_route(tmp_path: Path):
+    # The same gate logic is callable on a bare DoD source -- how the real Sheringham product is
+    # checked without fabricating a route.
+    _write_dod_tif(tmp_path / "dod.tif")
+    _identity, observed = route_evidence.inspect_dod_source(tmp_path / "dod.tif")
+    decl = rem.DoDSourceDeclaration(
+        path=Path("dod.tif"),
+        source_change_study_id="s",
+        dod_definition_declared=CANONICAL_DEFINITION,
+        source_scientific_role_declared="MULTI_EPOCH_SEABED_CHANGE_POC",
+    )
+    sem = route_evidence.assess_dod_semantic_provenance(decl, observed)
+    assert sem.passed and sem.effective_definition == route_evidence.ACCEPTED_DOD_DEFINITION
+    assert sem.definition_evidence_basis == route_evidence.MANIFEST_AND_EMBEDDED_TAG_AGREE
+    assert sem.source_role_evidence_basis == route_evidence.MANIFEST_AND_EMBEDDED_TAG_AGREE
+    bad = decl.model_copy(update={"dod_definition_declared": REVERSED_DEFINITION})
+    sem_bad = route_evidence.assess_dod_semantic_provenance(bad, observed)
+    assert not sem_bad.passed and sem_bad.effective_definition is None
+    assert sem_bad.reason_code == route_evidence.DOD_DECLARED_DEFINITION_UNSUPPORTED

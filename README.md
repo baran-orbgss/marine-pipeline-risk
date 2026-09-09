@@ -2828,3 +2828,66 @@ otherwise, never an interactive credential prompt.
   3 skipped, 25 live deselected, `uv audit --frozen` found no known
   vulnerabilities and no adverse project statuses in 87 packages. No
   further ticket has started.
+- **MAR-029A (DoD semantic provenance integrity repair,
+  `src/marine_engine/change/route_evidence_manifest.py`,
+  `src/marine_engine/change/route_evidence.py`).** Narrow scientific-integrity
+  repair to MAR-029; no new capability. Root cause: MAR-029 proved DoD file
+  identity, raster structure, CRS, and route linkage, but could not prove
+  what the raster VALUES scientifically mean -- `source_scientific_role_declared`
+  and `provenance_path` were optional, there was no declaration of the DoD
+  mathematical definition at all, and an untagged float raster could pass the
+  gates while the output metadata unconditionally stamped it with the
+  canonical MAR-021 definition. Repair: `DoDSourceDeclaration` now REQUIRES
+  non-empty `dod_definition_declared` and `source_scientific_role_declared`
+  (the role is not forced to the internal `MULTI_EPOCH_SEABED_CHANGE_POC`
+  literal, so the layer stays generic). The declared definition must
+  represent the accepted canonical definition, read from
+  `change.dod.DoDResult.definition` and never duplicated (whitespace-only
+  differences tolerated), else the run stops with
+  `DOD_DECLARED_DEFINITION_UNSUPPORTED` -- a reversed `epoch1 - epoch2`
+  product is rejected, never sign-flipped, reinterpreted, or guessed from
+  values. The raster's own embedded `definition` and `scientific_role` tags
+  are then compared SEPARATELY: agreement gives evidence basis
+  `MANIFEST_AND_EMBEDDED_TAG_AGREE`; disagreement blocks
+  (`DOD_DEFINITION_MISMATCH` / `DOD_SOURCE_ROLE_MISMATCH`, the software never
+  chooses a side); an absent tag leaves the declaration standing as a declared
+  fact with basis `MANIFEST_DECLARED_ONLY` plus an explicit limitation that no
+  embedded tag independently corroborates it. Metadata now exposes
+  `dod_definition: {declared, observed_embedded, effective, evidence_basis}`
+  (`effective` is set only after the declared-definition gate passed) and
+  `source_scientific_role: {declared, observed_embedded, evidence_basis}`,
+  never merged; the provenance artefact is reported as
+  `PROVENANCE_ARTIFACT_IDENTITY_CAPTURED` (path, byte size, SHA-256 only --
+  explicitly NOT a claim that provenance was verified) or
+  `PROVENANCE_ARTIFACT_NOT_DECLARED`. The gates live in one reusable helper
+  (`assess_dod_semantic_provenance`) so they can be run against a bare DoD
+  product without a route. Wording repaired: the module, CLI help, and report
+  now say "a DoD source satisfying the explicit canonical-definition
+  contract" rather than "the accepted MAR-021 DoD raster" when referring to
+  an arbitrary operator source. Unchanged: sampling algorithm (exact
+  containing cell, no interpolation), nodata never zero, no threshold, no
+  causality, and `change/dod.py`, `change/uncertainty.py`,
+  `change/epoch_compatibility.py`, `change/alignment.py`,
+  `change/common_support.py`, `project/route_reference.py`,
+  `project/model.py`, `scour/*`, `burial/*`, `freespan/*` (verified
+  byte-identical to the canonical base). Tests: 22 added (75 in
+  `tests/test_route_change_evidence.py`), covering missing declarations,
+  canonical/reversed/arbitrary definitions, embedded-tag agreement /
+  mismatch / absence for both facts, the untagged-raster defect, metadata
+  separation, provenance wording, unchanged sampling values (+/-0.001 m
+  preserved, nodata never zero), and no threshold / no sign conversion. Real
+  Sheringham check (cached MAR-021 DoD, no download, no route fabricated):
+  the raster's embedded tags are `scientific_role =
+  MULTI_EPOCH_SEABED_CHANGE_POC` and `definition = delta_bed_elevation_m =
+  bed_elevation_epoch2_m - bed_elevation_epoch1_m`; through an explicit
+  MAR-029A declaration the helper returns definition evidence basis
+  `MANIFEST_AND_EMBEDDED_TAG_AGREE` (role likewise) and a reversed declaration
+  returns `DOD_DECLARED_DEFINITION_UNSUPPORTED`; DoD SHA-256 unchanged
+  (`e7b8eb87...`). PL854 MAR-027 re-run unchanged (941 stations, 23,480.669
+  m). Synthetic combined CLI proof unchanged (15 / 11 / 5 / 5 / 1 / 1 / 3
+  samples) with basis `MANIFEST_AND_EMBEDDED_TAG_AGREE`. Real same-project
+  route + multi-epoch DoD proof remains NO. Local verification: `uv lock
+  --check` clean, repo-wide `ruff format` (215 files unchanged) / `ruff
+  check` clean, offline suite 1572 passed (up from 1550), 3 skipped, 25 live
+  deselected, `uv audit --frozen` clean (87 packages). No further ticket has
+  started.

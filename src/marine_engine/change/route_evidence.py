@@ -2,7 +2,8 @@
 
 A generic bridge between two ACCEPTED components, redesigning neither:
 
-    accepted MAR-021/021A DoD raster (read-only)
+    a DoD source satisfying the explicit canonical-definition contract (read-only; the
+    accepted MAR-021/021A product is one such source, but the layer stays generic)
         +
     accepted MAR-027 canonical route-reference grid (`project.route_reference`)
         v
@@ -20,6 +21,14 @@ Immutable definitions reused verbatim (Sections 5, 16):
     delta_bed_elevation_m = bed_elevation_epoch2_m - bed_elevation_epoch1_m   (`change.dod`)
     positive -> OBSERVED_SEABED_RAISING, negative -> OBSERVED_SEABED_LOWERING, zero -> no label
     (`change.dod.classify_change_direction`, never re-implemented here)
+
+DoD semantic provenance (MAR-029A): raster bytes != structural facts != DECLARED definition !=
+EMBEDDED definition tag != provenance-artefact identity. The operator's manifest must declare
+the DoD definition and source scientific role explicitly; only a declaration representing the
+accepted canonical definition is interpretable (`DOD_DECLARED_DEFINITION_UNSUPPORTED` otherwise),
+an embedded `definition`/`scientific_role` tag that disagrees blocks (`DOD_DEFINITION_MISMATCH`
+/ `DOD_SOURCE_ROLE_MISMATCH`), and an absent tag yields evidence basis `MANIFEST_DECLARED_ONLY`
+-- the declaration is trusted as a declared fact but never presented as observed.
 
 No generic significance threshold exists (MAR-021A remains authoritative, Section 6): every
 sample is preserved regardless of magnitude; nothing is flagged, filtered, or reclassified.
@@ -54,6 +63,7 @@ from marine_engine.change.dod import (
     classify_change_direction,
 )
 from marine_engine.change.route_evidence_manifest import (
+    DoDSourceDeclaration,
     RouteChangeEvidenceManifest,
     load_route_change_evidence_manifest,
     resolve_manifest_path,
@@ -80,20 +90,28 @@ __all__ = [
     "DOD_CRS_MISSING",
     "DOD_DECLARED_CRS_CONFLICT",
     "DOD_SOURCE_ROLE_MISMATCH",
+    "DOD_DECLARED_DEFINITION_UNSUPPORTED",
+    "DOD_DEFINITION_MISMATCH",
     "DOD_CRS_MISMATCH",
     "NO_ROUTE_POINTS_ON_VALID_DOD_SUPPORT",
     "CHANGE_VALUE_AVAILABLE",
     "CHANGE_VALUE_NODATA",
     "ROUTE_POINT_OUTSIDE_DOD_EXTENT",
     "SAMPLE_SUPPORT_SEMANTICS",
+    "MANIFEST_AND_EMBEDDED_TAG_AGREE",
+    "MANIFEST_DECLARED_ONLY",
+    "PROVENANCE_ARTIFACT_IDENTITY_CAPTURED",
+    "PROVENANCE_ARTIFACT_NOT_DECLARED",
     "ROUTE_CHANGE_LAYER",
     "ROUTE_CHANGE_COLUMNS",
     "DIRECTION_LABEL_DISCLAIMER",
     "SAMPLE_COUNT_NOTE",
     "DoDObservedFacts",
+    "DoDSemanticProvenance",
     "RouteChangeEvidenceResult",
     "inspect_dod_source",
     "observe_dod_raster",
+    "assess_dod_semantic_provenance",
     "sample_dod_at_route_reference_points",
     "build_route_change_evidence",
     "run_route_change_evidence",
@@ -121,7 +139,33 @@ DOD_ROTATED_GRID_UNSUPPORTED = "DOD_ROTATED_GRID_UNSUPPORTED"
 DOD_CRS_MISSING = "DOD_CRS_MISSING"
 DOD_DECLARED_CRS_CONFLICT = "DOD_DECLARED_CRS_CONFLICT"
 DOD_SOURCE_ROLE_MISMATCH = "DOD_SOURCE_ROLE_MISMATCH"
+DOD_DECLARED_DEFINITION_UNSUPPORTED = "DOD_DECLARED_DEFINITION_UNSUPPORTED"
+DOD_DEFINITION_MISMATCH = "DOD_DEFINITION_MISMATCH"
 DOD_CRS_MISMATCH = "DOD_CRS_MISMATCH"
+
+# --- MAR-029A: semantic-provenance evidence bases -------------------------------------------------
+# What backs the DoD definition / source role used for a run: the manifest declaration corroborated
+# by the raster's own embedded tag, or the manifest declaration alone (never presented as observed).
+MANIFEST_AND_EMBEDDED_TAG_AGREE = "MANIFEST_AND_EMBEDDED_TAG_AGREE"
+MANIFEST_DECLARED_ONLY = "MANIFEST_DECLARED_ONLY"
+
+# A provenance artefact is only ever identified (path, byte size, SHA-256); its scientific content
+# is not parsed or validated by this layer.
+PROVENANCE_ARTIFACT_IDENTITY_CAPTURED = "PROVENANCE_ARTIFACT_IDENTITY_CAPTURED"
+PROVENANCE_ARTIFACT_NOT_DECLARED = "PROVENANCE_ARTIFACT_NOT_DECLARED"
+PROVENANCE_ARTIFACT_NOTE = (
+    "a declared provenance artefact is identified by path, byte size, and SHA-256 only; its "
+    "scientific content is neither parsed nor validated by this layer, so a captured identity is "
+    "NOT a claim that provenance was verified"
+)
+DEFINITION_DECLARED_ONLY_LIMITATION = (
+    "the DoD definition is backed by the manifest declaration only: the raster carries no embedded "
+    "'definition' tag that independently corroborates it"
+)
+ROLE_DECLARED_ONLY_LIMITATION = (
+    "the source scientific role is backed by the manifest declaration only: the raster carries no "
+    "embedded 'scientific_role' tag that independently corroborates it"
+)
 NO_ROUTE_POINTS_ON_VALID_DOD_SUPPORT = "NO_ROUTE_POINTS_ON_VALID_DOD_SUPPORT"
 
 # --- Section 15: per-sample statuses --------------------------------------------------------------
@@ -335,6 +379,115 @@ def _declared_vs_observed_crs_conflict(declared: str | None, observed: str) -> s
     return None
 
 
+def _represents_canonical_definition(text: str) -> bool:
+    """MAR-029A Section 6: exact representation of the accepted MAR-021 definition, tolerating only
+    surrounding/internal whitespace differences. No sign flipping, no operand reordering, no
+    reinterpretation -- anything else is unsupported."""
+
+    return " ".join(text.split()) == " ".join(ACCEPTED_DOD_DEFINITION.split())
+
+
+@dataclass(frozen=True)
+class DoDSemanticProvenance:
+    """MAR-029A: the outcome of the semantic-provenance gates for one DoD source. `reason_code`
+    is None when both gates pass; the evidence bases then say what backs each fact."""
+
+    definition_declared: str
+    definition_observed_embedded: str | None
+    definition_evidence_basis: str | None
+    source_role_declared: str
+    source_role_observed_embedded: str | None
+    source_role_evidence_basis: str | None
+    reason_code: str | None
+    finding: str | None
+    limitations: list[str]
+
+    @property
+    def passed(self) -> bool:
+        return self.reason_code is None
+
+    @property
+    def effective_definition(self) -> str | None:
+        """The interpretable definition -- present ONLY when the gates passed."""
+        return ACCEPTED_DOD_DEFINITION if self.passed else None
+
+
+def assess_dod_semantic_provenance(
+    dod_decl: DoDSourceDeclaration, dod_observed: DoDObservedFacts
+) -> DoDSemanticProvenance:
+    """MAR-029A Sections 6-8. The DECLARED definition must represent the accepted canonical
+    definition (never flipped, reinterpreted, or guessed from values) -- otherwise
+    `DOD_DECLARED_DEFINITION_UNSUPPORTED`. The raster's own EMBEDDED `definition` tag is compared
+    separately: agreement -> `MANIFEST_AND_EMBEDDED_TAG_AGREE`, disagreement ->
+    `DOD_DEFINITION_MISMATCH` (the software never chooses a side), absence ->
+    `MANIFEST_DECLARED_ONLY` plus an explicit limitation. The declared (required) source
+    scientific role is compared with the embedded `scientific_role` tag under the same three
+    rules (`DOD_SOURCE_ROLE_MISMATCH` on disagreement). A declaration is trusted as a DECLARED
+    fact; it is never presented as observed."""
+
+    declared_def = dod_decl.dod_definition_declared
+    observed_def = dod_observed.tags.get("definition")
+    declared_role = dod_decl.source_scientific_role_declared
+    observed_role = dod_observed.tags.get("scientific_role")
+    limitations: list[str] = []
+
+    def _blocked(reason_code: str, finding: str) -> DoDSemanticProvenance:
+        return DoDSemanticProvenance(
+            definition_declared=declared_def,
+            definition_observed_embedded=observed_def,
+            definition_evidence_basis=None,
+            source_role_declared=declared_role,
+            source_role_observed_embedded=observed_role,
+            source_role_evidence_basis=None,
+            reason_code=reason_code,
+            finding=finding,
+            limitations=[],
+        )
+
+    if not _represents_canonical_definition(declared_def):
+        return _blocked(
+            DOD_DECLARED_DEFINITION_UNSUPPORTED,
+            f"declared DoD definition {declared_def!r} does not represent the only definition "
+            f"this layer can interpret, {ACCEPTED_DOD_DEFINITION!r}; the sign is not flipped and "
+            "the values are not reinterpreted -- supply a compatible DoD",
+        )
+    if observed_def is None:
+        definition_basis = MANIFEST_DECLARED_ONLY
+        limitations.append(DEFINITION_DECLARED_ONLY_LIMITATION)
+    elif _represents_canonical_definition(observed_def):
+        definition_basis = MANIFEST_AND_EMBEDDED_TAG_AGREE
+    else:
+        return _blocked(
+            DOD_DEFINITION_MISMATCH,
+            f"declared DoD definition {declared_def!r} disagrees with the raster's own embedded "
+            f"definition tag {observed_def!r}; the software does not choose a side",
+        )
+
+    if observed_role is None:
+        role_basis = MANIFEST_DECLARED_ONLY
+        limitations.append(ROLE_DECLARED_ONLY_LIMITATION)
+    elif observed_role == declared_role:
+        role_basis = MANIFEST_AND_EMBEDDED_TAG_AGREE
+    else:
+        return _blocked(
+            DOD_SOURCE_ROLE_MISMATCH,
+            f"declared source scientific role {declared_role!r} does not match the DoD raster's "
+            f"own embedded tag {observed_role!r}",
+        )
+
+    return DoDSemanticProvenance(
+        definition_declared=declared_def,
+        definition_observed_embedded=observed_def,
+        definition_evidence_basis=definition_basis,
+        source_role_declared=declared_role,
+        source_role_observed_embedded=observed_role,
+        source_role_evidence_basis=role_basis,
+        reason_code=None,
+        finding=None,
+        limitations=limitations,
+    )
+
+
 # --- Section 13-15: sampling ----------------------------------------------------------------------
 
 
@@ -504,6 +657,9 @@ class RouteChangeEvidenceResult:
     declared_vs_observed_crs_conflict: str | None
     dod_vs_route_crs_status: str | None
     samples: gpd.GeoDataFrame | None
+    definition_evidence_basis: str | None = None
+    source_role_evidence_basis: str | None = None
+    effective_dod_definition: str | None = None
     products_written: bool = False
     output_paths: dict[str, str] = field(default_factory=dict)
 
@@ -534,6 +690,8 @@ def build_route_change_evidence(
     declared_conflict: str | None = None
     dod_vs_route: str | None = None
     samples: gpd.GeoDataFrame | None = None
+    definition_basis: str | None = None
+    role_basis: str | None = None
 
     def _not_available(reason_code: str, finding: str) -> RouteChangeEvidenceResult:
         findings.append(finding)
@@ -553,6 +711,9 @@ def build_route_change_evidence(
             declared_vs_observed_crs_conflict=declared_conflict,
             dod_vs_route_crs_status=dod_vs_route,
             samples=samples,
+            definition_evidence_basis=definition_basis,
+            source_role_evidence_basis=role_basis,
+            effective_dod_definition=None,
         )
 
     # Section 11: the canonical route-reference grid must exist -- no route is ever invented.
@@ -625,17 +786,15 @@ def build_route_change_evidence(
     if declared_conflict is not None:
         return _not_available(DOD_DECLARED_CRS_CONFLICT, declared_conflict)
 
-    observed_role = dod_observed.tags.get("scientific_role")
-    if (
-        dod_decl.source_scientific_role_declared is not None
-        and observed_role is not None
-        and observed_role != dod_decl.source_scientific_role_declared
-    ):
-        return _not_available(
-            DOD_SOURCE_ROLE_MISMATCH,
-            f"declared source scientific role {dod_decl.source_scientific_role_declared!r} does "
-            f"not match the DoD raster's own embedded tag {observed_role!r}",
-        )
+    # MAR-029A Sections 6-8: DoD semantic provenance (declared definition gate, embedded
+    # definition tag, declared vs embedded source role) -- assessed by ONE helper so the same
+    # logic can be exercised against a real DoD product without a route.
+    semantics = assess_dod_semantic_provenance(dod_decl, dod_observed)
+    findings.extend(semantics.limitations)
+    if semantics.reason_code is not None:
+        return _not_available(semantics.reason_code, semantics.finding or semantics.reason_code)
+    definition_basis = semantics.definition_evidence_basis
+    role_basis = semantics.source_role_evidence_basis
 
     # Section 12: DoD CRS vs canonical route-reference grid CRS -- semantic, conservative.
     grid_crs = CRS.from_user_input(grid.crs).to_string()
@@ -674,6 +833,10 @@ def build_route_change_evidence(
         declared_vs_observed_crs_conflict=None,
         dod_vs_route_crs_status=dod_vs_route,
         samples=samples,
+        definition_evidence_basis=definition_basis,
+        source_role_evidence_basis=role_basis,
+        # The effective definition exists ONLY after the declared-definition gate above passed.
+        effective_dod_definition=ACCEPTED_DOD_DEFINITION,
     )
 
 
@@ -712,6 +875,25 @@ def build_route_change_evidence_metadata(result: RouteChangeEvidenceResult) -> d
     rr = result.route_reference
     dod_decl = result.route_manifest.dod
     grid_crs = CRS.from_user_input(rr.grid_gdf.crs).to_string() if rr.grid_gdf is not None else None
+    observed_tags = result.dod_observed.tags if result.dod_observed is not None else {}
+    limitations = [
+        SAMPLE_SUPPORT_DESCRIPTION,
+        GENERIC_SIGNIFICANCE_NOTE,
+        DIRECTION_LABEL_DISCLAIMER,
+        NOT_A_STATE_NOTE,
+        NO_INTERVAL_NOTE,
+        SAMPLE_COUNT_NOTE,
+        TEMPORAL_NOTE,
+        PROVENANCE_ARTIFACT_NOTE,
+        "cross-CRS route sampling (DoD CRS differing from the route-reference grid CRS) is not "
+        "implemented; such inputs are reported as DOD_CRS_MISMATCH",
+        "no future change rate, sediment-transport, or morphodynamic prediction of any kind",
+        "no route risk, hazard, readiness, or failure-probability output of any kind",
+    ]
+    if result.definition_evidence_basis == MANIFEST_DECLARED_ONLY:
+        limitations.append(DEFINITION_DECLARED_ONLY_LIMITATION)
+    if result.source_role_evidence_basis == MANIFEST_DECLARED_ONLY:
+        limitations.append(ROLE_DECLARED_ONLY_LIMITATION)
     return {
         "scientific_role": SCIENTIFIC_ROLE,
         "status": result.status,
@@ -730,6 +912,7 @@ def build_route_change_evidence_metadata(result: RouteChangeEvidenceResult) -> d
             "horizontal_crs_declared": dod_decl.horizontal_crs_declared,
             "epoch1_survey_epoch_declared": dod_decl.epoch1_survey_epoch_declared,
             "epoch2_survey_epoch_declared": dod_decl.epoch2_survey_epoch_declared,
+            "dod_definition_declared": dod_decl.dod_definition_declared,
             "source_scientific_role_declared": dod_decl.source_scientific_role_declared,
             "licence_note": dod_decl.licence_note,
             "association_note": (
@@ -756,13 +939,32 @@ def build_route_change_evidence_metadata(result: RouteChangeEvidenceResult) -> d
         "dod_source_immutability": IMMUTABLE_SOURCE_NOTE,
         "dod_observed_facts": result.dod_observed.to_dict() if result.dod_observed else None,
         "dod_definition": {
-            "definition": ACCEPTED_DOD_DEFINITION,
+            "declared": dod_decl.dod_definition_declared,
+            "observed_embedded": observed_tags.get("definition"),
+            "effective": result.effective_dod_definition,
+            "evidence_basis": result.definition_evidence_basis,
+            "interpretable_definition": ACCEPTED_DOD_DEFINITION,
             "positive_label": OBSERVED_SEABED_RAISING,
             "negative_label": OBSERVED_SEABED_LOWERING,
             "zero_label": None,
             "classifier": "marine_engine.change.dod.classify_change_direction (reused verbatim)",
+            "note": "'effective' is set only after the declared definition passed the "
+            "canonical-definition gate; it is never derived from the raster values",
         },
-        "source_provenance_artifact": _identity_dict(result.provenance_identity),
+        "source_scientific_role": {
+            "declared": dod_decl.source_scientific_role_declared,
+            "observed_embedded": observed_tags.get("scientific_role"),
+            "evidence_basis": result.source_role_evidence_basis,
+        },
+        "source_provenance_artifact": {
+            "status": (
+                PROVENANCE_ARTIFACT_IDENTITY_CAPTURED
+                if result.provenance_identity is not None
+                else PROVENANCE_ARTIFACT_NOT_DECLARED
+            ),
+            "identity": _identity_dict(result.provenance_identity),
+            "note": PROVENANCE_ARTIFACT_NOTE,
+        },
         "crs_compatibility": {
             "comparison_method": "pyproj.CRS semantic equality (never raw string equality)",
             "dod_declared_crs": dod_decl.horizontal_crs_declared,
@@ -806,19 +1008,7 @@ def build_route_change_evidence_metadata(result: RouteChangeEvidenceResult) -> d
             "gpkg": result.output_paths.get("gpkg"),
             "gis_layer": ROUTE_CHANGE_LAYER if result.products_written else None,
         },
-        "explicit_limitations": [
-            SAMPLE_SUPPORT_DESCRIPTION,
-            GENERIC_SIGNIFICANCE_NOTE,
-            DIRECTION_LABEL_DISCLAIMER,
-            NOT_A_STATE_NOTE,
-            NO_INTERVAL_NOTE,
-            SAMPLE_COUNT_NOTE,
-            TEMPORAL_NOTE,
-            "cross-CRS route sampling (DoD CRS differing from the route-reference grid CRS) is not "
-            "implemented; such inputs are reported as DOD_CRS_MISMATCH",
-            "no future change rate, sediment-transport, or morphodynamic prediction of any kind",
-            "no route risk, hazard, readiness, or failure-probability output of any kind",
-        ],
+        "explicit_limitations": limitations,
     }
 
 
@@ -846,7 +1036,12 @@ def build_route_change_evidence_validation(result: RouteChangeEvidenceResult) ->
     allowed = {OBSERVED_SEABED_RAISING, OBSERVED_SEABED_LOWERING}
     return {
         "question_a_does_mar029_reuse_the_accepted_mar021_dod_definition": (
-            "YES" if ACCEPTED_DOD_DEFINITION.endswith("epoch2_m - bed_elevation_epoch1_m") else "NO"
+            "YES"
+            if result.effective_dod_definition == ACCEPTED_DOD_DEFINITION
+            else ("NOT_APPLICABLE" if result.effective_dod_definition is None else "NO")
+        ),
+        "question_i_dod_definition_evidence_basis": (
+            result.definition_evidence_basis or "NOT_APPLICABLE"
         ),
         "question_b_can_a_positive_dod_sample_be_called_definitive_deposition": (
             "NO" if directions <= allowed else "YES"
@@ -908,7 +1103,8 @@ def build_route_change_evidence_report_blocks(
         {
             "type": "paragraph",
             "text": "For every canonical MAR-027 route-reference point of the declared project "
-            "route, the accepted MAR-021 DoD raster was read at the single cell containing that "
+            "route, the DoD source satisfying the explicit canonical-definition contract was read "
+            "at the single cell containing that "
             f"point ({SAMPLE_SUPPORT_SEMANTICS}). {SAMPLE_SUPPORT_DESCRIPTION}.",
         },
         {
@@ -923,8 +1119,20 @@ def build_route_change_evidence_report_blocks(
                 f"{result.route_reference.chainage_origin_basis}",
                 f"DoD source: {result.dod_resolved_path}",
                 f"DoD SHA-256: {_sha(result) or 'n/a'}",
-                f"DoD source change study: {dod_decl.source_change_study_id}",
-                f"DoD definition: {ACCEPTED_DOD_DEFINITION}",
+                f"DoD source change study (declared): {dod_decl.source_change_study_id}",
+                f"DoD definition (declared): {dod_decl.dod_definition_declared}",
+                "DoD definition (observed embedded tag): "
+                f"{metadata['dod_definition']['observed_embedded'] or 'absent'}",
+                "DoD definition (effective): "
+                f"{result.effective_dod_definition or 'none -- gate not passed'}",
+                f"DoD definition evidence basis: {result.definition_evidence_basis or 'n/a'}",
+                f"Source scientific role (declared): {dod_decl.source_scientific_role_declared}",
+                "Source scientific role (observed embedded tag): "
+                f"{metadata['source_scientific_role']['observed_embedded'] or 'absent'}",
+                "Source scientific role evidence basis: "
+                f"{result.source_role_evidence_basis or 'n/a'}",
+                f"Provenance artefact: {metadata['source_provenance_artifact']['status']} -- "
+                f"{PROVENANCE_ARTIFACT_NOTE}",
                 POINT_GEOMETRY_NOTE,
                 CELL_CENTER_DISTANCE_NOTE,
             ],

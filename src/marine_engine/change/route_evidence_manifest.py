@@ -12,8 +12,9 @@ every model). Every path resolves relative to THIS manifest file's own directory
 process's current working directory -- `load_route_change_evidence_manifest` returns that
 directory alongside the parsed manifest so callers cannot resolve paths any other way.
 
-Declared facts recorded here (route asset ID, source change-study identity, declared CRS,
-declared epochs, declared source scientific role, provenance artefact) are kept structurally
+Declared facts recorded here (route asset ID, source change-study identity, declared DoD
+definition, declared source scientific role, declared CRS, declared epochs, provenance
+artefact) are kept structurally
 separate from what is later OBSERVED from the DoD raster itself
 (`route_evidence.inspect_dod_source`).
 """
@@ -24,27 +25,45 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class DoDSourceDeclaration(BaseModel):
-    """Section 9 (declared/linked side): the accepted DoD raster to consume READ-ONLY, plus the
-    operator/source-declared facts about it. `path` is the DoD GeoTIFF; `provenance_path`, when
-    given, is the accepted machine-readable provenance/validation artefact of the change study
-    that produced the DoD (e.g. MAR-021's `seabed_change_poc_validation.json`) -- it is
-    identified by content hash and copied nowhere. Nothing here is ever inferred from the raster."""
+    """Section 9 (declared/linked side): a DoD source raster to consume READ-ONLY, plus the
+    operator/source-DECLARED facts about it. `path` is the DoD GeoTIFF; `provenance_path`, when
+    given, is a machine-readable provenance/validation artefact of the change study that produced
+    the DoD (e.g. MAR-021's `seabed_change_poc_validation.json`) -- it is identified by content
+    hash only and copied nowhere. Nothing here is ever inferred from the raster.
+
+    MAR-029A: `dod_definition_declared` and `source_scientific_role_declared` are REQUIRED and
+    non-empty. Raster bytes and structure prove nothing about what the values MEAN; the operator
+    must state the mathematical definition explicitly, and only a declaration that represents the
+    accepted canonical definition (`change.dod.DoDResult.definition`) can be interpreted. The
+    software never invents, flips, or guesses a definition from the values."""
 
     model_config = ConfigDict(extra="forbid")
 
     path: Path
     source_change_study_id: str
+    dod_definition_declared: str
+    source_scientific_role_declared: str
     provenance_path: Path | None = None
     horizontal_crs_declared: str | None = None
     epoch1_survey_epoch_declared: str | None = None
     epoch2_survey_epoch_declared: str | None = None
-    source_scientific_role_declared: str | None = None
     source_name: str | None = None
     licence_note: str | None = None
+
+    @model_validator(mode="after")
+    def _require_non_empty_semantics(self) -> DoDSourceDeclaration:
+        for name in (
+            "dod_definition_declared",
+            "source_scientific_role_declared",
+            "source_change_study_id",
+        ):
+            if not str(getattr(self, name)).strip():
+                raise ValueError(f"dod.{name} must be a non-empty declaration")
+        return self
 
 
 class RouteChangeEvidenceManifest(BaseModel):
