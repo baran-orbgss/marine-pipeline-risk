@@ -2700,3 +2700,36 @@ otherwise, never an interactive credential prompt.
   coverage, automatic temporal correlation, broad asset-category
   ingestion, hazard fusion, route suitability, new geohazard engines. No
   further ticket has started.
+- **MAR-028 (independent CI & dependency audit gate,
+  `.github/workflows/ci.yml`).** Engineering-integrity ticket only: no new
+  marine science, no new geohazard capability, no change under
+  `src/marine_engine/`, no test change, no dependency or `uv.lock` change.
+  A single GitHub Actions workflow (`CI`, job `verify`, triggers `push` to
+  `main` and `pull_request`, no schedule, `permissions: contents: read`,
+  30-minute timeout, checkout with `persist-credentials: false`) now
+  independently verifies every commit from a clean clone, so the
+  implementing agent is no longer the only party asserting that the
+  committed repository passes its gates. External actions are pinned to
+  full immutable commit SHAs (`actions/checkout` v7.0.1, `astral-sh/setup-uv`
+  v10.0.1), uv is pinned to 0.12.9 (the version that produced the committed
+  lockfile and ran the local gates) and Python to 3.12 (matching
+  `.python-version`). Gate order: `uv lock --check` (fails if
+  `pyproject.toml` and `uv.lock` disagree) -> `uv sync --frozen` (installs
+  the committed lock, never re-resolves) -> `ruff format --check` ->
+  `ruff check` -> `pytest` (pyproject's default `-m "not live"` applies, so
+  no NSTA/MEDIN/BGS/EMODnet/SeaDataNet/Copernicus call is made) ->
+  `uv audit --frozen` (blocking; no `--ignore`, no exception policy exists).
+  CI is verification-only: it never runs `ruff format .`, never commits,
+  pushes, or mutates repository contents, and receives no secrets. What a
+  green CI run means: the committed offline code and tests pass on a clean
+  Linux runner with the locked dependency set, and the locked dependencies
+  had no known vulnerability or adverse project status at run time. What it
+  does NOT mean: PL854 / Sheringham Shoal / Barrow real-data regression --
+  those datasets are intentionally gitignored, so real-data scientific
+  regression remains a local/manual step, and CI does not replace GPT
+  scientific review or GIS visual QA. Local baseline at the canonical base
+  before the workflow was written: `uv lock --check` clean, `uv audit
+  --frozen` found no known vulnerabilities and no adverse project statuses
+  in 87 packages, `ruff format --check` 212 files already formatted, `ruff
+  check` clean, offline suite 1497 passed, 3 skipped, 25 live deselected.
+  No further ticket has started.

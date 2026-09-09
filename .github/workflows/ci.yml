@@ -1,0 +1,64 @@
+# MAR-028 -- independent verification gate.
+#
+# This workflow verifies the committed, offline-capable repository from a
+# clean clone. It is verification-only: it never formats, fixes, commits,
+# pushes, or otherwise mutates repository contents.
+#
+# It does NOT perform real-data scientific validation. The PL854 /
+# Sheringham Shoal / Barrow datasets are intentionally gitignored, so a
+# clean GitHub runner has none of them, and no live scientific service
+# (NSTA, MEDIN, BGS, EMODnet, SeaDataNet CDI, Copernicus Marine) is
+# contacted: pytest's default `-m "not live"` marker selection applies.
+# Real-data regression remains a local/manual step.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.9"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Lockfile consistency (uv lock --check)
+        run: uv lock --check
+
+      - name: Install locked environment (uv sync --frozen)
+        run: uv sync --frozen
+
+      - name: Report toolchain versions
+        run: |
+          uv --version
+          uv run --frozen python --version
+
+      - name: Format check (ruff format --check)
+        run: uv run --frozen ruff format --check .
+
+      - name: Lint (ruff check)
+        run: uv run --frozen ruff check .
+
+      - name: Offline test suite (pytest, live marker excluded by pyproject)
+        run: uv run --frozen pytest
+
+      - name: Dependency vulnerability / adverse-status audit (uv audit --frozen)
+        run: uv audit --frozen

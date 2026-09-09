@@ -332,7 +332,33 @@ uv run pytest
 
 unless the MAR ticket explicitly defines a different verification requirement.
 
-There is currently no separate assumption that GitHub CI, `mypy`, or pre-commit has run.
+## Local verification vs GitHub CI verification
+
+Since MAR-028 the repository has an independent GitHub Actions workflow:
+
+```text
+.github/workflows/ci.yml
+```
+
+It runs on `push` to `main` and on `pull_request`, from a clean clone, and verifies only:
+
+```text
+uv lock --check
+uv sync --frozen
+ruff format --check
+ruff check
+pytest            (offline suite; live marker excluded by pyproject)
+uv audit --frozen (blocking dependency vulnerability/adverse-status audit)
+```
+
+GitHub CI never performs real-data scientific validation. The PL854 / Sheringham Shoal / Barrow datasets are gitignored and are not available on a runner. Real-data regression remains local/manual.
+
+There is still no `mypy` or pre-commit gate.
+
+Keep the two kinds of verification distinct:
+
+* **local verification** — commands Claude Code ran in the working tree during the session;
+* **GitHub CI verification** — the actual GitHub Actions run for the pushed commit.
 
 Do not describe local verification as CI.
 
@@ -342,7 +368,9 @@ Do not claim:
 CI passed
 ```
 
-unless an actual CI system executed and passed.
+unless the actual GitHub Actions run for the final commit was inspected and reported `success`.
+
+Do not weaken the workflow (skip a step, add an audit ignore, unpin an action, loosen a marker) to make a ticket pass. A failing gate is a finding to report.
 
 ---
 
@@ -977,6 +1005,7 @@ implementation
 → commit
 → push
 → local/remote HEAD verification
+→ GitHub Actions CI result inspection (when the ticket requires push-to-main completion)
 → final report
 → STOP
 ```
@@ -1009,7 +1038,11 @@ Include, where applicable:
 11. actual outputs inspected;
 12. limitations;
 13. final commit SHA;
-14. local/remote HEAD confirmation.
+14. local/remote HEAD confirmation;
+15. local verification result (what was run in the session, stated on its own);
+16. GitHub CI verification result (the actual workflow run status for the final commit, stated on its own, or an explicit statement that it was not inspected).
+
+Local verification and GitHub CI verification must be reported independently. One does not imply the other.
 
 Do not report historical test counts as if they were executed in the current session.
 
