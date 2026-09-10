@@ -73,6 +73,11 @@ CANONICAL_TERRAIN_ROLE_MISMATCH = "CANONICAL_TERRAIN_ROLE_MISMATCH"
 CANONICAL_TERRAIN_INTRINSIC_NOT_READY = "CANONICAL_TERRAIN_INTRINSIC_NOT_READY"
 TERRAIN_PIXELS_NOT_SQUARE_METRIC = "TERRAIN_PIXELS_NOT_SQUARE_METRIC"
 TERRAIN_ROTATED_GRID_UNSUPPORTED = "TERRAIN_ROTATED_GRID_UNSUPPORTED"
+# MAR-031A: the canonical terrain's horizontal CRS linear unit must be PROVEN metre-equivalent
+# (axis unit-to-metre conversion factor exactly 1.0) before any pixel spacing is treated as metres.
+# A projected CRS in feet / US survey feet / unknown units, or a geographic CRS, fails this
+# independently of pixel squareness and grid rotation. No conversion or reprojection is performed.
+TERRAIN_HORIZONTAL_CRS_LINEAR_UNIT_NOT_METRE = "TERRAIN_HORIZONTAL_CRS_LINEAR_UNIT_NOT_METRE"
 SITE_GEOTECHNICAL_PROFILE_UNAVAILABLE = "SITE_GEOTECHNICAL_PROFILE_UNAVAILABLE"
 NO_GEOTECHNICAL_SCENARIO_SUPPLIED = "NO_GEOTECHNICAL_SCENARIO_SUPPLIED"
 

@@ -5,7 +5,8 @@ Consumes the ACCEPTED MAR-020 canonical terrain product (`terrain/canonical_bed_
 
 1. answers terrain-screening readiness by DELEGATING intrinsic raster readiness to the accepted
    `terrain.readiness.assess_bathymetry_readiness` (never re-implemented) and adding only the
-   MAR-031-specific integration conditions (canonical role tag, square metric pixels, no rotation);
+   MAR-031-specific integration conditions (canonical role tag, horizontal CRS linear unit proven
+   metre-equivalent [MAR-031A], square pixels, no rotation);
 2. for each INDEPENDENT slope scale, calls the accepted
    `terrain.derivatives.compute_slope_aspect_deg` unchanged and derives
    `normalized_undrained_strength_demand = sin(alpha) * cos(alpha)`;
@@ -25,12 +26,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyproj
 import rasterio
+from pyproj.exceptions import CRSError as PyprojCRSError
 from rasterio.errors import RasterioError, RasterioIOError
 
 from marine_engine.slope_stability import contract, core, maps, report
@@ -50,6 +54,97 @@ REGIONAL_CONTEXT_AVAILABLE = "AVAILABLE"
 REGIONAL_CONTEXT_NOT_AVAILABLE = "NOT_AVAILABLE"
 
 
+# --- MAR-031A: horizontal CRS linear-unit integrity (observed from the CRS, never declared) -------
+
+# Only normal CRS-library floating precision is tolerated: the axis unit-to-metre conversion factor
+# must be exactly 1.0. International foot (0.3048) and US survey foot (0.30480060960121924) are
+# ~0.7 away and can never pass; degrees (~0.01745) can never pass; nothing is ever converted.
+_METRE_FACTOR_ABS_TOL = 1e-12
+
+
+@dataclass(frozen=True)
+class HorizontalLinearUnitFacts:
+    """What the CRS itself says about its horizontal axis unit. `verified_metres` is True ONLY
+    for a projected CRS whose every horizontal axis converts to metre with factor == 1.0."""
+
+    unit_name: str | None
+    to_metre_factor: float | None
+    is_projected: bool | None
+    verified_metres: bool
+    detail: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "crs_linear_unit_name": self.unit_name,
+            "crs_linear_unit_to_m_factor": self.to_metre_factor,
+            "crs_is_projected": self.is_projected,
+            "horizontal_linear_unit_verified_metres": self.verified_metres,
+            "detail": self.detail,
+        }
+
+
+def inspect_horizontal_linear_unit(crs: rasterio.crs.CRS | None) -> HorizontalLinearUnitFacts:
+    """Semantic linear-unit check via pyproj axis metadata (no string matching on unit names,
+    no reinterpretation of a projected CRS as metric merely because it is projected). Unknown or
+    unavailable unit semantics FAIL closed."""
+
+    if crs is None:
+        return HorizontalLinearUnitFacts(None, None, None, False, "no CRS on the raster")
+    try:
+        parsed = pyproj.CRS.from_user_input(crs.to_wkt())
+    except (PyprojCRSError, ValueError, TypeError, AttributeError) as exc:
+        return HorizontalLinearUnitFacts(
+            None, None, None, False, f"CRS could not be parsed for unit semantics: {exc}"
+        )
+
+    axes = list(parsed.axis_info)
+    names = sorted({str(a.unit_name) for a in axes})
+    factors = sorted({float(a.unit_conversion_factor) for a in axes})
+    unit_name = names[0] if len(names) == 1 else (", ".join(names) if names else None)
+    factor = factors[0] if len(factors) == 1 else None
+    is_projected = bool(parsed.is_projected)
+
+    if not axes:
+        return HorizontalLinearUnitFacts(
+            unit_name, factor, is_projected, False, "CRS exposes no axis unit information"
+        )
+    if not is_projected:
+        return HorizontalLinearUnitFacts(
+            unit_name,
+            factor,
+            is_projected,
+            False,
+            f"CRS is not projected (geographic={parsed.is_geographic}); axis unit "
+            f"{unit_name!r} is not a horizontal linear metre",
+        )
+    if len(names) != 1 or len(factors) != 1:
+        return HorizontalLinearUnitFacts(
+            unit_name,
+            factor,
+            is_projected,
+            False,
+            f"horizontal axes do not share one linear unit: names={names}, factors={factors}",
+        )
+    if not math.isfinite(factor) or not math.isclose(
+        factor, 1.0, rel_tol=0.0, abs_tol=_METRE_FACTOR_ABS_TOL
+    ):
+        return HorizontalLinearUnitFacts(
+            unit_name,
+            factor,
+            is_projected,
+            False,
+            f"horizontal linear unit {unit_name!r} converts to metre with factor {factor!r}, "
+            "not 1.0; pixel spacing is therefore NOT metres (no conversion is performed)",
+        )
+    return HorizontalLinearUnitFacts(
+        unit_name,
+        factor,
+        is_projected,
+        True,
+        f"projected CRS, horizontal linear unit {unit_name!r}, to-metre factor {factor!r}",
+    )
+
+
 # --- Canonical terrain facts (observed from the file, never declared) -----------------------------
 
 
@@ -64,13 +159,18 @@ class CanonicalTerrainFacts:
     transform: tuple[float, ...] | None
     width: int
     height: int
-    pixel_size_x_m: float | None
-    pixel_size_y_m: float | None
+    # Raw grid spacing in the CRS's own horizontal unit (whatever that is): |transform.a|-style
+    # values read straight from the affine. NEVER metres by assumption (MAR-031A).
+    pixel_size_x_crs_units: float | None
+    pixel_size_y_crs_units: float | None
     bounds: tuple[float, float, float, float] | None
     nodata: float | None
     dtype: str | None
     band_count: int
     color_interpretations: tuple[str, ...]
+    horizontal_unit: HorizontalLinearUnitFacts = field(
+        default_factory=lambda: HorizontalLinearUnitFacts(None, None, None, False, "not inspected")
+    )
     tags: dict[str, str] = field(default_factory=dict)
     canonical_sha256: str | None = None
 
@@ -83,16 +183,45 @@ class CanonicalTerrainFacts:
         return bool(self.transform) and (self.transform[1] != 0.0 or self.transform[3] != 0.0)
 
     @property
-    def pixels_square_metric(self) -> bool:
+    def horizontal_linear_unit_verified_metres(self) -> bool:
+        return self.horizontal_unit.verified_metres
+
+    @property
+    def pixel_size_x_m(self) -> float | None:
+        """Metric pixel width -- defined ONLY once the CRS horizontal unit is proven metre
+        (factor exactly 1.0, so the value is the raw spacing x 1.0). None otherwise: a 10-foot
+        pixel is never reported as a 10-metre pixel."""
+
+        if not self.horizontal_unit.verified_metres or self.pixel_size_x_crs_units is None:
+            return None
+        return float(self.pixel_size_x_crs_units) * float(self.horizontal_unit.to_metre_factor)
+
+    @property
+    def pixel_size_y_m(self) -> float | None:
+        if not self.horizontal_unit.verified_metres or self.pixel_size_y_crs_units is None:
+            return None
+        return float(self.pixel_size_y_crs_units) * float(self.horizontal_unit.to_metre_factor)
+
+    @property
+    def pixels_square(self) -> bool:
+        """Pixel GEOMETRY only (finite, positive, square), unit-agnostic."""
+
+        x, y = self.pixel_size_x_crs_units, self.pixel_size_y_crs_units
         return (
-            self.pixel_size_x_m is not None
-            and self.pixel_size_y_m is not None
-            and np.isfinite(self.pixel_size_x_m)
-            and np.isfinite(self.pixel_size_y_m)
-            and self.pixel_size_x_m > 0
-            and abs(self.pixel_size_x_m - self.pixel_size_y_m) <= 1e-9 * self.pixel_size_x_m
-            and self.crs_is_geographic is False
+            x is not None
+            and y is not None
+            and bool(np.isfinite(x))
+            and bool(np.isfinite(y))
+            and x > 0
+            and abs(x - y) <= 1e-9 * x
         )
+
+    @property
+    def pixels_square_metric(self) -> bool:
+        """Square pixels AND a horizontal unit proven to be metre. Projected status alone is
+        NOT sufficient (MAR-031A)."""
+
+        return self.pixels_square and self.horizontal_linear_unit_verified_metres
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -102,8 +231,12 @@ class CanonicalTerrainFacts:
             "crs": self.crs,
             "crs_is_geographic": self.crs_is_geographic,
             "crs_linear_units": self.crs_linear_units,
+            **self.horizontal_unit.to_dict(),
             "transform": list(self.transform) if self.transform else None,
             "dimensions": {"width": self.width, "height": self.height},
+            "pixel_size_x_crs_units": self.pixel_size_x_crs_units,
+            "pixel_size_y_crs_units": self.pixel_size_y_crs_units,
+            # Metric spacing is null unless the horizontal unit is verified metre.
             "pixel_size_m": self.pixel_size_x_m,
             "pixel_size_x_m": self.pixel_size_x_m,
             "pixel_size_y_m": self.pixel_size_y_m,
@@ -152,13 +285,15 @@ def inspect_canonical_terrain(
                 transform=tuple(float(v) for v in tuple(transform)[:6]),
                 width=src.width,
                 height=src.height,
-                pixel_size_x_m=float(transform.a),
-                pixel_size_y_m=float(-transform.e),
+                # Raw affine spacing in CRS units; metres only via the verified factor (MAR-031A).
+                pixel_size_x_crs_units=float(transform.a),
+                pixel_size_y_crs_units=float(-transform.e),
                 bounds=tuple(float(v) for v in src.bounds),
                 nodata=src.nodata,
                 dtype=src.dtypes[0],
                 band_count=src.count,
                 color_interpretations=tuple(str(c) for c in src.colorinterp),
+                horizontal_unit=inspect_horizontal_linear_unit(crs),
                 tags={k: str(v) for k, v in src.tags().items()},
                 canonical_sha256=_sha256_of(path) if compute_sha256 else None,
             )
@@ -173,8 +308,8 @@ def inspect_canonical_terrain(
             transform=None,
             width=0,
             height=0,
-            pixel_size_x_m=None,
-            pixel_size_y_m=None,
+            pixel_size_x_crs_units=None,
+            pixel_size_y_crs_units=None,
             bounds=None,
             nodata=None,
             dtype=None,
@@ -209,8 +344,13 @@ def _raster_facts_for_intrinsic_readiness(
         crs_linear_units=facts.crs_linear_units,
         width=facts.width,
         height=facts.height,
-        pixel_size_x_m=facts.pixel_size_x_m,
-        pixel_size_y_m=facts.pixel_size_y_m,
+        # Delegation fidelity: the accepted MAR-020 callers (cli.py build-highres-terrain-poc and
+        # the project adapter) hand the raw affine spacing to RasterFacts.pixel_size_*_m. The
+        # intrinsic verdict must be exactly what accepted MAR-020 would say about this raster, so
+        # the same raw spacing is passed here. MAR-031A's metre requirement is enforced separately
+        # (and more strictly) by MAR-031's own integration check; it never mutates this verdict.
+        pixel_size_x_m=facts.pixel_size_x_crs_units,
+        pixel_size_y_m=facts.pixel_size_y_crs_units,
         bounds=facts.bounds,
         nodata_value=facts.nodata,
         vertical_datum=facts.tags.get("source_vertical_datum"),
@@ -242,6 +382,7 @@ def assess_terrain_screening_readiness(
             "status": contract.TERRAIN_SCREENING_NOT_READY,
             "reasons": reasons,
             "intrinsic_bathymetry_readiness": None,
+            "terrain_horizontal_crs_units": None,
         }
 
     if not facts.readable:
@@ -250,6 +391,7 @@ def assess_terrain_screening_readiness(
             "status": contract.TERRAIN_SCREENING_NOT_READY,
             "reasons": reasons,
             "intrinsic_bathymetry_readiness": None,
+            "terrain_horizontal_crs_units": None,
         }
 
     role = facts.tags.get("scientific_role")
@@ -264,14 +406,26 @@ def assess_terrain_screening_readiness(
             f"{contract.SOURCE_TERRAIN_LAYER_REQUIRED!r} (the raster is not the accepted canonical "
             "bed_elevation_m product; nothing is inferred from its values)"
         )
+    # MAR-031A: three INDEPENDENT integration findings (unit, geometry, rotation), each with its
+    # own controlled reason so readiness evidence stays machine-readable.
+    if not facts.horizontal_linear_unit_verified_metres:
+        reasons.append(
+            f"{contract.TERRAIN_HORIZONTAL_CRS_LINEAR_UNIT_NOT_METRE}: crs={facts.crs!r}, "
+            f"crs_is_geographic={facts.crs_is_geographic}, "
+            f"crs_linear_unit_name={facts.horizontal_unit.unit_name!r}, "
+            f"crs_linear_unit_to_m_factor={facts.horizontal_unit.to_metre_factor!r}, "
+            f"raw pixel spacing {facts.pixel_size_x_crs_units} x {facts.pixel_size_y_crs_units} "
+            f"CRS units ({facts.horizontal_unit.detail}); the raster is not reprojected, "
+            "resampled or unit-converted"
+        )
+    if not facts.pixels_square:
+        reasons.append(
+            f"{contract.TERRAIN_PIXELS_NOT_SQUARE_METRIC}: raw pixel spacing "
+            f"{facts.pixel_size_x_crs_units} x {facts.pixel_size_y_crs_units} CRS units is not "
+            "finite, positive and square"
+        )
     if facts.is_rotated:
         reasons.append(f"{contract.TERRAIN_ROTATED_GRID_UNSUPPORTED}: transform={facts.transform}")
-    if not facts.pixels_square_metric:
-        reasons.append(
-            f"{contract.TERRAIN_PIXELS_NOT_SQUARE_METRIC}: pixel size "
-            f"{facts.pixel_size_x_m} x {facts.pixel_size_y_m}, "
-            f"crs_is_geographic={facts.crs_is_geographic}"
-        )
 
     if band is not None:
         intrinsic_result = terrain_readiness.assess_bathymetry_readiness(
@@ -294,6 +448,18 @@ def assess_terrain_screening_readiness(
         "status": status,
         "reasons": reasons,
         "intrinsic_bathymetry_readiness": intrinsic,
+        # MAR-031A observed unit evidence (raw CRS-unit spacing vs metric spacing kept distinct).
+        "terrain_horizontal_crs_units": {
+            "crs": facts.crs,
+            "crs_is_geographic": facts.crs_is_geographic,
+            **facts.horizontal_unit.to_dict(),
+            "pixel_size_x_crs_units": facts.pixel_size_x_crs_units,
+            "pixel_size_y_crs_units": facts.pixel_size_y_crs_units,
+            "pixel_size_x_m": facts.pixel_size_x_m,
+            "pixel_size_y_m": facts.pixel_size_y_m,
+            "pixels_square": facts.pixels_square,
+            "grid_rotated": facts.is_rotated,
+        },
     }
 
 
@@ -527,6 +693,15 @@ def run_slope_instability_screening(
 
     if terrain_screening["status"] == contract.TERRAIN_SCREENING_READY:
         assert facts is not None and band is not None
+        # MAR-031A hard guard: terrain mathematics is reachable ONLY with a proven metre unit and
+        # a defined metric spacing. Fail before any slope/demand/FoS computation otherwise.
+        if not facts.horizontal_linear_unit_verified_metres or facts.pixel_size_x_m is None:
+            raise core.SlopeStabilityInputError(
+                f"{contract.TERRAIN_HORIZONTAL_CRS_LINEAR_UNIT_NOT_METRE}: refusing to treat raw "
+                f"CRS-unit spacing {facts.pixel_size_x_crs_units} as metres (unit "
+                f"{facts.horizontal_unit.unit_name!r}, factor "
+                f"{facts.horizontal_unit.to_metre_factor!r})"
+            )
         transform = facts.affine
         crs = facts.crs
         cell_size_m = float(facts.pixel_size_x_m)

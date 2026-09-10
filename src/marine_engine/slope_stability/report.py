@@ -94,7 +94,25 @@ def build_screening_metadata(
         "canonical_terrain_path": (terrain_facts or {}).get("path"),
         "canonical_terrain_sha256": (terrain_facts or {}).get("canonical_sha256"),
         "terrain_crs": (terrain_facts or {}).get("crs"),
+        # Metric resolution is null unless the horizontal CRS unit is verified metre (MAR-031A).
         "terrain_resolution_m": (terrain_facts or {}).get("pixel_size_m"),
+        "terrain_horizontal_crs_units": {
+            key: (terrain_facts or {}).get(key)
+            for key in (
+                "crs",
+                "crs_is_geographic",
+                "crs_is_projected",
+                "crs_linear_unit_name",
+                "crs_linear_unit_to_m_factor",
+                "pixel_size_x_crs_units",
+                "pixel_size_y_crs_units",
+                "pixel_size_x_m",
+                "pixel_size_y_m",
+                "horizontal_linear_unit_verified_metres",
+            )
+        }
+        if terrain_facts
+        else None,
         "terrain_dimensions": (terrain_facts or {}).get("dimensions"),
         "terrain_transform": (terrain_facts or {}).get("transform"),
         "terrain_vertical_datum": (terrain_facts or {}).get("source_vertical_datum"),
@@ -195,6 +213,8 @@ def build_screening_readiness(
             else contract.HIGH_RESOLUTION_CURRENT_SEABED_GEOMETRY_NOT_AVAILABLE
         ),
         "intrinsic_bathymetry_readiness": terrain_screening.get("intrinsic_bathymetry_readiness"),
+        # MAR-031A: observed horizontal CRS unit evidence (raw CRS-unit spacing vs metric spacing).
+        "terrain_horizontal_crs_units": terrain_screening.get("terrain_horizontal_crs_units"),
         "geotechnical_status": geotechnical_status,
         "geotechnical_reasons": geotechnical_reasons,
         "geotechnical_parameter_basis": (
@@ -228,6 +248,17 @@ def format_summary_lines(
     lines.append(f"  terrain_screening_status: {readiness['terrain_screening_status']}")
     for reason in readiness["terrain_screening_reasons"]:
         lines.append(f"    - {reason}")
+    units = readiness.get("terrain_horizontal_crs_units")
+    if units:
+        lines.append(
+            f"  terrain horizontal CRS unit: {units.get('crs')} / "
+            f"{units.get('crs_linear_unit_name')!r} (to-metre factor "
+            f"{units.get('crs_linear_unit_to_m_factor')!r}); raw spacing "
+            f"{units.get('pixel_size_x_crs_units')} x {units.get('pixel_size_y_crs_units')} "
+            f"CRS units; horizontal_linear_unit_verified_metres="
+            f"{str(units.get('horizontal_linear_unit_verified_metres')).lower()}; "
+            f"pixel_size_m={units.get('pixel_size_x_m')}"
+        )
     lines.append(
         "  pipeline_scale_slope_stability_terrain_readiness: "
         f"{readiness['pipeline_scale_slope_stability_terrain_readiness']}"

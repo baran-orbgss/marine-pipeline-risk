@@ -3270,3 +3270,111 @@ otherwise, never an interactive credential prompt.
   runout, debris-flow dynamics, pipeline impact loading, probabilistic landslide
   hazard, route suitability scoring, and any geotechnical-asset ingestion that
   would let a scenario be treated as measured site truth.
+- **MAR-031A (horizontal CRS linear-unit integrity repair for the MAR-031
+  slope-instability screening; `slope_stability/screening.py`,
+  `slope_stability/contract.py`, `slope_stability/report.py`).** Integration /
+  unit-contract repair, not a slope-science change: MAR-031 mechanics are
+  unchanged. Root cause: MAR-031's integration check treated "projected CRS" as
+  if it meant "projected METRE CRS" -- `inspect_canonical_terrain` stored the
+  raw affine spacing (`transform.a`, `-transform.e`) as `pixel_size_x_m` /
+  `pixel_size_y_m` before any unit was proven, `pixels_square_metric` only
+  required `crs_is_geographic is False`, and on `TERRAIN_SCREENING_READY` that
+  raw value was passed as `cell_size_m` into the accepted MAR-020
+  `compute_slope_aspect_deg`. A canonical raster with the correct MAR-020
+  role/layer tags, square unrotated pixels and a projected US-survey-foot or
+  international-foot CRS could therefore have been screened with a 10-foot
+  pixel silently interpreted as 10 m (instead of ~3.048 m), producing
+  physically mis-scaled slopes. MAR-031A prevents projected non-metre CRS
+  units from being interpreted as metres. The observed raster CRS is now
+  inspected semantically with `pyproj` (already a dependency): every
+  horizontal axis of the CRS must belong to a PROJECTED CRS and share one
+  linear unit whose unit-to-metre conversion factor is exactly 1.0 (absolute
+  tolerance 1e-12, i.e. only CRS-library floating precision; international
+  foot 0.3048, US survey foot 0.30480060960121924 and degree 0.01745 can never
+  pass; a geographic CRS with a factor-1.0 angular unit such as radian is still
+  rejected because it is not projected; a missing, unparseable or axis-less CRS
+  fails closed). No string matching on unit names decides anything. New
+  observed facts (`HorizontalLinearUnitFacts`, embedded in
+  `CanonicalTerrainFacts`) keep the RAW CRS-unit spacing
+  (`pixel_size_x_crs_units`, `pixel_size_y_crs_units`) structurally separate
+  from the METRIC spacing (`pixel_size_x_m`, `pixel_size_y_m`, `pixel_size_m`),
+  which are defined only once the unit is verified metre (raw spacing x 1.0)
+  and are otherwise `null` -- a 10-foot pixel is never serialized as a
+  10-metre pixel, and `terrain_resolution_m` in the metadata is `null` for a
+  non-metre terrain. `crs_linear_unit_name`, `crs_linear_unit_to_m_factor`,
+  `crs_is_projected`, `crs_is_geographic` and
+  `horizontal_linear_unit_verified_metres` (explicitly `false` for unsupported
+  or unknown units) are recorded in the terrain facts, in a new
+  `terrain_horizontal_crs_units` block of `slope_instability_readiness.json`
+  and `slope_instability_screening_metadata.json`, and on one console summary
+  line. Readiness now emits three INDEPENDENT controlled findings instead of
+  one overloaded reason: new
+  `TERRAIN_HORIZONTAL_CRS_LINEAR_UNIT_NOT_METRE` (unit; also the reason for a
+  geographic CRS), `TERRAIN_PIXELS_NOT_SQUARE_METRIC` (now pixel geometry
+  only: finite, positive, square in CRS units) and
+  `TERRAIN_ROTATED_GRID_UNSUPPORTED` (rotation). A projected non-metre
+  canonical terrain is `TERRAIN_SCREENING_NOT_READY` and fails BEFORE terrain
+  mathematics: no slope raster, no normalized-strength-demand raster, no FoS or
+  model-state raster, no scenario evaluation even when a scenario manifest is
+  supplied (a hard guard in `run_slope_instability_screening` additionally
+  raises `SlopeStabilityInputError` if the READY branch were ever entered
+  without a verified metre unit). No reprojection or unit conversion is
+  performed: the raster is never reprojected, resampled, transform-scaled or
+  copied, and a non-metre terrain requires a separately authorized future
+  conversion ticket. MAR-020 intrinsic readiness remains delegated and
+  unmutated: the accepted `assess_bathymetry_readiness` is still called with
+  the raw affine spacing exactly as MAR-020's own callers (`cli.py`,
+  `project/bathymetry_adapter.py`) pass it, so its verdict is what accepted
+  MAR-020 says about the raster (READY / READY_WITH_LIMITATIONS for a projected
+  foot raster) and is reported verbatim under `intrinsic_bathymetry_readiness`,
+  while MAR-031's stronger metre-specific requirement makes the effective
+  terrain screening NOT_READY -- intrinsic and effective conclusions stay
+  separately visible. `terrain/derivatives.py`, `terrain/readiness.py`,
+  `terrain/canonical.py`, `morphology/regional.py`, `slope_stability/core.py`
+  (the MAR-031 sin(alpha)cos(alpha) demand and scenario FoS equations),
+  `sediment/*`, `metocean/*`, `change/*`, `scour/*`, `burial/*`, `freespan/*`
+  and `project/*` are byte-identical to the MAR-031A canonical base (`core.py`
+  and `canonical.py` are newly pinned by content hash in the tests alongside
+  the existing MAR-031 pins); `cli.py` is unchanged. Tests: 22 added in
+  `tests/test_slope_stability.py` (98 in the module, up from 76): EPSG:32631
+  metre CRS passes with `horizontal_linear_unit_verified_metres = true`, unit
+  `metre`, factor 1.0 and 1 m pixel spacing (raw and metric); a REAL projected
+  US-survey-foot CRS (EPSG:2229) with correct MAR-020 tags, square unrotated
+  10-unit pixels is NOT_READY with `TERRAIN_HORIZONTAL_CRS_LINEAR_UNIT_NOT_METRE`
+  as the ONLY blocking reason while the delegated MAR-020 intrinsic verdict
+  still passes (the previously reachable failure, now rejected); a REAL
+  international-foot CRS (EPSG:2222, factor 0.3048) is NOT_READY; a non-metre
+  CRS never calls `compute_slope_aspect_deg`, never computes demand or FoS and
+  writes no GeoTIFF even with an explicit scenario; the raw foot spacing is
+  never serialized as metres (`pixel_size_*_m`, `pixel_size_m`,
+  `terrain_resolution_m` all `null`, raw 10.0 kept under `*_crs_units`);
+  unit name / factor recorded for metre, OSGB metre, ftUS, ft and degree CRSs
+  (parametrized); None / radian-geographic CRS fail closed; geographic CRS
+  NOT_READY; rotated metre grid NOT_READY for rotation only; non-square metre
+  grid NOT_READY for pixel geometry only (metric spacing 1 x 2 m still
+  defined); intrinsic MAR-020 verdict equals a direct call and is not mutated;
+  CLI reports the unit block and writes no products; MAR-031 formulas
+  re-asserted; no `reproject(` / `rasterio.warp` / `WarpedVRT` / `Resampling`
+  / `transform_bounds` identifier introduced. REAL Sheringham Shoal 2020
+  regression (cached MAR-020 canonical terrain only, SHA-256 `fc3f5c1d...`
+  unchanged, no download, no MAR-020 rerun): EPSG:32631, horizontal unit
+  `metre`, factor 1.0, `horizontal_linear_unit_verified_metres = true`,
+  raw and metric spacing 1.0 x 1.0, `TERRAIN_SCREENING_READY`, intrinsic
+  `READY_WITH_LIMITATIONS` (survey epoch) as before; 310 s; the 10 m and 50 m
+  slope and normalized-strength-demand GeoTIFFs are byte-identical to the
+  accepted MAR-031 outputs (SHA-256 `960ecc51...`, `c08194a7...`,
+  `8e79a662...`, `0624e0de...` unchanged) and every summary statistic is
+  identical (10 m: 75,984,140 valid, slope mean 0.3826, demand mean 0.006673;
+  50 m: 73,934,497 valid, slope mean 0.2424, demand mean 0.004230), so MAR-031
+  numerical results are unchanged; `terrain_resolution_m` remains 1.0.
+  REAL PL854 regression: unchanged --
+  `TERRAIN_SCREENING_NOT_READY` (`CANONICAL_TERRAIN_NOT_AVAILABLE`),
+  `REGIONAL_SLOPE_CONTEXT = AVAILABLE` / `REGIONAL_CONTEXT_ONLY`, never
+  promoted, `GEOTECHNICAL_STABILITY_NOT_EVALUABLE`,
+  `LOCAL_SLOPE_STABILITY_NOT_EVALUABLE`, `terrain_horizontal_crs_units = null`
+  (no terrain to inspect), no products. Summary: MAR-031 mechanics unchanged;
+  MAR-031A prevents projected non-metre CRS units from being interpreted as
+  metres; Sheringham results unchanged; no reprojection or unit conversion is
+  performed. Local verification: `uv lock --check` clean, repo-wide `ruff
+  format` / `ruff check` clean, offline suite 1775 passed (up from 1753), 3 skipped, 25 live deselected, `uv audit
+  --frozen` clean (87 packages). No further ticket has started.

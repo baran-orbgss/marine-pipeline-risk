@@ -17,6 +17,7 @@ import tokenize
 from pathlib import Path
 
 import numpy as np
+import pyproj
 import pytest
 import rasterio
 import yaml
@@ -103,8 +104,16 @@ def _synthetic_bed_elevation(height: int = 260, width: int = 240) -> np.ndarray:
     return bed
 
 
-def _write_canonical(study_dir: Path, bed: np.ndarray, *, tags: dict | None = None) -> Path:
-    transform = rasterio.Affine(CELL_M, 0.0, ORIGIN_X, 0.0, -CELL_M, ORIGIN_Y)
+def _write_canonical(
+    study_dir: Path,
+    bed: np.ndarray,
+    *,
+    tags: dict | None = None,
+    crs: str = CRS,
+    transform: rasterio.Affine | None = None,
+) -> Path:
+    if transform is None:
+        transform = rasterio.Affine(CELL_M, 0.0, ORIGIN_X, 0.0, -CELL_M, ORIGIN_Y)
     default_tags = {
         "product": "MAR-020 generic high-resolution seabed terrain POC",
         "scientific_role": contract.SOURCE_TERRAIN_ROLE_REQUIRED,
@@ -119,7 +128,7 @@ def _write_canonical(study_dir: Path, bed: np.ndarray, *, tags: dict | None = No
     return terrain_raster_io.write_terrain_raster(
         bed,
         transform,
-        CRS,
+        crs,
         study_dir / screening.TERRAIN_SUBDIR / contract.CANONICAL_TERRAIN_FILENAME,
         tags if tags is not None else default_tags,
     )
@@ -1067,3 +1076,391 @@ def test_K1_contract_records_equations_references_and_applicability(synthetic_st
         assert key in result.metadata, key
     assert result.metadata["terrain_crs"] == CRS
     assert result.metadata["terrain_resolution_m"] == CELL_M
+
+
+# --- MAR-031A: horizontal CRS linear-unit integrity -----------------------------------------------
+#
+# MAR-031 requires a projected METRE terrain CRS, but "projected" alone never proves "metre". These
+# tests build synthetic canonical rasters with the correct MAR-020 role/layer tags, square unrotated
+# pixels and a REAL projected foot CRS from PROJ, and prove that MAR-031A refuses to treat the raw
+# 10-foot spacing as 10 metres -- without reprojecting, resampling or converting anything.
+
+CRS_US_SURVEY_FOOT = "EPSG:2229"  # NAD83 / California zone 5 (ftUS)
+CRS_INTERNATIONAL_FOOT = "EPSG:2222"  # NAD83 / Arizona East (ft)
+CRS_GEOGRAPHIC = "EPSG:4326"
+FOOT_CELL = 10.0
+# Plausible projected coordinates for the foot CRSs (magnitudes MAR-020 accepts as projected).
+FOOT_ORIGIN_X, FOOT_ORIGIN_Y = 6_100_000.0, 1_900_000.0
+US_SURVEY_FOOT_TO_M = 1200.0 / 3937.0
+INTERNATIONAL_FOOT_TO_M = 0.3048
+
+
+def _write_foot_canonical(study_dir: Path, crs: str, cell: float = FOOT_CELL) -> Path:
+    transform = rasterio.Affine(cell, 0.0, FOOT_ORIGIN_X, 0.0, -cell, FOOT_ORIGIN_Y)
+    return _write_canonical(study_dir, _synthetic_bed_elevation(), crs=crs, transform=transform)
+
+
+def _unit_reasons(result) -> list[str]:
+    return [
+        r
+        for r in result.terrain_screening["reasons"]
+        if r.startswith(contract.TERRAIN_HORIZONTAL_CRS_LINEAR_UNIT_NOT_METRE)
+    ]
+
+
+def test_U01_metre_crs_passes_with_verified_horizontal_unit(synthetic_study: Path):
+    result = _run(synthetic_study)
+    assert result.terrain_screening["status"] == contract.TERRAIN_SCREENING_READY
+    assert _unit_reasons(result) == []
+    units = result.terrain_screening["terrain_horizontal_crs_units"]
+    assert units["crs"] == CRS
+    assert units["crs_is_geographic"] is False
+    assert units["crs_is_projected"] is True
+    assert units["horizontal_linear_unit_verified_metres"] is True
+    assert units["crs_linear_unit_name"] == "metre"
+    assert units["crs_linear_unit_to_m_factor"] == 1.0
+    assert result.readiness["terrain_horizontal_crs_units"] == units
+    assert result.metadata["terrain_horizontal_crs_units"]["horizontal_linear_unit_verified_metres"]
+
+
+def test_U02_metre_crs_still_reports_one_metre_pixel_spacing(synthetic_study: Path):
+    result = _run(synthetic_study)
+    facts = result.terrain_facts
+    assert facts.pixel_size_x_crs_units == CELL_M
+    assert facts.pixel_size_y_crs_units == CELL_M
+    assert facts.pixel_size_x_m == CELL_M
+    assert facts.pixel_size_y_m == CELL_M
+    assert facts.pixels_square and facts.pixels_square_metric
+    assert result.metadata["terrain_resolution_m"] == CELL_M
+    units = result.metadata["terrain_horizontal_crs_units"]
+    assert units["pixel_size_x_crs_units"] == CELL_M
+    assert units["pixel_size_x_m"] == CELL_M
+    assert units["pixel_size_y_m"] == CELL_M
+    assert [s["window_half_width_px"] for s in result.scale_results] == [10, 50]
+
+
+def test_U03_projected_us_survey_foot_crs_is_not_ready_even_though_mar020_passes(tmp_path: Path):
+    """The previously reachable failure: projected + correct MAR-020 tags + square unrotated pixels
+    + US survey feet. Accepted MAR-020 intrinsic readiness passes this raster (it only requires
+    'projected'); MAR-031A must still refuse it; the dedicated unit reason is the ONLY block."""
+
+    study_dir = tmp_path / "processed" / "ftus_site"
+    _write_foot_canonical(study_dir, CRS_US_SURVEY_FOOT)
+    result = _run(study_dir)
+
+    assert result.terrain_screening["status"] == contract.TERRAIN_SCREENING_NOT_READY
+    intrinsic = result.terrain_screening["intrinsic_bathymetry_readiness"]
+    assert intrinsic["status"] in ("READY", "READY_WITH_LIMITATIONS")  # MAR-020 alone would pass
+    blocking = [
+        r
+        for r in result.terrain_screening["reasons"]
+        if not r.startswith("intrinsic limitation")
+        and r != contract.HIGH_RESOLUTION_CURRENT_SEABED_GEOMETRY_NOT_AVAILABLE
+    ]
+    assert len(blocking) == 1
+    assert blocking[0].startswith(contract.TERRAIN_HORIZONTAL_CRS_LINEAR_UNIT_NOT_METRE)
+    assert "US survey foot" in blocking[0]
+    assert contract.TERRAIN_PIXELS_NOT_SQUARE_METRIC not in " ".join(blocking)
+    assert contract.TERRAIN_ROTATED_GRID_UNSUPPORTED not in " ".join(blocking)
+    assert result.readiness["pipeline_scale_slope_stability_terrain_readiness"] == "NOT_READY"
+    assert result.readiness["local_slope_stability_status"] == (
+        contract.LOCAL_SLOPE_STABILITY_NOT_EVALUABLE
+    )
+
+
+def test_U04_projected_international_foot_crs_is_not_ready(tmp_path: Path):
+    study_dir = tmp_path / "processed" / "ft_site"
+    _write_foot_canonical(study_dir, CRS_INTERNATIONAL_FOOT)
+    result = _run(study_dir)
+    assert result.terrain_screening["status"] == contract.TERRAIN_SCREENING_NOT_READY
+    [reason] = _unit_reasons(result)
+    assert "'foot'" in reason
+    units = result.terrain_screening["terrain_horizontal_crs_units"]
+    assert units["crs_linear_unit_name"] == "foot"
+    assert units["crs_linear_unit_to_m_factor"] == pytest.approx(INTERNATIONAL_FOOT_TO_M, abs=0.0)
+    assert units["horizontal_linear_unit_verified_metres"] is False
+    assert result.scale_results == []
+
+
+def test_U05_non_metre_crs_never_reaches_slope_demand_or_fos_even_with_a_scenario(
+    tmp_path: Path, monkeypatch
+):
+    study_dir = tmp_path / "processed" / "ftus_site"
+    _write_foot_canonical(study_dir, CRS_US_SURVEY_FOOT)
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("accepted MAR-020 compute_slope_aspect_deg was reached")
+
+    monkeypatch.setattr(screening.terrain_derivatives, "compute_slope_aspect_deg", _forbidden)
+    monkeypatch.setattr(
+        screening.core,
+        "compute_normalized_strength_demand",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("demand was computed")),
+    )
+    monkeypatch.setattr(
+        screening.core,
+        "compute_scenario_factor_of_safety",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("FoS was computed")),
+    )
+    result = _run(study_dir, scenarios=[_scenario()])
+
+    assert result.terrain_screening["status"] == contract.TERRAIN_SCREENING_NOT_READY
+    assert _unit_reasons(result)
+    assert result.scale_results == []
+    assert result.scenario_results == []
+    out_dir = study_dir / screening.SLOPE_STABILITY_SUBDIR
+    assert not list(out_dir.glob("*.tif"))
+    assert not list(out_dir.glob("normalized_strength_demand_*")), "no demand output"
+    assert not list(out_dir.glob("factor_of_safety_*")), "no FoS output"
+    assert not list(out_dir.glob("model_state_*"))
+    assert not any(
+        k.startswith(("slope_", "normalized_", "factor_", "model_")) for k in result.outputs
+    )
+    assert result.readiness["geotechnical_status"] == contract.GEOTECHNICAL_STABILITY_NOT_EVALUABLE
+    assert result.readiness["questions"]["factor_of_safety_evaluable"] is False
+    assert result.metadata["geotechnical_factor_of_safety_computed"] is False
+
+
+def test_U06_raw_foot_spacing_is_never_serialized_as_metres(tmp_path: Path):
+    study_dir = tmp_path / "processed" / "ftus_site"
+    _write_foot_canonical(study_dir, CRS_US_SURVEY_FOOT)
+    result = _run(study_dir)
+    facts = result.terrain_facts
+
+    assert facts.pixel_size_x_crs_units == FOOT_CELL
+    assert facts.pixel_size_y_crs_units == FOOT_CELL
+    assert facts.pixel_size_x_m is None
+    assert facts.pixel_size_y_m is None
+    assert facts.pixels_square is True  # geometry is fine ...
+    assert facts.pixels_square_metric is False  # ... but it is not metric
+    assert facts.horizontal_linear_unit_verified_metres is False
+
+    facts_doc = facts.to_dict()
+    assert facts_doc["pixel_size_x_crs_units"] == FOOT_CELL
+    assert facts_doc["pixel_size_m"] is None
+    assert facts_doc["pixel_size_x_m"] is None
+    assert facts_doc["pixel_size_y_m"] is None
+    assert facts_doc["crs_linear_unit_name"] == "US survey foot"
+    assert facts_doc["crs_linear_unit_to_m_factor"] == pytest.approx(US_SURVEY_FOOT_TO_M, rel=1e-12)
+    assert facts_doc["horizontal_linear_unit_verified_metres"] is False
+
+    # Serialized products on disk say the same thing.
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["terrain_resolution_m"] is None
+    units = metadata["terrain_horizontal_crs_units"]
+    assert units["pixel_size_x_crs_units"] == FOOT_CELL
+    assert units["pixel_size_x_m"] is None
+    assert units["pixel_size_y_m"] is None
+    assert units["horizontal_linear_unit_verified_metres"] is False
+    assert units["crs_linear_unit_name"] == "US survey foot"
+    readiness = json.loads(result.readiness_path.read_text(encoding="utf-8"))
+    r_units = readiness["terrain_horizontal_crs_units"]
+    assert r_units["horizontal_linear_unit_verified_metres"] is False
+    assert r_units["pixel_size_x_m"] is None
+    assert r_units["pixel_size_x_crs_units"] == FOOT_CELL
+    # The 10-foot pixel is nowhere described as a 10-metre pixel.
+    serialized = result.metadata_path.read_text(encoding="utf-8")
+    assert '"terrain_resolution_m": 10.0' not in serialized
+    assert '"pixel_size_x_m": 10.0' not in serialized
+
+
+def test_U07_geographic_crs_remains_not_ready_with_unit_reason(tmp_path: Path):
+    study_dir = tmp_path / "processed" / "geo_site"
+    transform = rasterio.Affine(1e-5, 0.0, 1.0, 0.0, -1e-5, 53.0)
+    _write_canonical(study_dir, _synthetic_bed_elevation(), crs=CRS_GEOGRAPHIC, transform=transform)
+    result = _run(study_dir)
+    assert result.terrain_screening["status"] == contract.TERRAIN_SCREENING_NOT_READY
+    [reason] = _unit_reasons(result)
+    assert "not projected" in reason
+    units = result.terrain_screening["terrain_horizontal_crs_units"]
+    assert units["crs_is_geographic"] is True
+    assert units["crs_is_projected"] is False
+    assert units["horizontal_linear_unit_verified_metres"] is False
+    assert units["pixel_size_x_m"] is None
+    assert result.scale_results == []
+
+
+def test_U08_rotated_metre_grid_is_independently_not_ready_for_rotation(tmp_path: Path):
+    study_dir = tmp_path / "processed" / "rotated_site"
+    transform = rasterio.Affine(CELL_M, 0.1, ORIGIN_X, 0.1, -CELL_M, ORIGIN_Y)
+    _write_canonical(study_dir, _synthetic_bed_elevation(), transform=transform)
+    result = _run(study_dir)
+    assert result.terrain_screening["status"] == contract.TERRAIN_SCREENING_NOT_READY
+    reasons = result.terrain_screening["reasons"]
+    assert any(r.startswith(contract.TERRAIN_ROTATED_GRID_UNSUPPORTED) for r in reasons)
+    assert _unit_reasons(result) == []  # the metre unit itself is fine
+    units = result.terrain_screening["terrain_horizontal_crs_units"]
+    assert units["horizontal_linear_unit_verified_metres"] is True
+    assert units["grid_rotated"] is True
+    assert result.scale_results == []
+
+
+def test_U09_non_square_metre_grid_is_independently_not_ready_for_pixel_geometry(tmp_path: Path):
+    study_dir = tmp_path / "processed" / "nonsquare_site"
+    transform = rasterio.Affine(CELL_M, 0.0, ORIGIN_X, 0.0, -2.0 * CELL_M, ORIGIN_Y)
+    _write_canonical(study_dir, _synthetic_bed_elevation(), transform=transform)
+    result = _run(study_dir)
+    assert result.terrain_screening["status"] == contract.TERRAIN_SCREENING_NOT_READY
+    reasons = result.terrain_screening["reasons"]
+    assert any(r.startswith(contract.TERRAIN_PIXELS_NOT_SQUARE_METRIC) for r in reasons)
+    assert not any(r.startswith(contract.TERRAIN_ROTATED_GRID_UNSUPPORTED) for r in reasons)
+    assert _unit_reasons(result) == []
+    units = result.terrain_screening["terrain_horizontal_crs_units"]
+    assert units["horizontal_linear_unit_verified_metres"] is True
+    assert units["pixels_square"] is False
+    assert units["pixel_size_x_m"] == CELL_M and units["pixel_size_y_m"] == 2.0 * CELL_M
+    assert result.scale_results == []
+
+
+@pytest.mark.parametrize(
+    "crs, expected_name, expected_factor, expected_verified",
+    [
+        (CRS, "metre", 1.0, True),
+        ("EPSG:27700", "metre", 1.0, True),
+        (CRS_US_SURVEY_FOOT, "US survey foot", US_SURVEY_FOOT_TO_M, False),
+        (CRS_INTERNATIONAL_FOOT, "foot", INTERNATIONAL_FOOT_TO_M, False),
+        (CRS_GEOGRAPHIC, "degree", math.radians(1.0), False),
+    ],
+)
+def test_U10_linear_unit_name_and_factor_are_recorded_semantically(
+    crs, expected_name, expected_factor, expected_verified
+):
+    facts = screening.inspect_horizontal_linear_unit(rasterio.crs.CRS.from_user_input(crs))
+    assert facts.unit_name == expected_name
+    assert facts.to_metre_factor == pytest.approx(expected_factor, rel=1e-12)
+    assert facts.verified_metres is expected_verified
+    assert facts.is_projected is (crs != CRS_GEOGRAPHIC)
+    doc = facts.to_dict()
+    assert doc["crs_linear_unit_name"] == expected_name
+    assert doc["horizontal_linear_unit_verified_metres"] is expected_verified
+
+
+def test_U10b_missing_or_unknown_unit_semantics_fail_closed():
+    none_facts = screening.inspect_horizontal_linear_unit(None)
+    assert none_facts.verified_metres is False
+    assert none_facts.unit_name is None and none_facts.to_metre_factor is None
+
+    # A geographic CRS whose axis factor happens to be 1.0 (radians) is still not a metre.
+    radians_wkt = (
+        pyproj.CRS.from_user_input(CRS_GEOGRAPHIC)
+        .to_wkt()
+        .replace('ANGLEUNIT["degree",0.0174532925199433]', 'ANGLEUNIT["radian",1]')
+    )
+    assert "radian" in radians_wkt
+    radian_facts = screening.inspect_horizontal_linear_unit(
+        rasterio.crs.CRS.from_user_input(radians_wkt)
+    )
+    assert radian_facts.to_metre_factor == 1.0
+    assert radian_facts.is_projected is False
+    assert radian_facts.verified_metres is False
+
+
+def test_U11_projected_status_alone_is_not_sufficient_to_claim_metric_terrain(tmp_path: Path):
+    """A frozen-facts proof independent of the raster: same geometry, same tags, only the unit
+    facts differ -> only the metre one is 'square metric'."""
+
+    study_dir = tmp_path / "processed" / "ftus_site"
+    path = _write_foot_canonical(study_dir, CRS_US_SURVEY_FOOT)
+    foot_facts = screening.inspect_canonical_terrain(path, compute_sha256=False)
+    assert foot_facts.crs_is_geographic is False  # projected ...
+    assert foot_facts.pixels_square is True
+    assert foot_facts.is_rotated is False
+    assert foot_facts.pixels_square_metric is False  # ... yet not metric
+    assert foot_facts.pixel_size_x_m is None
+    metre_facts = screening.inspect_canonical_terrain(
+        _write_canonical(tmp_path / "processed" / "m_site", _synthetic_bed_elevation()),
+        compute_sha256=False,
+    )
+    assert metre_facts.pixels_square_metric is True
+    assert metre_facts.pixel_size_x_m == CELL_M
+
+
+def test_U12_intrinsic_mar020_verdict_is_delegated_and_not_mutated_for_foot_crs(tmp_path: Path):
+    from marine_engine.terrain import readiness as terrain_readiness
+
+    study_dir = tmp_path / "processed" / "ftus_site"
+    path = _write_foot_canonical(study_dir, CRS_US_SURVEY_FOOT)
+    facts = screening.inspect_canonical_terrain(path)
+    band = screening.read_canonical_band(path)
+    direct = terrain_readiness.assess_bathymetry_readiness(
+        screening._raster_facts_for_intrinsic_readiness(facts, band)
+    ).to_dict()
+    result = screening.assess_terrain_screening_readiness(facts, band)
+    assert result["intrinsic_bathymetry_readiness"] == direct  # reported verbatim
+    assert result["status"] == contract.TERRAIN_SCREENING_NOT_READY  # MAR-031 stronger requirement
+    assert direct["status"] in ("READY", "READY_WITH_LIMITATIONS")
+
+
+def test_U13_cli_reports_unit_block_and_writes_no_products_for_foot_crs(tmp_path: Path, capsys):
+    config_path = _write_study_config(tmp_path, "FTUS_SITE")
+    _write_foot_canonical(tmp_path / "processed" / "ftus_site", CRS_US_SURVEY_FOOT)
+    manifest_path = _write_manifest(tmp_path / "scenarios.yaml", scales=[10.0])
+    assert (
+        cli.main(
+            [
+                "build-slope-instability-screening",
+                str(config_path),
+                "--scenario-manifest",
+                str(manifest_path),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "TERRAIN_SCREENING_NOT_READY" in out
+    assert contract.TERRAIN_HORIZONTAL_CRS_LINEAR_UNIT_NOT_METRE in out
+    assert "horizontal_linear_unit_verified_metres=false" in out
+    assert "REAL TERRAIN-DERIVED NORMALIZED STRENGTH DEMAND AVAILABLE? NO" in out
+    out_dir = tmp_path / "processed" / "ftus_site" / "slope_stability"
+    assert not list(out_dir.glob("*.tif"))
+    assert (out_dir / "slope_instability_readiness.json").exists()
+
+
+# MAR-031A pins: MAR-031 equations (core.py) and the accepted MAR-020 canonical module are
+# byte-identical to main @ 0f00285 (the MAR-031A canonical base). derivatives.py / readiness.py /
+# regional.py are already pinned above.
+MAR031A_PROTECTED_MODULE_SHA256 = {
+    "src/marine_engine/slope_stability/core.py": (
+        "e11c36ee4d85cebf620419c487f0a5fd633538aec2032f664eb43984f6ce3183"
+    ),
+    "src/marine_engine/terrain/canonical.py": (
+        "bd70073a75611e23dd1229c84cb815ca8bd49da33ef8434b9568afd4d1bd3486"
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "relative_path, expected_sha256", sorted(MAR031A_PROTECTED_MODULE_SHA256.items())
+)
+def test_U14_mar031_equations_and_mar020_canonical_module_are_byte_identical(
+    relative_path, expected_sha256
+):
+    content = (REPO_ROOT / relative_path).read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(content).hexdigest() == expected_sha256, relative_path
+
+
+def test_U15_normalized_demand_and_scenario_fos_formulas_unchanged():
+    alpha = np.radians(np.array([0.0, 10.0, 30.0, 45.0, 60.0]))
+    demand = core.compute_normalized_strength_demand(np.degrees(alpha))
+    np.testing.assert_array_equal(demand, np.sin(alpha) * np.cos(alpha))
+    fos = core.compute_scenario_factor_of_safety(np.array([[DEG30]]), _scenario())
+    assert fos.factor_of_safety[0, 0] == pytest.approx(1.0, abs=1e-12)
+    tau_expected = (
+        GAMMA_KN * 1000.0 * DEPTH_M * math.sin(math.radians(DEG30)) * math.cos(math.radians(DEG30))
+    )
+    assert fos.tau_driving_pa[0, 0] == pytest.approx(tau_expected, rel=1e-12)
+
+
+def test_U16_no_reprojection_conversion_or_transform_scaling_was_introduced():
+    code = _code_only_source(screening)
+    for forbidden in (
+        "reproject(",
+        "rasterio.warp",
+        "WarpedVRT",
+        "calculate_default_transform",
+        "transform_bounds",
+        "Resampling",
+    ):
+        assert forbidden not in code, forbidden
+    # The metre factor is applied only where it is exactly 1.0 (verified) -- never as a conversion.
+    assert "if not self.horizontal_unit.verified_metres" in code
