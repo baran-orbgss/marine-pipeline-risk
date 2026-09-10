@@ -3378,3 +3378,114 @@ otherwise, never an interactive credential prompt.
   performed. Local verification: `uv lock --check` clean, repo-wide `ruff
   format` / `ruff check` clean, offline suite 1775 passed (up from 1753), 3 skipped, 25 live deselected, `uv audit
   --frozen` clean (87 packages). No further ticket has started.
+- **MAR-032 (generic offshore CPT/CPTU evidence & liquefaction-INPUT readiness
+  POC; new `geotechnical/` package -- `cpt_contract.py`, `cpt_inventory.py`,
+  `cpt_profile.py`, `cpt_readiness.py`, `manifest.py`, `evidence_build.py`,
+  `report.py`; new `providers/geotechnical/sheringham_2008_cptu.py`; new
+  `project/cpt_adapter.py`; `configs/geotechnical/sheringham_shoal_2008_cptu.yaml`;
+  CLI `build-cpt-evidence-poc`).** Real offshore CPT/CPTU source evidence
+  introduced and a generic CPT evidence/readiness contract defined; NO
+  liquefaction physics: no CSR, CRR, factor of safety, probability, LPI,
+  settlement, lateral spreading, post-liquefaction strength, pipeline flotation
+  or wave-induced pore pressure is computed, and the earthquake-induced and
+  wave/current-induced seabed liquefaction mechanisms are reported as SEPARATE
+  blocks (`WAVE_INDUCED_LIQUEFACTION_MODELLED = false`). Real source: The
+  Crown Estate Marine Data Exchange series TCE-1964, "2008, GEO, Sheringham
+  Shoal, Cone Penetration Test Geotechnical Investigation"
+  (`marinedataexchange.co.uk/details/1964/summary`; publisher The Crown
+  Estate; contractor GEO for Scira Offshore Energy; collection 29 Sep - 16 Oct
+  2008; source-declared "101 continuous CPTs (CPTU) in 86 locations" recorded
+  as a DECLARATION, never enforced as a parsed count). Package URLs were
+  resolved from the series page's own "Download Dataset" anchor-click targets
+  (never guessed): the CPT dataset package
+  `122-1964-Cone PenetrationTests Logs.zip` (2,658,522 B, SHA-256
+  `e55e1375...`) and the associated Part B (Geotechnical Data) / Part C (Field
+  Operations) report package (34,642,187 B, SHA-256 `9df9479f...`), both saved
+  unaltered under `data/raw/geotechnical/sheringham_shoal_2008_cptu/` with
+  JSON sidecars (HTTP status/Content-Length/ETag/Last-Modified recorded;
+  reruns are offline cache hits with SHA-256 re-verified). Machine-readable
+  availability was determined from actual bytes: recursive inventory of 106
+  files (magic-byte content type, SHA-256, evidence-based role) found 100
+  GEO-format CPT CSVs (`CPT-<id>.csv`, ISO-8859, CRLF, semicolon-delimited:
+  7 header lines, column row `Scan#;Depth;Tip;Sleeve;Pore;Incl;Time;`, unit
+  row `#;m.;MPa;MPa;MPa;deg;`), 2 MEDIN/report metadata XMLs, 2 tiny text
+  files and 2 PDFs (documentary; never OCR'd or digitized). So the real
+  answer is DOCUMENTARY_CPT_EVIDENCE_AVAILABLE = true AND
+  DIGITAL_NUMERIC_CPT_PROFILE_READY = true. Canonical profile
+  (`MEASURED_CPT_CPTU_PROFILE`, `cpt_measurements.parquet`): 138,514 rows, 100
+  tests, identity (`source_id`, `test_id`, `observation_index` = Scan#) plus
+  depth; channels `qc_mpa` (Tip, MPa; Part B: "qc is the measured cone
+  resistance"), `fs_kpa` (Sleeve, MPa x1000), `u2_kpa` (Pore, MPa x1000; Part
+  C: "single filter located just behind the cone tip"), `qt_mpa` = null
+  everywhere (the source's qt exists only in its PDF plots via qt = qc + (1 -
+  a)u, a = 0.75 -- recorded as source-stated, NOT applied; qc is never copied
+  into qt), inclination and time preserved raw (`raw__Incl` deg; `raw__Time`
+  unit not stated -> unresolved). Depth reference established from the source
+  itself (Part B: "Start of test (depth 0 m) is defined as the interface
+  between the rig bottom plate and the seabed") -> `DEPTH_BELOW_SEABED`,
+  `depth_bsf_m` -0.9471 to 39.9906 m; 4,169 negative-depth rows (cone still
+  inside the rig) preserved, never removed; the header `Depth ;15.70` field is
+  kept raw with UNRESOLVED semantics. Coordinates preserved from each CSV
+  header (`WGS 84;UTM;31`, 100 tests) and the user-declared `EPSG:32631` is
+  accepted only because the provider verifies it is semantically the
+  source-stated WGS 84 / UTM zone 31N (Part C geodetic block: false northing
+  0.00) -- no UTM-by-location inference, no reprojection; `cpt_locations.gpkg`
+  (100 points, EPSG:32631, x 371,996-380,442, y 5,884,678-5,892,955);
+  `location_id` = null (86 locations declared, none identified per test).
+  QA reports, never repairs: 0 duplicate observation identities, 4 rows
+  sharing a depth value with different readings (kept), 2 depth-order
+  violations (kept), no smoothing/interpolation/despiking/resampling (raw
+  extremes such as u2 -31,578 kPa and inclination 95.87 deg are preserved as
+  read). Real CPT evidence readiness: `READY_WITH_LIMITATIONS` (limitations:
+  101 declared vs 100 parsed tests -- report test F3A has no CSV in the
+  package; 4 shared-depth rows; 2 depth-order violations; qt not provided;
+  `raw__Time` unit not stated). Liquefaction-INPUT readiness
+  (`LIQUEFACTION_INPUT_READINESS_ASSESSMENT`): earthquake
+  `EARTHQUAKE_LIQUEFACTION_TRIGGERING_NOT_EVALUABLE` (present: profile, depth
+  below seabed, qc, fs, u2, source-stated cone area ratio; missing: soil unit
+  weight / stress state, total and effective vertical stress basis, PGA,
+  magnitude; stress-reduction method NOT_AUTHORIZED) and wave
+  `WAVE_INDUCED_LIQUEFACTION_NOT_EVALUABLE` (missing: wave forcing, water
+  depth, soil hydraulic and compressibility/stiffness properties, initial
+  effective stress state, pore-pressure response parameters -- accepted
+  MAR-009/011/012 forcing is NOT assumed sufficient). Surface sediment is not
+  substituted for geotechnical data: MAR-008 Folk/PSA/D50 and MAR-013 mobility
+  are context only and cannot produce LIQUEFIABLE/CRR/relative density/CPT or
+  SPT resistance. PL854 remains not evaluable: `CPT_GEOTECHNICAL_PROFILE =
+  NOT_AVAILABLE`, `EARTHQUAKE_LIQUEFACTION_TRIGGERING = NOT_EVALUABLE`,
+  `WAVE_INDUCED_LIQUEFACTION = NOT_EVALUABLE`, no route-wide classification.
+  Project integration (narrow): `CPT` moved into
+  `CATEGORIES_WITH_READINESS_ADAPTERS`; `registry._register_cpt` inspects the
+  registered file's bytes (`project/cpt_adapter.py`) and DELEGATES to
+  `geotechnical.cpt_readiness.assess_cpt_readiness` -- a stub/unknown file or
+  a PDF is REGISTERED but `NOT_READY` (DIGITAL_PROFILE blocking), a canonical
+  measurements parquet is assessed from its QA; evidence roles untouched,
+  MAR-026/026A intrinsic/effective semantics unchanged (the MAR-027 stub test
+  that used `CPT` as a no-adapter category now uses `BOREHOLE`). References
+  recorded as future-method context only (Youd et al. 2001; Boulanger & Idriss
+  2014; Robertson & Wride 1998; Jeng 2001) and Le et al. 2014 as literature
+  context (no paper value copied into any measurement). Protected MAR-031/031A
+  slope, sediment and metocean modules unchanged (`git diff` empty). Tests:
+  new `tests/test_cpt_evidence.py` (42 tests, offline, synthetic
+  `SYNTHETIC_TEST_FIXTURE` GEO-format packages served through a monkeypatched
+  HTTP layer) covering the Section 32 matrix: exact source identity, declared
+  101/86 recorded not enforced, SHA-256 + HTTP evidence, deterministic
+  inventory, cache reuse with zero network calls, tampered-cache refusal, only
+  intercepted URLs requested, PDF/PNG/TIFF/JPEG documentary even when named
+  `.csv`, no OCR/image dependency, explicit unit conversion, unknown unit ->
+  null, depth reference required, qc/qt/fs/u2 distinct, duplicate-identity
+  blocking vs shared-depth limitation, no interpolation/smoothing/resampling/
+  despiking (spike and gap survive; source scan), determinism, missing
+  coordinates stay missing, no declared CRS -> unresolved and no layer,
+  EPSG:32632 / ED50 / EPSG:4326 declared -> conflict and NOT_READY, no
+  sediment/metocean coupling, no CSR/CRR/FoS/LPI definitions, earthquake
+  block itemizes missing PGA/magnitude/stress state, wave block separate and
+  still NOT_EVALUABLE with all evidence flags set, CPT stub/PDF/parquet
+  registration outcomes with explicit delegation spy, evidence role
+  preserved, documentary-only package writes readiness but no measurements,
+  strict manifest schema, CLI end-to-end and idempotent. Local verification:
+  `uv lock --check` clean, repo-wide `ruff format` / `ruff check` clean,
+  offline suite 1816 passed (up from 1775), 4 skipped, 25 live deselected,
+  `uv audit --frozen` clean (87 packages); real Sheringham build 13 s
+  (network) then offline cache rerun; every JSON/Parquet/GPKG output inspected
+  directly. No further ticket has started.

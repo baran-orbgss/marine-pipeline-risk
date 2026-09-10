@@ -18,19 +18,23 @@ DERIVED = "DERIVED"
 EVIDENCE_ROLES = frozenset({PROJECT_GEOMETRY, MEASURED, SOURCE_INTERPRETED, DERIVED})
 
 # --- Section 7: asset category vocabulary -------------------------------------------------------
-# Only these three have a real readiness adapter in MAR-026.
+# Only these three had a real readiness adapter in MAR-026. MAR-032 adds a fourth, `CPT`, which
+# delegates to `marine_engine.geotechnical.cpt_readiness.assess_cpt_readiness` and can never be
+# READY merely because a file exists (a documentary or unrecognised file is BLOCKING).
 
 PIPELINE_ROUTE = "PIPELINE_ROUTE"
 BATHYMETRY_RASTER = "BATHYMETRY_RASTER"
 BURIAL_PROFILE = "BURIAL_PROFILE"
+CPT = "CPT"
 
-CATEGORIES_WITH_READINESS_ADAPTERS = frozenset({PIPELINE_ROUTE, BATHYMETRY_RASTER, BURIAL_PROFILE})
+CATEGORIES_WITH_READINESS_ADAPTERS = frozenset(
+    {PIPELINE_ROUTE, BATHYMETRY_RASTER, BURIAL_PROFILE, CPT}
+)
 
 # Forward-compatible vocabulary: registrable (identity + provenance recorded) but with no
 # scientific interpretation implemented in MAR-026 -- see REGISTERED_READINESS_NOT_IMPLEMENTED.
 METOCEAN = "METOCEAN"
 SEDIMENT_SAMPLE = "SEDIMENT_SAMPLE"
-CPT = "CPT"
 BOREHOLE = "BOREHOLE"
 FREESPAN_OBSERVATION = "FREESPAN_OBSERVATION"
 SHALLOW_GAS_INTERPRETATION = "SHALLOW_GAS_INTERPRETATION"
@@ -44,7 +48,6 @@ FUTURE_CATEGORIES_WITHOUT_ADAPTERS = frozenset(
     {
         METOCEAN,
         SEDIMENT_SAMPLE,
-        CPT,
         BOREHOLE,
         FREESPAN_OBSERVATION,
         SHALLOW_GAS_INTERPRETATION,

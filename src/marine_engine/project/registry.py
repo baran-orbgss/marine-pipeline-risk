@@ -41,10 +41,12 @@ from pyproj import CRS
 from pyproj.exceptions import CRSError
 
 from marine_engine.burial import readiness as burial_readiness
-from marine_engine.project import bathymetry_adapter, burial_adapter, route_adapter
+from marine_engine.geotechnical import cpt_readiness
+from marine_engine.project import bathymetry_adapter, burial_adapter, cpt_adapter, route_adapter
 from marine_engine.project.categories import (
     BATHYMETRY_RASTER,
     BURIAL_PROFILE,
+    CPT,
     PIPELINE_ROUTE,
     REGISTERED_READINESS_NOT_IMPLEMENTED,
 )
@@ -421,6 +423,61 @@ def _register_burial(
     return AssetRegistrationResult(registration=registration, burial_table_df=df)
 
 
+def _register_cpt(
+    asset: AssetEntry,
+    resolved_path: Path,
+    byte_size: int,
+    sha256: str,
+    provenance_declared: dict[str, Any],
+) -> AssetRegistrationResult:
+    """MAR-032 Section 25: inspect the registered CPT file's real bytes (`cpt_adapter`) and
+    DELEGATE to the generic `geotechnical.cpt_readiness.assess_cpt_readiness`. A documentary or
+    unrecognised file is registered but BLOCKING on `DIGITAL_PROFILE`, so path existence alone
+    can never yield READY. The declared evidence role is passed through untouched."""
+
+    try:
+        facts, observed_facts = cpt_adapter.inspect_cpt_asset(resolved_path)
+    except cpt_adapter.CptAssetLoadError as exc:
+        return _failed_registration(
+            asset,
+            resolved_path=resolved_path,
+            byte_size=byte_size,
+            sha256=sha256,
+            detail=str(exc),
+            provenance_declared=provenance_declared,
+        )
+
+    result = cpt_readiness.assess_cpt_readiness(facts)
+    observed_facts = {
+        **observed_facts,
+        "machine_readable_cpt_profile_available": facts.machine_readable_profile_available,
+        "canonical_profile_created": facts.canonical_profile_created,
+        "row_count": facts.row_count,
+        "depth_reference": facts.depth_reference,
+        "notes": list(facts.notes),
+    }
+    registration = AssetRegistration(
+        asset_id=asset.asset_id,
+        category=asset.category,
+        evidence_role=asset.evidence_role,
+        resolved_path=str(resolved_path),
+        filename=resolved_path.name,
+        byte_size=byte_size,
+        sha256=sha256,
+        registration_status=REGISTERED,
+        registration_detail=(
+            "CPT asset inspected; readiness delegated to geotechnical.cpt_readiness"
+        ),
+        provenance_declared=provenance_declared,
+        observed_facts=observed_facts,
+        conflicts=[],
+        readiness_status_intrinsic=result.status,
+        readiness_status_effective=_effective_readiness_status(result.status, []),
+        readiness_result=result.to_dict(),
+    )
+    return AssetRegistrationResult(registration=registration)
+
+
 def register_asset(
     asset: AssetEntry, *, manifest_dir: Path, working_crs: str
 ) -> AssetRegistrationResult:
@@ -458,6 +515,10 @@ def register_asset(
         )
     if asset.category == BURIAL_PROFILE:
         return _register_burial(
+            asset, identity.resolved_path, identity.byte_size, identity.sha256, provenance_declared
+        )
+    if asset.category == CPT:
+        return _register_cpt(
             asset, identity.resolved_path, identity.byte_size, identity.sha256, provenance_declared
         )
 

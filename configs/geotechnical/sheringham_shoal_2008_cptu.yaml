@@ -1,0 +1,32 @@
+# MAR-032 -- generic offshore CPT/CPTU evidence & liquefaction-INPUT readiness POC.
+#
+# Typed, source-specific CPT evidence manifest (marine_engine.geotechnical.manifest).
+# Deliberately NOT part of the generic study config or the generic project manifest.
+#
+# Real public source: The Crown Estate Marine Data Exchange series TCE-1964,
+# "2008, GEO, Sheringham Shoal, Cone Penetration Test Geotechnical Investigation"
+# https://www.marinedataexchange.co.uk/details/1964/summary
+#
+# This build acquires, inventories and normalizes CPT/CPTU EVIDENCE. It computes no CSR, CRR,
+# factor of safety, probability, LPI, settlement, lateral spreading or wave-induced pore pressure.
+
+evidence_id: sheringham_shoal_2008_cptu
+
+source:
+  provider: sheringham_shoal_2008_cptu
+  # The associated Part B / Part C report package is required to establish the depth reference,
+  # the qc / fs / u2 channel semantics and the coordinate system statement (all quoted in the
+  # provider). It is documentary: nothing in it is OCR'd or digitized.
+  acquire_reports_package: true
+
+paths:
+  raw_dir: data/raw/geotechnical/sheringham_shoal_2008_cptu
+  interim_dir: data/interim/sheringham_shoal_2008_cptu
+  processed_dir: data/processed/sheringham_shoal_2008_cptu
+
+declared:
+  # USER-declared CRS for the test positions. The source itself states "UTM 31 / WGS 84" with
+  # false northing 0.00 (northern hemisphere). This declaration is accepted as the resolved CRS
+  # only because the provider verifies it is semantically that same system (projected, UTM zone
+  # 31N, WGS 84 datum); it never overrides or reprojects the source coordinates.
+  coordinate_crs: EPSG:32631

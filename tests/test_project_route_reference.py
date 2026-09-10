@@ -1018,31 +1018,34 @@ def test_failed_registration_with_relationship_is_unresolved(tmp_path: Path):
 
 
 def test_future_category_with_relationship_is_linked_with_limitations_only(tmp_path: Path):
+    # MAR-032 gave `CPT` a readiness adapter, so this MAR-027 invariant is exercised with
+    # `BOREHOLE`, which still has none -- the intent (a future category with a declared route
+    # relationship is linked with limitations only) is unchanged.
     _write_route_gpkg(tmp_path / "route_a.gpkg")
-    (tmp_path / "cpt.txt").write_text("stub", encoding="utf-8")
+    (tmp_path / "bh.txt").write_text("stub", encoding="utf-8")
     manifest_path = _write_manifest(
         tmp_path,
         _manifest_yaml(
             ROUTE_A_YAML
-            + """  - asset_id: cpt_001
-    category: CPT
+            + """  - asset_id: bh_001
+    category: BOREHOLE
     evidence_role: MEASURED
-    path: ./cpt.txt
+    path: ./bh.txt
     route_relationship:
       route_asset_id: route_a
       relationship_type: ROUTE_REFERENCED
     provenance:
-      source_name: CPT campaign
+      source_name: Borehole campaign
 """,
             primary_route="route_a",
             interval_m=25.0,
         ),
     )
     _m, _summary, model = _build(manifest_path)
-    cpt = next(link for link in model.asset_linkages if link.asset_id == "cpt_001")
-    assert cpt.readiness_status_effective == categories.REGISTERED_READINESS_NOT_IMPLEMENTED
-    assert cpt.route_linkage_status == project_model.LINKED_WITH_LIMITATIONS
-    assert any("no category-specific" in f for f in cpt.route_linkage_findings)
+    bh = next(link for link in model.asset_linkages if link.asset_id == "bh_001")
+    assert bh.readiness_status_effective == categories.REGISTERED_READINESS_NOT_IMPLEMENTED
+    assert bh.route_linkage_status == project_model.LINKED_WITH_LIMITATIONS
+    assert any("no category-specific" in f for f in bh.route_linkage_findings)
 
 
 # --- Section 19: raster extent facts are never valid-data coverage ------------------------------

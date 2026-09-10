@@ -61,6 +61,9 @@ from marine_engine.freespan import report as fs_report
 from marine_engine.freespan import structural_handoff as fs_structural_handoff
 from marine_engine.freespan import support_state as fs_support_state
 from marine_engine.freespan import synthetic as fs_synthetic
+from marine_engine.geotechnical import evidence_build as cpt_evidence_build
+from marine_engine.geotechnical import manifest as cpt_manifest
+from marine_engine.geotechnical import report as cpt_report
 from marine_engine.metocean import (
     combined_bed_shear,
     combined_bed_shear_map,
@@ -11130,6 +11133,40 @@ def _cmd_build_slope_instability_screening(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_cpt_evidence_poc(args: argparse.Namespace) -> int:
+    """MAR-032: generic offshore CPT/CPTU evidence & liquefaction-INPUT
+    readiness POC. Resolves/caches the official source package, inventories
+    every file from its real bytes, parses ONLY defensibly machine-readable
+    numeric profiles through the source-specific reader, normalizes them into
+    the canonical CPT contract (qc != qt; unknown unit -> null; unresolved
+    depth reference -> null) and reports explicit non-numeric readiness plus
+    separate earthquake- and wave-liquefaction INPUT readiness. Computes no
+    CSR/CRR/FoS/probability/LPI/settlement/lateral spreading/pore pressure.
+    PDF/image logs are never OCR'd or digitized.
+    """
+
+    try:
+        manifest = cpt_manifest.load_cpt_evidence_manifest(args.manifest)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: CPT evidence manifest {args.manifest} rejected: {exc}")
+        return 1
+    try:
+        result = cpt_evidence_build.run_cpt_evidence_build(
+            manifest, log=lambda message: print(message, flush=True)
+        )
+    except (ValueError, OSError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    print()
+    for line in cpt_report.format_summary_lines(result):
+        print(line)
+    print()
+    for line in cpt_report.format_acceptance_lines(result):
+        print(line)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -11702,6 +11739,27 @@ def build_parser() -> argparse.ArgumentParser:
     build_slope_instability_screening_parser.set_defaults(
         func=_cmd_build_slope_instability_screening
     )
+
+    build_cpt_evidence_poc_parser = subparsers.add_parser(
+        "build-cpt-evidence-poc",
+        help=(
+            "MAR-032: generic offshore CPT/CPTU evidence & liquefaction-INPUT readiness POC. "
+            "Reads a typed CPT evidence manifest (configs/geotechnical/*.yaml), acquires or "
+            "reuses the cached official source package(s), inventories every file from its real "
+            "bytes (SHA-256, content type, evidence-based role), parses ONLY defensibly "
+            "machine-readable numeric CPT/CPTU profiles via the source-specific reader, "
+            "normalizes them into the canonical contract (qc never becomes qt; unknown units -> "
+            "null; unresolved depth reference -> null; coordinates preserved, CRS never guessed) "
+            "and writes explicit non-numeric CPT readiness plus SEPARATE earthquake- and wave-"
+            "liquefaction INPUT readiness under interim/ and processed/. PDF/image logs are "
+            "documentary and never OCR'd or digitized. No CSR, CRR, factor of safety, "
+            "probability, LPI, settlement, lateral spreading or wave pore pressure is computed."
+        ),
+    )
+    build_cpt_evidence_poc_parser.add_argument(
+        "manifest", type=Path, help="Path to a typed CPT evidence manifest YAML file."
+    )
+    build_cpt_evidence_poc_parser.set_defaults(func=_cmd_build_cpt_evidence_poc)
 
     return parser
 
