@@ -3105,3 +3105,168 @@ otherwise, never an interactive credential prompt.
   clean, offline suite 1677 passed (up from 1633), 3 skipped, 25 live
   deselected, `uv audit --frozen` clean (87 packages). No further ticket
   has started.
+- **MAR-031 (generic submarine slope-instability screening POC,
+  `src/marine_engine/slope_stability/`, `build-slope-instability-screening`).**
+  First slope-instability capability, built as TWO strictly separated levels
+  that are never conflated. (A) Terrain / geometric predisposition from real
+  bathymetry: the accepted MAR-020 canonical `bed_elevation_m` raster is read
+  read-only, slope is computed by calling the accepted MAR-020
+  `terrain.derivatives.compute_slope_aspect_deg` unchanged at two INDEPENDENT
+  scales (10 m engineering, 50 m intermediate -- never averaged, never combined
+  by maximum, neither selected as "the" landslide scale;
+  `SLOPE_SCALE_SENSITIVITY_NOT_FAILURE_SURFACE_SCALE`), and the canonical
+  terrain-derived product `normalized_undrained_strength_demand =
+  sin(alpha) * cos(alpha)` (dimensionless, scientific role
+  `UNDRAINED_INFINITE_SLOPE_NORMALIZED_STRENGTH_DEMAND`) is derived from the
+  undrained translational infinite-slope idealization `FS = s_u /
+  (gamma_prime * z * sin(alpha) * cos(alpha))` (Baeten et al. 2014) by setting
+  `N_u = s_u / (gamma_prime * z)` and FS = 1: it is the normalized undrained
+  strength ratio REQUIRED for limit equilibrium under the simplified geometry --
+  not actual soil strength, not a factor of safety, not a probability, not a
+  susceptibility score, not a landslide risk. (B) Optional geotechnical
+  scenario: a factor of safety `FS = s_u / tau_d`, `tau_d = gamma_prime * z *
+  sin(alpha) * cos(alpha)` (SI internally; kPa / kN/m3 inputs converted
+  explicitly once) is computed ONLY when a separate typed Pydantic scenario
+  manifest (`slope_stability/manifest.py`, `--scenario-manifest`; deliberately
+  outside the generic `ProjectManifest`) supplies explicit scenarios whose
+  `material_model` must be `COHESIVE_UNDRAINED_TRANSLATIONAL_INFINITE_SLOPE`
+  and whose `parameter_basis` must be `USER_DECLARED_HYPOTHETICAL_SCENARIO`
+  (both required, no defaults); `undrained_shear_strength_kpa`,
+  `submerged_unit_weight_kn_m3` and `slip_surface_depth_m` must be finite and
+  > 0 (zero / negative / NaN / infinity rejected at parse time and again in
+  `core.UndrainedInfiniteSlopeScenario`; no clipping, no defaults, nothing
+  inferred from literature, BGS Folk class, sand/mud/gravel percentage, nearest
+  PSA sample, morphology or water depth). There is NO built-in soil scenario.
+  Every scenario output (`factor_of_safety_<scenario_id>_<scale>m.tif`,
+  int8 `model_state_<scenario_id>_<scale>m.tif` with an embedded code legend,
+  metadata) carries `scenario_id`, `parameter_basis`, `material_model` and the
+  disclaimer `USER_DECLARED_HYPOTHETICAL_SCENARIO -- NOT_SITE_SPECIFIC_MEASUREMENT`.
+  At exactly zero slope the idealized driving shear is 0 and the FS is null
+  (`NO_DOWNSLOPE_GRAVITATIONAL_DRIVING_SHEAR`); infinity is never written and
+  no minimum slope threshold exists, so a very small finite slope legitimately
+  yields a very large finite FS. Model states are descriptive only
+  (`MODEL_FS_BELOW_1` / `MODEL_FS_AT_1` / `MODEL_FS_ABOVE_1` /
+  `NO_DOWNSLOPE_GRAVITATIONAL_DRIVING_SHEAR` / `NOT_EVALUABLE`; FS = 1 is the
+  mechanical limit-equilibrium boundary, `AT_1` uses a pure floating-point
+  tolerance): no safe/unsafe or low/high verdicts, no design factor such as
+  FS >= 1.5, no LOW/MODERATE/HIGH/CRITICAL slope class, no universal critical
+  slope angle, no weighted overlay, no statistical or quantile susceptibility.
+  Hydrostatic water pressure is represented through submerged unit weight;
+  excess pore pressure generation / dissipation is NOT MODELLED (and its
+  absence is never treated as "excess pore pressure = 0 measured"); earthquake,
+  wave, toe-erosion, rapid-sedimentation and gas triggers, progressive /
+  retrogressive failure, liquefaction, runout, slide volume / velocity, pipeline
+  impact force / displacement, tsunami, landslide probability and any risk score
+  are NOT modelled -- every `*_modelled` / `*_computed` flag in the metadata and
+  readiness JSON is asserted `false` from `contract.NOT_MODELLED_FLAGS`, and a
+  missing trigger model is never translated into "trigger absent"
+  (`TRIGGER_RESPONSE_NOT_MODELLED`). Model applicability (thin translational
+  slab, slip surface approximately parallel to the seabed, cohesive sediment,
+  undrained total-stress, static gravitational loading; not automatically
+  applicable to drained sand, rock, rotational / deep-seated, weak-layer
+  propagation, retrogressive, sensitive-clay post-failure, liquefaction, debris
+  flow, turbidity current), the four literature references (Masson et al. 2006
+  doi 10.1098/rsta.2006.1810; Locat & Lee 2002 doi 10.1139/t01-089; Kvalstad et
+  al. 2005 doi 10.1016/j.marpetgeo.2004.10.019 -- Storegga parameters are NOT
+  copied to any site; Baeten et al. 2014 doi 10.1002/2013JF003068, who state the
+  simple infinite-slope model does not determine runout, spreading, mass-flow
+  dynamics or disintegration) and ten limitations are recorded in
+  `slope_instability_contract.json` and `slope_instability_screening_metadata.json`.
+  Readiness (`slope_instability_readiness.json`) answers four separate
+  questions with explicit vocabularies and no percentage:
+  `TERRAIN_SCREENING_READY / TERRAIN_SCREENING_NOT_READY` (intrinsic raster
+  readiness DELEGATED to the accepted MAR-020 `assess_bathymetry_readiness` and
+  reported separately, plus MAR-031's own integration conditions: embedded
+  `scientific_role` / `layer` must be the accepted canonical product, square
+  metric pixels, no rotation), `GEOTECHNICAL_STABILITY_SCENARIO_AVAILABLE /
+  GEOTECHNICAL_STABILITY_NOT_EVALUABLE`, `TRIGGER_RESPONSE_NOT_MODELLED`, and
+  `LOCAL_SLOPE_STABILITY_NOT_EVALUABLE /
+  HYPOTHETICAL_SCENARIO_FOS_AVAILABLE_NOT_SITE_SPECIFIC`. Raster integrity
+  (Section 26): every output grid is written on the canonical terrain's own
+  CRS, transform, width and height with NaN nodata; no reprojection,
+  resampling, interpolation or hole filling; the canonical nodata footprint is
+  preserved (the accepted MAR-020 plane fit can return a window-supported value
+  AT a nodata cell; MAR-031 restricts its own product to the canonical valid
+  mask without touching MAR-020). Very large rasters are processed in row bands
+  with a halo >= the window half-width, calling the MAR-020 function unchanged
+  per band -- proven identical to the untiled result by test, not assumed. The
+  figure (`maps/<project_id>_slope_instability_screening.png`) compares
+  bathymetry, 10 m slope, 10 m and 50 m normalized strength demand with
+  sequential perceptual colormaps only (a non-sequential colormap is rejected;
+  display decimation is visual-only). MAR-020 (`terrain/derivatives.py`,
+  `terrain/readiness.py`), MAR-007 (`morphology/regional.py`), `sediment/*`,
+  `metocean/*`, `change/*`, `scour/*`, `burial/*`, `freespan/*`, `project/*` are
+  unmodified (the three protected science modules are pinned by content hash in
+  the tests; `cli.py` gained only the new command and its parser). Tests: 76 in
+  `tests/test_slope_stability.py` covering the MAR-031 Section 34 matrix --
+  exact `sin(alpha)cos(alpha)` formula, 0 deg -> 0, 45 deg -> 0.5, 30 deg ->
+  sin30 cos30, NaN propagation, non-negativity, out-of-range / infinite slopes
+  rejected; no hazard-class or safe/unsafe vocabulary (identifier-level scans
+  that ignore disclaiming prose); 10 m / 50 m separate; input arrays not
+  mutated; canonical nodata never receives a value; CRS / transform /
+  dimensions preserved; no resampling / reprojection identifiers; analytic
+  30 deg / 8 kN/m3 / 2 m case (`tau_d` 6928.203 Pa) gives FS = 1 to 1e-12 and
+  `MODEL_FS_AT_1`; doubling s_u doubles FS, doubling z or gamma' halves it;
+  invalid s_u / gamma' / z rejected in core and manifest; zero slope -> null
+  FS and no infinity; 1e-6 deg -> finite FS > 1e6; state classification; no
+  default scenario (signature default, empty manifest rejected, no literature
+  constants, no sediment / grain-size / Folk identifiers or imports, no
+  function implementing pore-pressure / seismic / liquefaction / runout /
+  impact / probability / risk physics); terrain mode without geotechnics
+  reports FoS not evaluable; scenario outputs retain `scenario_id` and
+  `USER_DECLARED_HYPOTHETICAL_SCENARIO`; synthetic 10 deg plane reproduces
+  sin10 cos10 and a flat half reproduces exactly zero demand; tiled == untiled;
+  determinism; PL854-like study without canonical terrain -> controlled
+  NOT_READY with regional context `REGIONAL_CONTEXT_ONLY`; non-canonical role
+  tag rejected; CLI terrain mode, scenario mode (manifest scales honoured),
+  invalid manifest -> exit 1, no network. REAL Sheringham Shoal 2020 proof
+  (cached MAR-020 canonical terrain, SHA-256 `fc3f5c1d...`, source raster
+  SHA-256 `c5e3ee92...`, no download, 303 s): EPSG:32631, 9855 x 25610 px,
+  1 m, transform (1, 0, 371143, 0, -1, 5894017) preserved on every output;
+  intrinsic MAR-020 readiness `READY_WITH_LIMITATIONS` (no survey epoch in the
+  raster tags), `TERRAIN_SCREENING_READY`; 10 m: 75,984,140 valid /
+  176,402,410 nodata of 252,386,550 cells, slope 0.0000..16.2914 deg (mean
+  0.3826, p50 0.2145, p95 1.2665, p99 2.9473), demand 0.000000..0.269260 (mean
+  0.006673, p50 0.003744, p95 0.022097, p99 0.051349); 50 m: 73,934,497 valid /
+  178,452,053 nodata, slope 0.0000..3.5158 deg (mean 0.2424, p50 0.1660, p95
+  0.7339, p99 1.2853), demand 0.000000..0.061208 (mean 0.004230, p50 0.002897,
+  p95 0.012807, p99 0.022426); no infinity anywhere; the MAR-031 10 m slope is
+  bitwise identical to the accepted MAR-020 `terrain/slope.tif` on all
+  75,984,140 shared cells (max abs diff 0.0), MAR-031 excluding only the 1,275
+  MAR-020 window-supported values at canonical nodata cells; a second identical
+  run reproduced the demand GeoTIFFs byte-for-byte; figure 2741 x 1623 px.
+  Conclusion: REAL HIGH-RES TERRAIN = YES; REAL TERRAIN-DERIVED NORMALIZED
+  STRENGTH DEMAND = YES; REAL SITE-SPECIFIC GEOTECHNICAL FACTOR OF SAFETY = NO
+  (`GEOTECHNICAL_STABILITY_NOT_EVALUABLE`, `NO_GEOTECHNICAL_SCENARIO_SUPPLIED`,
+  `SITE_GEOTECHNICAL_PROFILE_UNAVAILABLE`; no Sheringham soil parameter was
+  supplied or invented); REAL LANDSLIDE PROBABILITY = NO. The cached MAR-020
+  `build-highres-terrain-poc` rerun re-derived a byte-identical
+  `canonical_bed_elevation.tif` (SHA-256 `fc3f5c1d...`) but its untiled
+  derivative stage then failed with a numpy `ArrayMemoryError` (environment
+  memory pressure, ~0.6 GB free at the time on a 32 GB machine); the accepted
+  MAR-020 derivative GeoTIFFs of 2026-09-07 were left untouched (`slope.tif`
+  SHA-256 `3df58a75...` unchanged) -- an environment limitation, not a code
+  change. REAL PL854 readiness (`configs/pl854.yaml`, no high-resolution
+  terrain): `TERRAIN_SCREENING_NOT_READY` with reasons
+  `HIGH_RESOLUTION_CURRENT_SEABED_GEOMETRY_NOT_AVAILABLE` /
+  `CANONICAL_TERRAIN_NOT_AVAILABLE`,
+  `pipeline_scale_slope_stability_terrain_readiness = NOT_READY`,
+  `GEOTECHNICAL_STABILITY_NOT_EVALUABLE`, `LOCAL_SLOPE_STABILITY_NOT_EVALUABLE`;
+  MAR-007 regional slope reported separately as `REGIONAL_SLOPE_CONTEXT =
+  AVAILABLE` with role `REGIONAL_CONTEXT_ONLY` (EMODnet DTM 2024, ~115 m-class,
+  100 m grid, 1991-1992 acquisitions; `slope_500m_deg` 0.0007..1.9667 deg mean
+  0.1775, `slope_1000m_deg` 0.0012..0.9688 deg mean 0.1302, 31,299 valid cells),
+  never promoted to `PIPELINE_SCALE_SLOPE_STABILITY_INPUT` and with no demand
+  derived from it -- PL854 local stability remains not evaluable from current
+  data. Summary: terrain-derived normalized strength demand implemented; 10 m /
+  50 m scales remain separate; optional explicit undrained infinite-slope
+  scenarios supported; no site geotech supplied by default; no slope hazard
+  class; no probability; no runout; no trigger model; PL854 local stability
+  remains not evaluable from current data. Local verification: `uv lock
+  --check` clean, repo-wide `ruff format` / `ruff check` clean, offline suite
+  1753 passed (up from 1677), 3 skipped, 25 live deselected, `uv audit --frozen` clean (87 packages). Not implemented
+  (future tickets): liquefaction, pseudostatic earthquake loading, pore-pressure
+  generation, weak-layer propagation, progressive / retrogressive failure,
+  runout, debris-flow dynamics, pipeline impact loading, probabilistic landslide
+  hazard, route suitability scoring, and any geotechnical-asset ingestion that
+  would let a scenario be treated as measured site truth.

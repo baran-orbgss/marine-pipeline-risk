@@ -145,6 +145,11 @@ from marine_engine.sediment import (
     noncohesive_mobility_map,
     transport_intensity,
 )
+from marine_engine.slope_stability import contract as slope_contract
+from marine_engine.slope_stability import core as slope_core
+from marine_engine.slope_stability import manifest as slope_manifest
+from marine_engine.slope_stability import report as slope_report
+from marine_engine.slope_stability import screening as slope_screening
 from marine_engine.terrain import canonical as terrain_canonical
 from marine_engine.terrain import contract as terrain_contract
 from marine_engine.terrain import derivatives as terrain_derivatives
@@ -11046,6 +11051,85 @@ def _cmd_build_project_readiness(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_slope_instability_screening(args: argparse.Namespace) -> int:
+    """MAR-031: generic submarine slope-instability screening POC. Terrain
+    predisposition (accepted MAR-020 canonical terrain -> accepted MAR-020
+    slope at independent 10 m / 50 m scales -> normalized undrained
+    strength demand sin(a)cos(a)) plus, ONLY when an explicit scenario
+    manifest is supplied, the undrained translational infinite-slope
+    factor of safety for user-declared hypothetical parameters. No default
+    soil scenario, no slope hazard class, no probability, no trigger,
+    no runout, no pipeline impact, no risk score. Fully offline; never
+    downloads terrain and never modifies the MAR-020 products.
+    """
+
+    config = load_study_config(args.config)
+    project_id = config.study.id.lower()
+    study_dir = config.paths.processed_dir / project_id
+
+    scenarios: list[slope_core.UndrainedInfiniteSlopeScenario] = []
+    slope_scales_m: list[float] = list(slope_contract.DEFAULT_SLOPE_SCALES_M)
+    analysis_id: str | None = None
+    if args.scenario_manifest is not None:
+        try:
+            manifest = slope_manifest.load_slope_instability_scenario_manifest(
+                args.scenario_manifest
+            )
+            scenarios = manifest.core_scenarios()
+        except (OSError, ValueError, slope_core.SlopeStabilityInputError) as exc:
+            print(f"ERROR: scenario manifest {args.scenario_manifest} rejected: {exc}")
+            return 1
+        analysis_id = manifest.analysis_id
+        if manifest.slope_scales_m:
+            slope_scales_m = [float(s) for s in manifest.slope_scales_m]
+        print(
+            f"Explicit scenario manifest {args.scenario_manifest}: {len(scenarios)} "
+            "USER_DECLARED_HYPOTHETICAL_SCENARIO(s) -- NOT_SITE_SPECIFIC_MEASUREMENT"
+        )
+    else:
+        print("No scenario manifest supplied: no geotechnical factor of safety will be computed.")
+
+    try:
+        result = slope_screening.run_slope_instability_screening(
+            project_id=project_id,
+            study_dir=study_dir,
+            slope_scales_m=slope_scales_m,
+            scenarios=scenarios,
+            analysis_id=analysis_id,
+            figure_title=f"{config.study.name} -- Submarine Slope-Instability Screening POC",
+            log=lambda message: print(message, flush=True),
+        )
+    except slope_core.SlopeStabilityInputError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    print()
+    for line in slope_report.format_summary_lines(
+        project_id=project_id,
+        readiness=result.readiness,
+        scale_results=result.scale_results,
+        scenario_results=result.scenario_results,
+        outputs=result.outputs,
+    ):
+        print(line)
+    print()
+    print("IS SLOPE ANGLE ALONE TREATED AS LANDSLIDE STABILITY? NO")
+    print(
+        "REAL TERRAIN-DERIVED NORMALIZED STRENGTH DEMAND AVAILABLE? "
+        + ("YES" if result.scale_results else "NO")
+    )
+    print(
+        "SITE-SPECIFIC GEOTECHNICAL FACTOR OF SAFETY AVAILABLE? NO"
+        + (
+            " (explicit hypothetical scenario FoS only -- NOT_SITE_SPECIFIC_MEASUREMENT)"
+            if result.scenario_results
+            else ""
+        )
+    )
+    print("LANDSLIDE PROBABILITY OR RISK SCORE COMPUTED? NO")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -11580,6 +11664,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build_route_seabed_change_evidence_parser.set_defaults(
         func=_cmd_build_route_seabed_change_evidence
+    )
+
+    build_slope_instability_screening_parser = subparsers.add_parser(
+        "build-slope-instability-screening",
+        help=(
+            "MAR-031: generic submarine slope-instability screening POC. Reads the accepted "
+            "MAR-020 canonical terrain (processed/<project_id>/terrain/"
+            "canonical_bed_elevation.tif) read-only, computes slope with the accepted MAR-020 "
+            "derivative at independent 10 m and 50 m scales (never averaged or maximized), and "
+            "derives the terrain-only normalized "
+            "undrained strength demand sin(alpha)*cos(alpha) -- the s_u/(gamma' z) ratio required "
+            "for FS=1 under the undrained translational infinite-slope idealization; NOT a factor "
+            "of safety, NOT a probability, NOT a hazard class. A factor of safety is computed ONLY "
+            "when --scenario-manifest supplies explicit USER_DECLARED_HYPOTHETICAL_SCENARIO "
+            "parameters (no default soil, nothing inferred from BGS/PSA/morphology). Excess pore "
+            "pressure, triggers, liquefaction, progressive/retrogressive failure, runout, pipeline "
+            "impact, landslide probability and risk score are NOT modelled. A study without "
+            "high-resolution canonical terrain (e.g. PL854) reports TERRAIN_SCREENING_NOT_READY / "
+            "HIGH_RESOLUTION_CURRENT_SEABED_GEOMETRY_NOT_AVAILABLE and MAR-007 regional slope as "
+            "REGIONAL_CONTEXT_ONLY. Outputs under processed/<project_id>/slope_stability/ and "
+            "maps/. Fully offline."
+        ),
+    )
+    build_slope_instability_screening_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_slope_instability_screening_parser.add_argument(
+        "--scenario-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Optional explicit slope-stability scenario manifest YAML (typed, hazard-specific; "
+            "not part of the generic project manifest). Without it no factor of safety is computed."
+        ),
+    )
+    build_slope_instability_screening_parser.set_defaults(
+        func=_cmd_build_slope_instability_screening
     )
 
     return parser
