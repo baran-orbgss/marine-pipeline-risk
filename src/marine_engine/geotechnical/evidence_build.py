@@ -157,12 +157,61 @@ def run_cpt_evidence_build(
         if measurements is not None
         else contract.DEPTH_REFERENCE_UNRESOLVED
     )
+
+    # 4. processed numeric products. MAR-032A: written BEFORE readiness through the canonical
+    #    writer, then the product marker is read back from the ACTUAL bytes so the identity facts
+    #    below describe the file that exists, not the frame in memory.
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    canonical_fields: list[str] = []
+    marker: cpt_profile.CanonicalProductMarker | None = None
+    measurements_value_sha256: str | None = None
+    if measurements is not None and qa["row_count"] > 0:
+        measurements_path = processed_dir / "cpt_measurements.parquet"
+        cpt_profile.write_canonical_cpt_measurements(
+            measurements, measurements_path, evidence_id=evidence_id
+        )
+        marker = cpt_profile.read_canonical_cpt_product_marker(measurements_path)
+        measurements_value_sha256 = cpt_profile.canonical_value_sha256(measurements)
+        outputs["cpt_measurements"] = measurements_path
+        canonical_fields = list(measurements.columns)
+        if tests is not None and not tests.empty:
+            tests_path = processed_dir / "cpt_tests.parquet"
+            tests.to_parquet(tests_path, index=False)
+            outputs["cpt_tests"] = tests_path
+            if (
+                crs is not None
+                and crs.crs_resolved
+                and crs.resolved_crs
+                and not crs.conflict
+                and crs.declared_crs_semantically_matches_source
+            ):
+                gdf = gpd.GeoDataFrame(
+                    tests,
+                    geometry=gpd.points_from_xy(tests["position_x_raw"], tests["position_y_raw"]),
+                    crs=crs.resolved_crs,
+                )
+                gpkg_path = processed_dir / "cpt_locations.gpkg"
+                gdf.to_file(gpkg_path, layer="cpt_locations", driver="GPKG")
+                outputs["cpt_locations"] = gpkg_path
+
     facts = cpt_readiness.CptEvidenceFacts(
         source_package_resolved=bool(acquisitions),
         source_checksum_recorded=all(a.package_sha256 for a in acquisitions),
         documentary_evidence_available=documentary_available,
         machine_readable_profile_available=bool(machine_readable),
         canonical_profile_created=measurements is not None and qa["row_count"] > 0,
+        canonical_product_identity_verified=bool(marker is not None and marker.verified),
+        canonical_product_role_observed=marker.product_role if marker else None,
+        canonical_product_contract_observed=marker.contract_version if marker else None,
+        # Provider build path: the MEASURED role is established by the source-specific provider's
+        # explicit channel declarations (quoted source statements), and the product marker read
+        # back from the file carries exactly that role. There is no project manifest here; the
+        # project layer applies its own declared-role gate on registration.
+        measured_evidence_role_verified=bool(
+            marker is not None
+            and marker.verified
+            and marker.product_role == contract.MEASURED_CPT_CPTU_PROFILE
+        ),
         row_count=qa["row_count"],
         test_count=qa["test_count"],
         declared_test_count=declaration.get("source_declared_test_count"),
@@ -182,7 +231,7 @@ def run_cpt_evidence_build(
     readiness = cpt_readiness.assess_cpt_readiness(facts)
     liquefaction = cpt_readiness.assess_liquefaction_input_readiness(facts)
 
-    # 4. source-evidence summary (interim)
+    # 5. source-evidence summary (interim)
     outputs["cpt_source_evidence"] = _write_json(
         interim_dir / "cpt_source_evidence.json",
         {
@@ -201,28 +250,7 @@ def run_cpt_evidence_build(
         },
     )
 
-    # 5. processed outputs
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    canonical_fields: list[str] = []
-    if measurements is not None and qa["row_count"] > 0:
-        measurements_path = processed_dir / "cpt_measurements.parquet"
-        measurements.to_parquet(measurements_path, index=False)
-        outputs["cpt_measurements"] = measurements_path
-        canonical_fields = list(measurements.columns)
-        if tests is not None and not tests.empty:
-            tests_path = processed_dir / "cpt_tests.parquet"
-            tests.to_parquet(tests_path, index=False)
-            outputs["cpt_tests"] = tests_path
-            if crs is not None and crs.crs_resolved and crs.resolved_crs and not crs.conflict:
-                gdf = gpd.GeoDataFrame(
-                    tests,
-                    geometry=gpd.points_from_xy(tests["position_x_raw"], tests["position_y_raw"]),
-                    crs=crs.resolved_crs,
-                )
-                gpkg_path = processed_dir / "cpt_locations.gpkg"
-                gdf.to_file(gpkg_path, layer="cpt_locations", driver="GPKG")
-                outputs["cpt_locations"] = gpkg_path
-
+    # 6. processed metadata / readiness JSON
     metadata = {
         "evidence_id": evidence_id,
         "roles": {
@@ -252,6 +280,19 @@ def run_cpt_evidence_build(
         "machine_readable_cpt_profile_available": bool(machine_readable),
         "canonical_profile_created": facts.canonical_profile_created,
         "canonical_profile_fields": canonical_fields,
+        # MAR-032A: observed product identity (read back from the written Parquet bytes) and the
+        # content-VALUE hash (independent of Parquet file metadata; compare this, not the raw
+        # file SHA, to prove measurement values are unchanged).
+        "canonical_product_marker": marker.to_dict() if marker else None,
+        "canonical_product_identity_verified": facts.canonical_product_identity_verified,
+        "measured_evidence_role_verified": facts.measured_evidence_role_verified,
+        "measured_evidence_role_basis": (
+            "source-specific provider channel declarations (quoted source statements); the "
+            "product marker carries MEASURED_CPT_CPTU_PROFILE; no project manifest role exists "
+            "in this build path"
+        ),
+        "measured_cpt_profile_verified": facts.measured_cpt_profile_verified,
+        "measurements_value_sha256": measurements_value_sha256,
         "field_provenance": list(provenance),
         "source_units": semantics.get("source_unit_tokens", {}),
         "source_unit_token_aliases": semantics.get("source_unit_token_aliases", {}),
@@ -263,12 +304,24 @@ def run_cpt_evidence_build(
         "depth_reference_limitation": semantics.get("depth_reference_limitation"),
         "coordinate_reference": {
             "coordinates_available": facts.coordinates_available,
-            "declared_crs": crs.declared_crs if crs else None,
-            "resolved_crs": crs.resolved_crs if crs else None,
-            "crs_resolved": facts.crs_resolved,
-            "conflict": facts.crs_conflict,
-            "observed": crs.observed if crs else {},
-            "note": crs.note if crs else contract.SPATIAL_LOCATION_UNRESOLVED,
+            **(
+                crs.to_dict()
+                if crs
+                else {
+                    "declared_crs": None,
+                    "resolved_crs": None,
+                    "crs_resolved": False,
+                    "conflict": None,
+                    "observed": {},
+                    "note": contract.SPATIAL_LOCATION_UNRESOLVED,
+                    "source_reference_crs": getattr(provider, "SOURCE_REFERENCE_CRS", None),
+                    "source_horizontal_unit": getattr(provider, "SOURCE_HORIZONTAL_UNIT", None),
+                    "declared_crs_semantically_matches_source": False,
+                    "declared_crs_horizontal_unit": None,
+                    "declared_crs_horizontal_unit_to_m_factor": None,
+                    "reprojection_performed": False,
+                }
+            ),
         },
         "source_semantics": semantics,
         "unresolved": list(unresolved),
@@ -293,6 +346,7 @@ def run_cpt_evidence_build(
             "role": contract.LIQUEFACTION_INPUT_READINESS_ASSESSMENT,
             "cpt_evidence_readiness": readiness.to_dict(),
             "facts": {k: (list(v) if isinstance(v, tuple) else v) for k, v in vars(facts).items()},
+            "measured_cpt_profile_verified": facts.measured_cpt_profile_verified,
             "DOCUMENTARY_CPT_EVIDENCE_AVAILABLE": documentary_available,
             "DIGITAL_NUMERIC_CPT_PROFILE_READY": facts.canonical_profile_created,
         },

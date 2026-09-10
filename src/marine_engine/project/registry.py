@@ -433,10 +433,17 @@ def _register_cpt(
     """MAR-032 Section 25: inspect the registered CPT file's real bytes (`cpt_adapter`) and
     DELEGATE to the generic `geotechnical.cpt_readiness.assess_cpt_readiness`. A documentary or
     unrecognised file is registered but BLOCKING on `DIGITAL_PROFILE`, so path existence alone
-    can never yield READY. The declared evidence role is passed through untouched."""
+    can never yield READY. The declared evidence role is passed through untouched.
+
+    MAR-032A: the SHA-256 this registry actually computed is handed to the adapter (no checksum
+    Boolean is manufactured), and the declared evidence role is handed over ONLY as an input of
+    the measured-evidence-role gate. Declared role, observed canonical-product marker and observed
+    structural schema stay three separate facts in the registration."""
 
     try:
-        facts, observed_facts = cpt_adapter.inspect_cpt_asset(resolved_path)
+        facts, observed_facts = cpt_adapter.inspect_cpt_asset(
+            resolved_path, declared_evidence_role=asset.evidence_role, registered_sha256=sha256
+        )
     except cpt_adapter.CptAssetLoadError as exc:
         return _failed_registration(
             asset,
@@ -452,6 +459,10 @@ def _register_cpt(
         **observed_facts,
         "machine_readable_cpt_profile_available": facts.machine_readable_profile_available,
         "canonical_profile_created": facts.canonical_profile_created,
+        "canonical_cpt_product_identity_verified": facts.canonical_product_identity_verified,
+        "measured_evidence_role_verified": facts.measured_evidence_role_verified,
+        "measured_cpt_profile_verified": facts.measured_cpt_profile_verified,
+        "registered_asset_sha256": facts.registered_asset_sha256,
         "row_count": facts.row_count,
         "depth_reference": facts.depth_reference,
         "notes": list(facts.notes),

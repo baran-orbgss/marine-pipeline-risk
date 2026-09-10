@@ -141,6 +141,40 @@ CANONICAL_FIELD_UNITS = {
 }
 RAW_CHANNEL_PREFIX = "raw__"
 
+# --- MAR-032A: canonical CPT product identity ----------------------------------------------------
+# Permanent invariants: column names != measurement semantics, and a DECLARED evidence role != an
+# OBSERVED canonical-product identity. A Parquet file is a canonical MAR CPT product only when its
+# file-level schema metadata carries this explicit, versioned marker, written solely by
+# `cpt_profile.write_canonical_cpt_measurements`. Identity is never inferred from a filename or
+# from canonical-looking column names.
+
+PRODUCT_ROLE_METADATA_KEY = "marine_engine_product_role"
+PRODUCT_CONTRACT_METADATA_KEY = "marine_engine_cpt_contract"
+PRODUCT_EVIDENCE_ID_METADATA_KEY = "marine_engine_evidence_id"
+PRODUCT_CANONICAL_UNITS_METADATA_KEY = "marine_engine_canonical_units"
+CANONICAL_PRODUCT_METADATA_KEYS = (
+    PRODUCT_ROLE_METADATA_KEY,
+    PRODUCT_CONTRACT_METADATA_KEY,
+    PRODUCT_EVIDENCE_ID_METADATA_KEY,
+    PRODUCT_CANONICAL_UNITS_METADATA_KEY,
+)
+CPT_CANONICAL_PROFILE_CONTRACT = "CPT_CANONICAL_PROFILE_V1"
+
+# Structural columns whose presence makes a table LOOK like a canonical CPT profile. This is a
+# structural observation only: it establishes neither product identity nor measurement semantics.
+CANONICAL_STRUCTURAL_COLUMNS = (
+    SOURCE_ID,
+    TEST_ID,
+    OBSERVATION_INDEX,
+    DEPTH_SOURCE_VALUE,
+    DEPTH_REFERENCE_FIELD,
+    DEPTH_BSF_M,
+)
+
+# Controlled readiness reasons (MAR-032A Sections 9-11).
+CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED = "CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED"
+CPT_MEASURED_EVIDENCE_ROLE_NOT_VERIFIED = "CPT_MEASURED_EVIDENCE_ROLE_NOT_VERIFIED"
+
 # --- Section 15: deterministic unit conversions (source unit MUST be explicit; never inferred) ---
 # Keyed (from_unit, to_unit). Anything absent is "not deterministic here" -> value stays null.
 

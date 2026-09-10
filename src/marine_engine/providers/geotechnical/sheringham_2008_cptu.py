@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import zipfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -94,6 +95,10 @@ __all__ = [
     "depth_declaration",
     "build_canonical",
     "assess_crs",
+    "source_reference_crs",
+    "horizontal_axis_unit",
+    "SOURCE_REFERENCE_CRS",
+    "SOURCE_HORIZONTAL_UNIT",
     "acquisition_to_dict",
 ]
 
@@ -200,6 +205,14 @@ SOURCE_VERTICAL_STATEMENT = (
 )
 SOURCE_UTM_ZONE = "31N"
 SOURCE_DATUM_NAME_FRAGMENT = "1984"  # matches pyproj datum name "World Geodetic System 1984"
+# MAR-032A: the source-defined system (Part C 1.4: WGS 84; UTM zone 31; natural origin 0N / 3E;
+# scale 0.9996; false easting 500 000; false northing 0; metre) IS EPSG:32631. A declared CRS is
+# accepted only when pyproj establishes SEMANTIC equivalence with this reference CRS and its
+# horizontal axes are in metres -- a WGS 84 / UTM 31N system in feet is a material conflict.
+SOURCE_REFERENCE_CRS_EPSG = 32631
+SOURCE_REFERENCE_CRS = f"EPSG:{SOURCE_REFERENCE_CRS_EPSG}"
+SOURCE_HORIZONTAL_UNIT = "metre"
+SOURCE_HORIZONTAL_UNIT_TO_M_FACTOR = 1.0
 
 # Verbatim tokens as they appear in the CSV (latin-1). The unit row is exactly this.
 GEO_COLUMN_HEADER = "Scan#;Depth;Tip;Sleeve;Pore;Incl;Time;"
@@ -687,13 +700,68 @@ class CrsAssessment:
     crs_resolved: bool
     conflict: str | None
     note: str
+    # MAR-032A source-CRS facts (defaults are the honest 'not established' state).
+    source_reference_crs: str = SOURCE_REFERENCE_CRS
+    source_horizontal_unit: str = SOURCE_HORIZONTAL_UNIT
+    declared_crs_semantically_matches_source: bool = False
+    declared_crs_horizontal_unit: str | None = None
+    declared_crs_horizontal_unit_to_m_factor: float | None = None
+    reprojection_performed: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "declared_crs": self.declared_crs,
+            "resolved_crs": self.resolved_crs,
+            "crs_resolved": self.crs_resolved,
+            "conflict": self.conflict,
+            "observed": dict(self.observed),
+            "note": self.note,
+            "source_reference_crs": self.source_reference_crs,
+            "source_horizontal_unit": self.source_horizontal_unit,
+            "declared_crs_semantically_matches_source": (
+                self.declared_crs_semantically_matches_source
+            ),
+            "declared_crs_horizontal_unit": self.declared_crs_horizontal_unit,
+            "declared_crs_horizontal_unit_to_m_factor": (
+                self.declared_crs_horizontal_unit_to_m_factor
+            ),
+            "reprojection_performed": self.reprojection_performed,
+        }
+
+
+def source_reference_crs() -> CRS:
+    """The source-defined coordinate system as a pyproj CRS: EPSG:32631 (WGS 84 / UTM zone 31N,
+    metre). This is the ONLY comparison target; nothing is inferred from coordinates or site."""
+
+    return CRS.from_epsg(SOURCE_REFERENCE_CRS_EPSG)
+
+
+def horizontal_axis_unit(crs: CRS) -> tuple[str | None, float | None]:
+    """(unit name, unit-to-metre factor) shared by the CRS's horizontal axes. The factor is
+    reported only for a projected CRS (a degree has no length factor); None when the axes are
+    absent or carry different units."""
+
+    axes = list(crs.axis_info)
+    if not axes:
+        return None, None
+    names = {a.unit_name for a in axes}
+    factors = {float(a.unit_conversion_factor) for a in axes}
+    if len(names) != 1 or len(factors) != 1:
+        return None, None
+    return names.pop(), (factors.pop() if crs.is_projected else None)
+
+
+def _short(text: str, limit: int = 120) -> str:
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def assess_crs(declared_crs: str | None, tests: pd.DataFrame) -> CrsAssessment:
     """Section 17: source coordinates are preserved first. The source itself states 'UTM 31 /
-    WGS 84' with false northing 0.00 (northern hemisphere). A USER-declared CRS is accepted as the
-    resolved CRS ONLY if it is semantically that same system (pyproj: projected, UTM zone 31N,
-    WGS 84 datum). Nothing is guessed from coordinate magnitude or site location; with no
+    WGS 84' with false northing 0.00 (northern hemisphere), i.e. EPSG:32631. A USER-declared CRS
+    is accepted as the resolved CRS ONLY if pyproj establishes it is SEMANTICALLY that same system
+    (`CRS.from_epsg(32631) == declared`; an equivalent WKT without an EPSG label passes, a string
+    match is neither required nor sufficient) AND its horizontal axes are in metres. Nothing is
+    guessed from coordinate magnitude or site location; nothing is reprojected; with no
     declaration the CRS stays unresolved and no geospatial layer is written."""
 
     if tests.empty or "position_x_raw" not in tests.columns:
@@ -753,6 +821,14 @@ def assess_crs(declared_crs: str | None, tests: pd.DataFrame) -> CrsAssessment:
             f"declared CRS {declared_crs!r} is not a valid CRS identifier",
             contract.CRS_UNRESOLVED,
         )
+    reference = source_reference_crs()
+    unit_name, unit_factor = horizontal_axis_unit(crs)
+    semantically_equal = bool(reference == crs)  # pyproj semantic comparison, axis order kept
+    unit_is_metre = unit_factor is not None and math.isclose(
+        unit_factor, SOURCE_HORIZONTAL_UNIT_TO_M_FACTOR, rel_tol=0.0, abs_tol=1e-12
+    )
+    # Diagnostics only -- none of these establishes equivalence; the verdict is the pyproj
+    # comparison plus the explicit horizontal-unit check.
     datum_name = (crs.datum.name if crs.datum is not None else "") or ""
     problems: list[str] = []
     if not crs.is_projected:
@@ -761,23 +837,48 @@ def assess_crs(declared_crs: str | None, tests: pd.DataFrame) -> CrsAssessment:
         problems.append(f"UTM zone {crs.utm_zone!r} != source-stated {SOURCE_UTM_ZONE!r}")
     if SOURCE_DATUM_NAME_FRAGMENT not in datum_name:
         problems.append(f"datum {datum_name!r} is not WGS 84")
-    if problems:
+    if crs.is_projected and not unit_is_metre:
+        problems.append(
+            f"horizontal axis unit {unit_name!r} (1 unit = {unit_factor!r} m) is not "
+            f"{SOURCE_HORIZONTAL_UNIT}"
+        )
+    if not semantically_equal and not problems:
+        problems.append(
+            f"not semantically equivalent to {SOURCE_REFERENCE_CRS} under pyproj CRS comparison "
+            "(projection parameters or datum definition differ)"
+        )
+    if not semantically_equal or not unit_is_metre:
         return CrsAssessment(
-            True,
-            observed,
-            declared_crs,
-            None,
-            False,
-            f"declared CRS {declared_crs!r} contradicts source statement: {'; '.join(problems)}",
-            "material declared-vs-source CRS conflict; no layer written, nothing reprojected",
+            coordinates_available=True,
+            observed=observed,
+            declared_crs=declared_crs,
+            resolved_crs=None,
+            crs_resolved=False,
+            conflict=(
+                f"declared CRS {_short(declared_crs)!r} is not semantically the source-defined "
+                f"{SOURCE_REFERENCE_CRS} (WGS 84 / UTM zone 31N, {SOURCE_HORIZONTAL_UNIT}): "
+                + "; ".join(problems)
+            ),
+            note="material declared-vs-source CRS conflict; no layer written, nothing reprojected",
+            declared_crs_semantically_matches_source=False,
+            declared_crs_horizontal_unit=unit_name,
+            declared_crs_horizontal_unit_to_m_factor=unit_factor,
         )
     return CrsAssessment(
-        True,
-        observed,
-        declared_crs,
-        crs.to_string(),
-        True,
-        None,
-        "declared CRS is semantically the source-stated WGS 84 / UTM zone 31N (false northing "
-        "0.00)",
+        coordinates_available=True,
+        observed=observed,
+        declared_crs=declared_crs,
+        # The declared CRS verified semantically identical to the source-defined system, so the
+        # resolved CRS is that system; the raw source coordinates are labelled, never converted.
+        resolved_crs=SOURCE_REFERENCE_CRS,
+        crs_resolved=True,
+        conflict=None,
+        note=(
+            f"declared CRS is semantically the source-defined {SOURCE_REFERENCE_CRS} (WGS 84 / "
+            f"UTM zone 31N, false northing 0.00, {SOURCE_HORIZONTAL_UNIT}) under pyproj CRS "
+            "comparison; horizontal unit metre verified; nothing reprojected"
+        ),
+        declared_crs_semantically_matches_source=True,
+        declared_crs_horizontal_unit=unit_name,
+        declared_crs_horizontal_unit_to_m_factor=unit_factor,
     )

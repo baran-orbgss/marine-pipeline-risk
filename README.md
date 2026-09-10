@@ -3489,3 +3489,115 @@ otherwise, never an interactive credential prompt.
   `uv audit --frozen` clean (87 packages); real Sheringham build 13 s
   (network) then offline cache rerun; every JSON/Parquet/GPKG output inspected
   directly. No further ticket has started.
+- **MAR-032A (CPT canonical identity & CRS integrity repair; integration /
+  source-contract repair of MAR-032 -- `geotechnical/cpt_contract.py`,
+  `geotechnical/cpt_profile.py`, `geotechnical/cpt_readiness.py`,
+  `geotechnical/evidence_build.py`, `geotechnical/report.py`,
+  `providers/geotechnical/sheringham_2008_cptu.py`, `project/cpt_adapter.py`,
+  `project/registry.py`; NO CPT interpretation change, NO liquefaction
+  physics).** Two defects in the accepted MAR-032 behaviour were repaired.
+  Defect A (CRS): the Sheringham provider validated a declared CRS
+  heuristically (projected + `utm_zone == "31N"` + datum name containing
+  "1984"), which a custom WGS 84 / UTM 31N system in international feet or
+  US survey feet also satisfies -- reproduced before the fix: both foot
+  systems were accepted as the resolved CRS. The provider now compares the
+  declared CRS SEMANTICALLY against the source-defined reference
+  `CRS.from_epsg(32631)` (Part C 1.4: WGS 84, UTM zone 31, origin 0N / 3E,
+  scale 0.9996, false easting 500 000, false northing 0, metre) using pyproj
+  CRS equality (axis order kept), and explicitly checks the horizontal axis
+  unit; string equality is neither required nor sufficient (an equivalent WKT
+  carrying no EPSG identifier passes). New recorded facts:
+  `source_reference_crs = EPSG:32631`, `source_horizontal_unit = metre`,
+  `declared_crs_semantically_matches_source`,
+  `declared_crs_horizontal_unit`, `declared_crs_horizontal_unit_to_m_factor`,
+  `reprojection_performed = false`. Adversarial matrix proven: EPSG:32631
+  PASS; EPSG-free equivalent WKT PASS; EPSG:32632 FAIL; ED50 / UTM 31N
+  (EPSG:23031) FAIL; EPSG:4326 FAIL; WGS 84 / UTM 31N `+units=ft` FAIL
+  (factor 0.3048); WGS 84 / UTM 31N `+units=us-ft` FAIL (factor
+  0.3048006096...); a rejected CRS writes no `cpt_locations.gpkg`, the raw
+  source coordinates in `cpt_tests.parquet` are untouched, and no
+  reprojection code exists (source scan). Defect B (canonical identity): the
+  generic project CPT adapter recognised a "canonical CPT profile" from
+  `.parquet` + canonical-looking column names alone. Permanent invariants
+  now enforced: column names != measurement semantics, and declared evidence
+  role != observed canonical-product identity. A bounded canonical writer
+  `cpt_profile.write_canonical_cpt_measurements(...)` (the only writer of a
+  MAR CPT product; refuses an empty evidence id or a frame narrower than the
+  product contract) stamps a versioned file-level Parquet schema-metadata
+  marker: `marine_engine_product_role = MEASURED_CPT_CPTU_PROFILE`,
+  `marine_engine_cpt_contract = CPT_CANONICAL_PROFILE_V1`,
+  `marine_engine_evidence_id = <non-empty id>`,
+  `marine_engine_canonical_units = <sorted JSON of CANONICAL_FIELD_UNITS>`;
+  `read_canonical_cpt_product_marker(...)` reads it back from the bytes and
+  verifies every entry. The project adapter dispatches on Parquet magic bytes
+  (never the filename) and preserves three separate facts on registration:
+  the manifest `evidence_role` (never mutated), the OBSERVED product marker
+  (`canonical_product_marker`, `canonical_cpt_product_identity_verified`,
+  `canonical_product_role_observed`) and the OBSERVED structural schema
+  (`structural_canonical_columns_present`, `canonical_columns_missing`).
+  Readiness gates (`cpt_readiness`, still explicit vocabularies, no scores):
+  `DIGITAL_PROFILE` is BLOCKING with
+  `CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED` when the marker does not
+  verify, and `MEASUREMENT_SEMANTICS` is BLOCKING with
+  `CPT_MEASURED_EVIDENCE_ROLE_NOT_VERIFIED` unless BOTH the observed product
+  role is `MEASURED_CPT_CPTU_PROFILE` AND the declared evidence role is
+  `MEASURED`; a marked product registered as `SOURCE_INTERPRETED` or
+  `DERIVED` keeps that role exactly and is denied measured-CPT readiness.
+  `measured_cpt_profile_verified` is reported on the readiness result, and
+  the liquefaction-INPUT block counts `machine_readable_cpt_profile`, qc/qt,
+  fs, u2 and the wave `soil_profile` as AVAILABLE only from a verified
+  measured profile (still no CSR, CRR, FoS, LPI, settlement, lateral
+  spreading or wave pore-pressure computation). Checksum truth: the adapter
+  no longer manufactures `source_checksum_recorded = true`; the registry
+  hands over the SHA-256 it actually computed (`registered_asset_sha256`,
+  recorded in the SOURCE_PACKAGE facts) and a standalone adapter call
+  without one claims no checksum evidence. Section 11 lookalike proven: a
+  Parquet with `source_id, test_id, observation_index, depth_source_value,
+  depth_reference, depth_bsf_m, qc_mpa, fs_kpa, u2_kpa` and no product
+  metadata (even named `cpt_measurements.parquet`) registers as REGISTERED,
+  `structural_canonical_columns_present = true`,
+  `canonical_cpt_product_identity_verified = false`, intrinsic and effective
+  `NOT_READY`; malformed marker, wrong contract version, wrong role, wrong
+  unit contract and a missing structural column are all `NOT_READY`. The
+  provider build now writes `cpt_measurements.parquet` through the canonical
+  writer, reads the marker back before computing readiness, records
+  `canonical_product_marker`, `canonical_product_identity_verified`,
+  `measured_cpt_profile_verified` and a content-VALUE hash
+  `measurements_value_sha256` (deterministic full-precision CSV
+  serialization, independent of Parquet metadata) in `cpt_metadata.json`;
+  the `build-cpt-evidence-poc` summary and acceptance lines report the
+  marker, the semantic CRS verdict and the horizontal unit. Real Sheringham
+  regression (cached MDE packages; both "cache hit", raw archive bytes and
+  mtimes unchanged, zero acquisition, 6 s): 138,514 rows and 100 tests
+  unchanged; qc / fs / u2 / depth column null counts, sums, minima and
+  maxima identical to the pre-repair output and the default-serialization
+  value hash `dfad325f...` identical (only the raw Parquet SHA changed, from
+  `d32a42f1...` to `2f3bf2ac...`, because file metadata was added); `qt_mpa`
+  still null in
+  all 138,514 rows; marker read back from the real file verified
+  (`MEASURED_CPT_CPTU_PROFILE`, `CPT_CANONICAL_PROFILE_V1`,
+  `sheringham_shoal_2008_cptu`); `EPSG:32631` semantically matched, declared
+  horizontal unit metre (x1.0), `reprojection_performed = false`;
+  `cpt_locations.gpkg` 100 points EPSG:32631 with x/y equal to the raw
+  header coordinates; readiness `READY_WITH_LIMITATIONS` with the same five
+  limitations as MAR-032; earthquake and wave blocks still `NOT_EVALUABLE`.
+  The real product registered through the generic project layer: as
+  `MEASURED` -> intrinsic `READY_WITH_LIMITATIONS`, identity verified; as
+  `SOURCE_INTERPRETED` / `DERIVED` -> role preserved, identity verified,
+  measured gate false, `NOT_READY`; the same values re-written without the
+  marker -> structural true, identity false, `NOT_READY`. Protected
+  `terrain/`, `morphology/`, `metocean/`, `sediment/`, `change/`, `scour/`,
+  `burial/`, `freespan/`, `slope_stability/` untouched; MAR-032 channel
+  definitions and unit table unchanged (asserted). Tests:
+  `tests/test_cpt_evidence.py` 42 -> 56 (existing readiness unit tests now
+  state the two observed facts explicitly; MAR-032A adds writer/marker
+  round-trip and value identity, unmarked lookalike, marked bytes under
+  MEASURED vs SOURCE_INTERPRETED vs DERIVED, five defective-marker /
+  structure cases, SHA-256 recorded and never invented, qc/qt/unit/depth
+  semantics through the writer, the CRS matrix including both foot systems
+  as PROJ strings and WKT, rejected foot CRS end-to-end with no GPKG and no
+  reprojection, and marker + CRS facts in real-shape outputs). Local
+  verification: `uv lock --check` clean, repo-wide `ruff format --check` /
+  `ruff check` clean, offline suite 1830 passed (up from 1816), 4 skipped,
+  25 live deselected, `uv audit --frozen` clean (87 packages). No further
+  ticket has started.

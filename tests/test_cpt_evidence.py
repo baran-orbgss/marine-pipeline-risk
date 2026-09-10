@@ -39,6 +39,13 @@ from marine_engine.providers.geotechnical import sheringham_2008_cptu as provide
 
 SYNTHETIC_TAG = "SYNTHETIC_TEST_FIXTURE"
 
+# MAR-032A: readiness unit tests that model a GENUINE verified canonical product must state these
+# two observed facts explicitly -- nothing derives them from column appearance or a filename.
+_VERIFIED_PRODUCT = {
+    "canonical_product_identity_verified": True,
+    "measured_evidence_role_verified": True,
+}
+
 # --- synthetic fixtures ---------------------------------------------------------------------------
 
 
@@ -220,6 +227,7 @@ def test_02_03_declared_counts_recorded_as_declaration_not_enforced():
         row_count=10,
         test_count=100,
         declared_test_count=101,
+        **_VERIFIED_PRODUCT,
         depth_reference=contract.DEPTH_BELOW_SEABED,
         depth_bsf_available=True,
         channels_present=(contract.QC_MPA,),
@@ -528,6 +536,7 @@ def test_20_21_duplicate_identities_detected_and_contradictory_duplicates_not_av
         test_count=1,
         duplicate_observation_identity_count=2,
         contradictory_duplicate_depth_row_count=2,
+        **_VERIFIED_PRODUCT,
         depth_reference=contract.DEPTH_BELOW_SEABED,
         depth_bsf_available=True,
         channels_present=(contract.QC_MPA,),
@@ -546,6 +555,7 @@ def test_20_21_duplicate_identities_detected_and_contradictory_duplicates_not_av
         test_count=1,
         duplicate_observation_identity_count=0,
         contradictory_duplicate_depth_row_count=2,
+        **_VERIFIED_PRODUCT,
         depth_reference=contract.DEPTH_BELOW_SEABED,
         depth_bsf_available=True,
         channels_present=(contract.QC_MPA,),
@@ -755,6 +765,7 @@ def test_41_43_earthquake_readiness_reports_missing_pga_magnitude_and_stress_sta
         depth_bsf_available=True,
         channels_present=(contract.QC_MPA, contract.FS_KPA, contract.U2_KPA),
         cone_area_ratio_source_stated=True,
+        **_VERIFIED_PRODUCT,
     )
     liq = cpt_readiness.assess_liquefaction_input_readiness(facts)
     eq = liq["earthquake_induced"]
@@ -787,6 +798,8 @@ def test_44_wave_liquefaction_readiness_is_a_separate_block():
     full = cpt_readiness.CptEvidenceFacts(
         machine_readable_profile_available=True,
         canonical_profile_created=True,
+        row_count=1,
+        **_VERIFIED_PRODUCT,
         wave_forcing_available=True,
         water_depth_available=True,
         soil_hydraulic_properties_available=True,
@@ -863,7 +876,8 @@ def test_45b_canonical_parquet_asset_delegates_to_generic_readiness(
         observation_index_column="idx",
     )
     parquet = tmp_path / "cpt_measurements.parquet"
-    build.measurements.to_parquet(parquet, index=False)
+    # MAR-032A: only the canonical writer produces a verified canonical product.
+    cpt_profile.write_canonical_cpt_measurements(build.measurements, parquet, evidence_id="syn")
     result = _register(_project_manifest(tmp_path, "cpt_measurements.parquet"))
     reg = result.registration
     assert reg.readiness_status_intrinsic == contract.READY_WITH_LIMITATIONS
@@ -872,8 +886,12 @@ def test_45b_canonical_parquet_asset_delegates_to_generic_readiness(
     assert axes[contract.DEPTH_REFERENCE]["status"] == contract.READY
     assert axes[contract.SPATIAL_REFERENCE]["status"] == contract.NOT_AVAILABLE
     assert reg.observed_facts["record_count"] == 4
-    # Explicit delegation: the registry calls the generic readiness function, not a copy of it.
-    facts_direct, _ = cpt_adapter.inspect_cpt_asset(parquet)
+    assert reg.observed_facts["canonical_cpt_product_identity_verified"] is True
+    # Explicit delegation: the registry calls the generic readiness function, not a copy of it,
+    # handing it the SHA-256 it computed and the declared role as gate input.
+    facts_direct, _ = cpt_adapter.inspect_cpt_asset(
+        parquet, declared_evidence_role="MEASURED", registered_sha256=reg.sha256
+    )
     direct = cpt_readiness.assess_cpt_readiness(facts_direct)
     assert direct.to_dict() == reg.readiness_result
     calls: list[cpt_readiness.CptEvidenceFacts] = []
@@ -890,7 +908,17 @@ def test_45b_canonical_parquet_asset_delegates_to_generic_readiness(
     pd.DataFrame({"a": [1, 2]}).to_parquet(tmp_path / "other.parquet", index=False)
     other = _register(_project_manifest(tmp_path, "other.parquet"))
     assert other.registration.readiness_status == contract.NOT_READY
-    assert "canonical_columns_missing" in other.registration.observed_facts
+    assert other.registration.observed_facts["canonical_columns_missing"]
+    assert other.registration.observed_facts["structural_canonical_columns_present"] is False
+    # MAR-032A: the SAME canonical frame written by a plain `to_parquet` (no product marker) is a
+    # structural lookalike -- registered, structurally canonical, but NOT a verified CPT profile.
+    build.measurements.to_parquet(tmp_path / "plain.parquet", index=False)
+    plain = _register(_project_manifest(tmp_path, "plain.parquet")).registration
+    assert plain.registration_status == project_registry.REGISTERED
+    assert plain.observed_facts["structural_canonical_columns_present"] is True
+    assert plain.observed_facts["canonical_cpt_product_identity_verified"] is False
+    assert plain.readiness_status_intrinsic == contract.NOT_READY
+    assert plain.readiness_status_effective == contract.NOT_READY
 
 
 def test_46_evidence_role_preserved_and_never_inferred(tmp_path: Path):
@@ -1134,9 +1162,42 @@ def test_readiness_transitions_and_vocabulary():
             channels_present=tuple(contract.CANONICAL_MEASUREMENT_FIELDS),
             coordinates_available=True,
             crs_resolved=True,
+            **_VERIFIED_PRODUCT,
         )
     )
     assert ready.cpt_profile_status == contract.READY
+    assert ready.measured_cpt_profile_verified is True
+    # MAR-032A: the same facts WITHOUT a verified product identity, or WITHOUT the measured
+    # evidence-role gate, can never be READY -- column-level facts alone are insufficient.
+    base = {
+        "source_package_resolved": True,
+        "source_checksum_recorded": True,
+        "machine_readable_profile_available": True,
+        "canonical_profile_created": True,
+        "row_count": 3,
+        "test_count": 1,
+        "depth_reference": contract.DEPTH_BELOW_SEABED,
+        "depth_bsf_available": True,
+        "channels_present": tuple(contract.CANONICAL_MEASUREMENT_FIELDS),
+        "coordinates_available": True,
+        "crs_resolved": True,
+    }
+    assert cpt_readiness.CptEvidenceFacts(**base).measured_cpt_profile_verified is False
+    unmarked = cpt_readiness.assess_cpt_readiness(cpt_readiness.CptEvidenceFacts(**base))
+    assert unmarked.cpt_profile_status == contract.NOT_READY
+    assert any(
+        contract.CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED in r
+        for r in unmarked.axis(contract.DIGITAL_PROFILE).blocking_reasons
+    )
+    role_denied = cpt_readiness.assess_cpt_readiness(
+        cpt_readiness.CptEvidenceFacts(**{**base, "canonical_product_identity_verified": True})
+    )
+    assert role_denied.cpt_profile_status == contract.NOT_READY
+    assert role_denied.axis(contract.DIGITAL_PROFILE).status == contract.READY
+    assert any(
+        contract.CPT_MEASURED_EVIDENCE_ROLE_NOT_VERIFIED in r
+        for r in role_denied.axis(contract.MEASUREMENT_SEMANTICS).blocking_reasons
+    )
     for axis in ready.axes:
         assert axis.status in contract.READINESS_STATUSES
     payload = json.dumps(ready.to_dict())
@@ -1197,6 +1258,10 @@ declared:
     assert "CAN QC SILENTLY BECOME QT? NO" in out
     assert "IS EARTHQUAKE CSR COMPUTED IN MAR-032? NO" in out
     assert "ARE EARTHQUAKE- AND WAVE-INDUCED LIQUEFACTION KEPT SEPARATE? YES" in out
+    assert "IS THE CANONICAL CPT PRODUCT IDENTITY VERIFIED FROM FILE METADATA? YES" in out
+    assert "CAN A CANONICAL-LOOKING UNMARKED PARQUET PASS AS A VERIFIED MAR CPT PROFILE? NO" in out
+    assert "IS THE DECLARED CRS SEMANTICALLY THE SOURCE-DEFINED EPSG:32631 (metre)? YES" in out
+    assert "WERE SOURCE COORDINATES REPROJECTED? NO" in out
     assert (tmp_path / "processed" / "cpt_measurements.parquet").exists()
     # Second run is fully offline (cache) and idempotent.
     assert cli.main(["build-cpt-evidence-poc", str(manifest_path)]) == 0
@@ -1205,3 +1270,463 @@ declared:
     bad.write_text("evidence_id: x\n", encoding="utf-8")
     assert cli.main(["build-cpt-evidence-poc", str(bad)]) == 1
     assert "rejected" in capsys.readouterr().out
+
+
+# --- MAR-032A: canonical product identity, measured-role gate, checksum truth, CRS semantics ------
+
+
+def _canonical_frame() -> pd.DataFrame:
+    return cpt_profile.build_canonical_measurements(
+        _simple_observations(),
+        source_id=SYNTHETIC_TAG,
+        test_id="SYN-001",
+        depth=_depth(),
+        channels=_channels(),
+        observation_index_column="idx",
+    ).measurements
+
+
+def _write_with_metadata(path: Path, df: pd.DataFrame, marker: dict[str, str] | None) -> Path:
+    """Test-only raw writer: arbitrary metadata (or none), deliberately bypassing the canonical
+    writer so defective and absent markers can be manufactured."""
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    if marker is not None:
+        meta = dict(table.schema.metadata or {})
+        meta.update({k.encode("utf-8"): v.encode("utf-8") for k, v in marker.items()})
+        table = table.replace_schema_metadata(meta)
+    pq.write_table(table, path)
+    return path
+
+
+def _genuine_marker(evidence_id: str = SYNTHETIC_TAG) -> dict[str, str]:
+    return {
+        contract.PRODUCT_ROLE_METADATA_KEY: contract.MEASURED_CPT_CPTU_PROFILE,
+        contract.PRODUCT_CONTRACT_METADATA_KEY: contract.CPT_CANONICAL_PROFILE_CONTRACT,
+        contract.PRODUCT_EVIDENCE_ID_METADATA_KEY: evidence_id,
+        contract.PRODUCT_CANONICAL_UNITS_METADATA_KEY: cpt_profile.canonical_units_contract(),
+    }
+
+
+def _lookalike_frame() -> pd.DataFrame:
+    """MAR-032A Section 11 adversarial table: valid-looking canonical field names, no product
+    metadata. Every value is a SYNTHETIC_TEST_FIXTURE."""
+
+    return pd.DataFrame(
+        {
+            "source_id": ["LOOKALIKE"] * 3,
+            "test_id": ["FAKE-1"] * 3,
+            "observation_index": [1.0, 2.0, 3.0],
+            "depth_source_value": [0.0, 0.1, 0.2],
+            "depth_reference": [contract.DEPTH_BELOW_SEABED] * 3,
+            "depth_bsf_m": [0.0, 0.1, 0.2],
+            "qc_mpa": [1.0, 2.0, 3.0],
+            "fs_kpa": [10.0, 20.0, 30.0],
+            "u2_kpa": [1.0, 2.0, 3.0],
+        }
+    )
+
+
+_FOOT_UTM31_PROJ4 = "+proj=utm +zone=31 +datum=WGS84 +units=ft +no_defs"
+_US_FOOT_UTM31_PROJ4 = "+proj=utm +zone=31 +datum=WGS84 +units=us-ft +no_defs"
+
+
+def _epsg_free_wkt_32631() -> str:
+    from pyproj import CRS
+
+    wkt = re.sub(r',\s*ID\["EPSG",\d+\]', "", CRS.from_epsg(32631).to_wkt())
+    assert "EPSG" not in wkt
+    return wkt
+
+
+def test_032a_writer_stamps_versioned_marker_and_values_are_unchanged(tmp_path: Path):
+    df = _canonical_frame()
+    marked = cpt_profile.write_canonical_cpt_measurements(
+        df, tmp_path / "marked.parquet", evidence_id="syn_ev"
+    )
+    plain = tmp_path / "plain.parquet"
+    df.to_parquet(plain, index=False)
+    marker = cpt_profile.read_canonical_cpt_product_marker(marked)
+    assert marker.verified is True and marker.problems == ()
+    assert marker.product_role == contract.MEASURED_CPT_CPTU_PROFILE
+    assert marker.contract_version == "CPT_CANONICAL_PROFILE_V1"
+    assert marker.evidence_id == "syn_ev"
+    assert json.loads(marker.canonical_units) == contract.CANONICAL_FIELD_UNITS
+    assert set(marker.observed) == set(contract.CANONICAL_PRODUCT_METADATA_KEYS)
+    # Same rows/values, different raw bytes: identity is compared on VALUES, not file SHA-256.
+    pd.testing.assert_frame_equal(pd.read_parquet(marked), pd.read_parquet(plain))
+    assert cpt_profile.canonical_value_sha256(
+        pd.read_parquet(marked)
+    ) == cpt_profile.canonical_value_sha256(df)
+    assert (
+        hashlib.sha256(marked.read_bytes()).hexdigest()
+        != hashlib.sha256(plain.read_bytes()).hexdigest()
+    )
+    unmarked = cpt_profile.read_canonical_cpt_product_marker(plain)
+    assert unmarked.verified is False
+    assert unmarked.product_role is None and unmarked.observed == {}
+    # Bounded writer: no empty evidence id, no frame narrower than the product contract.
+    with pytest.raises(cpt_profile.CptProfileError):
+        cpt_profile.write_canonical_cpt_measurements(df, tmp_path / "x.parquet", evidence_id="  ")
+    with pytest.raises(cpt_profile.CptProfileError):
+        cpt_profile.write_canonical_cpt_measurements(
+            df.drop(columns=[contract.QT_MPA]), tmp_path / "y.parquet", evidence_id="syn"
+        )
+    assert not (tmp_path / "x.parquet").exists() and not (tmp_path / "y.parquet").exists()
+
+
+def test_032a_unmarked_lookalike_parquet_is_not_a_verified_cpt_profile(tmp_path: Path):
+    # Canonical-looking columns AND a canonical-looking filename: neither establishes identity.
+    _lookalike_frame().to_parquet(tmp_path / "cpt_measurements.parquet", index=False)
+    reg = _register(_project_manifest(tmp_path, "cpt_measurements.parquet")).registration
+    assert reg.registration_status == project_registry.REGISTERED
+    obs = reg.observed_facts
+    assert obs["structural_canonical_columns_present"] is True
+    assert obs["canonical_cpt_product_identity_verified"] is False
+    assert obs["canonical_product_role_observed"] is None
+    assert obs["canonical_product_marker"]["observed_metadata"] == {}
+    assert obs["measured_evidence_role_gate"]["verified"] is False
+    assert obs["measured_cpt_profile_verified"] is False
+    assert reg.evidence_role == "MEASURED"  # declared role preserved; it is not what verifies
+    assert reg.readiness_status_intrinsic == contract.NOT_READY
+    assert reg.readiness_status_effective == contract.NOT_READY
+    axes = {a["axis"]: a for a in reg.readiness_result["axes"]}
+    assert axes[contract.DIGITAL_PROFILE]["status"] == contract.NOT_READY
+    assert any(
+        contract.CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED in r
+        for r in axes[contract.DIGITAL_PROFILE]["blocking_reasons"]
+    )
+    assert reg.readiness_result["measured_cpt_profile_verified"] is False
+    # It contributes no measured resistance input to a FUTURE liquefaction framework either.
+    facts, _ = cpt_adapter.inspect_cpt_asset(
+        tmp_path / "cpt_measurements.parquet",
+        declared_evidence_role="MEASURED",
+        registered_sha256=reg.sha256,
+    )
+    liq = cpt_readiness.assess_liquefaction_input_readiness(facts)
+    assert liq["measured_cpt_profile_verified"] is False
+    eq = liq["earthquake_induced"]["required_evidence"]
+    assert eq["machine_readable_cpt_profile"] == contract.NOT_AVAILABLE
+    assert eq["qc"] == contract.NOT_AVAILABLE and eq["sleeve_friction_fs"] == contract.NOT_AVAILABLE
+    assert (
+        liq["wave_current_induced"]["required_evidence"]["soil_profile"] == contract.NOT_AVAILABLE
+    )
+
+
+def test_032a_marked_bytes_with_non_measured_declared_role_are_denied(tmp_path: Path):
+    marked = cpt_profile.write_canonical_cpt_measurements(
+        _canonical_frame(), tmp_path / "prod.parquet", evidence_id="syn"
+    )
+    measured = _register(_project_manifest(tmp_path, "prod.parquet", role="MEASURED")).registration
+    assert measured.readiness_status_intrinsic == contract.READY_WITH_LIMITATIONS
+    assert measured.observed_facts["measured_cpt_profile_verified"] is True
+    assert measured.readiness_result["measured_cpt_profile_verified"] is True
+    for role in ("SOURCE_INTERPRETED", "DERIVED"):
+        reg = _register(_project_manifest(tmp_path, "prod.parquet", role=role)).registration
+        assert reg.sha256 == measured.sha256  # identical bytes
+        assert reg.evidence_role == role  # declared role preserved exactly, never mutated
+        obs = reg.observed_facts
+        assert obs["canonical_cpt_product_identity_verified"] is True  # identity IS verified ...
+        assert obs["canonical_product_role_observed"] == contract.MEASURED_CPT_CPTU_PROFILE
+        assert obs["measured_evidence_role_gate"] == {
+            "observed_product_role": contract.MEASURED_CPT_CPTU_PROFILE,
+            "declared_evidence_role": role,
+            "verified": False,
+        }
+        assert obs["measured_cpt_profile_verified"] is False  # ... but it is not measured evidence
+        assert reg.readiness_status_intrinsic == contract.NOT_READY
+        assert reg.readiness_status_effective == contract.NOT_READY
+        axes = {a["axis"]: a for a in reg.readiness_result["axes"]}
+        assert axes[contract.DIGITAL_PROFILE]["status"] == contract.READY
+        assert axes[contract.MEASUREMENT_SEMANTICS]["status"] == contract.NOT_READY
+        assert any(
+            contract.CPT_MEASURED_EVIDENCE_ROLE_NOT_VERIFIED in r
+            for r in axes[contract.MEASUREMENT_SEMANTICS]["blocking_reasons"]
+        )
+        facts, _ = cpt_adapter.inspect_cpt_asset(
+            marked, declared_evidence_role=role, registered_sha256=reg.sha256
+        )
+        eq = cpt_readiness.assess_liquefaction_input_readiness(facts)["earthquake_induced"]
+        assert eq["required_evidence"]["qc"] == contract.NOT_AVAILABLE
+        assert eq["required_evidence"]["machine_readable_cpt_profile"] == contract.NOT_AVAILABLE
+    # No registration rewrote the file's own marker.
+    assert (
+        cpt_profile.read_canonical_cpt_product_marker(marked).product_role
+        == contract.MEASURED_CPT_CPTU_PROFILE
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "marker", "drop"),
+    [
+        (
+            "malformed",
+            {
+                contract.PRODUCT_ROLE_METADATA_KEY: "",
+                contract.PRODUCT_CONTRACT_METADATA_KEY: "garbage",
+                contract.PRODUCT_EVIDENCE_ID_METADATA_KEY: " ",
+                contract.PRODUCT_CANONICAL_UNITS_METADATA_KEY: "{not json",
+            },
+            None,
+        ),
+        (
+            "wrong_version",
+            {
+                **_genuine_marker(),
+                contract.PRODUCT_CONTRACT_METADATA_KEY: "CPT_CANONICAL_PROFILE_V0",
+            },
+            None,
+        ),
+        (
+            "wrong_role",
+            {**_genuine_marker(), contract.PRODUCT_ROLE_METADATA_KEY: "DERIVED_CPT_INTERPRETATION"},
+            None,
+        ),
+        (
+            "wrong_units",
+            {
+                **_genuine_marker(),
+                contract.PRODUCT_CANONICAL_UNITS_METADATA_KEY: json.dumps(
+                    {**contract.CANONICAL_FIELD_UNITS, "qc_mpa": "kPa"}
+                ),
+            },
+            None,
+        ),
+        ("missing_column", _genuine_marker(), contract.DEPTH_BSF_M),
+    ],
+)
+def test_032a_defective_markers_and_structure_never_verify(
+    tmp_path: Path, label: str, marker: dict[str, str], drop: str | None
+):
+    df = _canonical_frame()
+    if drop:
+        df = df.drop(columns=[drop])
+    _write_with_metadata(tmp_path / "p.parquet", df, marker)
+    reg = _register(_project_manifest(tmp_path, "p.parquet")).registration
+    assert reg.registration_status == project_registry.REGISTERED
+    obs = reg.observed_facts
+    assert obs["canonical_cpt_product_identity_verified"] is False, label
+    assert obs["canonical_product_identity_problems"], label
+    assert obs["measured_cpt_profile_verified"] is False, label
+    assert reg.readiness_status_intrinsic == contract.NOT_READY, label
+    assert reg.readiness_status_effective == contract.NOT_READY, label
+    if drop:
+        assert obs["structural_canonical_columns_present"] is False
+        assert obs["canonical_columns_missing"] == [drop]
+    else:
+        assert obs["structural_canonical_columns_present"] is True
+    # Whatever the file claims about itself is preserved verbatim as OBSERVED metadata.
+    assert obs["canonical_product_marker"]["observed_metadata"] == marker
+
+
+def test_032a_registration_sha_is_recorded_and_never_invented(tmp_path: Path):
+    marked = cpt_profile.write_canonical_cpt_measurements(
+        _canonical_frame(), tmp_path / "prod.parquet", evidence_id="syn"
+    )
+    expected = hashlib.sha256(marked.read_bytes()).hexdigest()
+    reg = _register(_project_manifest(tmp_path, "prod.parquet")).registration
+    assert reg.sha256 == expected
+    assert reg.observed_facts["registered_asset_sha256"] == expected
+    axes = {a["axis"]: a for a in reg.readiness_result["axes"]}
+    assert axes[contract.SOURCE_PACKAGE]["facts"]["registered_asset_sha256"] == expected
+    assert axes[contract.SOURCE_PACKAGE]["facts"]["source_checksum_recorded"] is True
+    # Standalone adapter call without a registration SHA-256: no checksum evidence is claimed.
+    facts, obs = cpt_adapter.inspect_cpt_asset(marked, declared_evidence_role="MEASURED")
+    assert facts.source_checksum_recorded is False and facts.registered_asset_sha256 is None
+    assert obs["registered_asset_sha256"] is None
+    standalone = cpt_readiness.assess_cpt_readiness(facts)
+    assert standalone.axis(contract.SOURCE_PACKAGE).status == contract.NOT_READY
+    assert any("SHA-256" in r for r in standalone.axis(contract.SOURCE_PACKAGE).blocking_reasons)
+    # A non-SHA string is not checksum evidence either.
+    facts_bad, _ = cpt_adapter.inspect_cpt_asset(
+        marked, declared_evidence_role="MEASURED", registered_sha256="not-a-sha"
+    )
+    assert facts_bad.source_checksum_recorded is False and facts_bad.registered_asset_sha256 is None
+    # Documentary and unrecognised files carry the real SHA-256 too, and verify nothing.
+    (tmp_path / "log.pdf").write_bytes(_fake_pdf_bytes())
+    pdf = _register(_project_manifest(tmp_path, "log.pdf")).registration
+    assert pdf.observed_facts["registered_asset_sha256"] == (
+        hashlib.sha256(_fake_pdf_bytes()).hexdigest()
+    )
+    (tmp_path / "cpt.txt").write_text("stub", encoding="utf-8")
+    stub = _register(_project_manifest(tmp_path, "cpt.txt")).registration
+    assert stub.observed_facts["registered_asset_sha256"] == hashlib.sha256(b"stub").hexdigest()
+    assert stub.observed_facts["canonical_cpt_product_identity_verified"] is False
+    assert pdf.observed_facts["canonical_cpt_product_identity_verified"] is False
+
+
+def test_032a_qc_qt_unit_and_depth_semantics_unchanged_through_the_writer(tmp_path: Path):
+    marked = cpt_profile.write_canonical_cpt_measurements(
+        _canonical_frame(), tmp_path / "prod.parquet", evidence_id="syn"
+    )
+    back = pd.read_parquet(marked)
+    obs = _simple_observations()
+    np.testing.assert_allclose(back[contract.QC_MPA], obs["qc"])  # measured qc, MPa -> MPa
+    assert back[contract.QT_MPA].isna().all()  # qt never copied from qc, never computed
+    np.testing.assert_allclose(back[contract.FS_KPA], obs["fs"])  # declared kPa -> kPa
+    np.testing.assert_allclose(back[contract.U2_KPA], obs["u"])
+    np.testing.assert_allclose(back[contract.DEPTH_BSF_M], obs["depth"])
+    assert back[contract.DEPTH_REFERENCE_FIELD].unique().tolist() == [contract.DEPTH_BELOW_SEABED]
+    assert back[contract.DEPTH_SOURCE_UNIT].unique().tolist() == ["m"]
+    # The unit contract MAR-032A serializes into the marker is the unchanged MAR-032 contract.
+    assert contract.CANONICAL_FIELD_UNITS == {
+        "depth_bsf_m": "m",
+        "qc_mpa": "MPa",
+        "qt_mpa": "MPa",
+        "fs_kpa": "kPa",
+        "u2_kpa": "kPa",
+    }
+    assert contract.UNIT_CONVERSION_FACTORS[("MPa", "kPa")] == 1000.0
+    assert contract.NOT_COMPUTED_FLAGS["qt_unequal_area_correction_applied"] is False
+    assert (
+        json.loads(cpt_profile.read_canonical_cpt_product_marker(marked).canonical_units)
+        == contract.CANONICAL_FIELD_UNITS
+    )
+
+
+def test_032a_crs_semantic_equality_matrix():
+    from pyproj import CRS
+
+    tests = _tests_with_coords()
+    accepted = {
+        "EPSG:32631": "EPSG:32631",
+        "EPSG-free WKT": _epsg_free_wkt_32631(),
+        "metre proj string": "+proj=utm +zone=31 +datum=WGS84 +units=m +no_defs",
+    }
+    for label, declared in accepted.items():
+        ok = provider.assess_crs(declared, tests)
+        assert ok.crs_resolved is True and ok.conflict is None, label
+        assert ok.declared_crs_semantically_matches_source is True, label
+        assert ok.resolved_crs == "EPSG:32631" == provider.SOURCE_REFERENCE_CRS
+        assert ok.declared_crs_horizontal_unit == "metre"
+        assert ok.declared_crs_horizontal_unit_to_m_factor == 1.0
+        assert ok.source_horizontal_unit == "metre" and ok.reprojection_performed is False
+    assert (
+        accepted["EPSG-free WKT"] != "EPSG:32631"
+    )  # acceptance is semantic, never string equality
+    rejected = {
+        "EPSG:32632": ("UTM zone", "metre", 1.0),
+        "EPSG:23031": ("WGS 84", "metre", 1.0),  # ED50 / UTM 31N
+        "EPSG:4326": ("not projected", "degree", None),
+        _FOOT_UTM31_PROJ4: ("foot", "foot", 0.3048),
+        _US_FOOT_UTM31_PROJ4: ("US survey foot", "US survey foot", 0.3048006096012192),
+        CRS.from_proj4(_FOOT_UTM31_PROJ4).to_wkt(): ("foot", "foot", 0.3048),
+        CRS.from_proj4(_US_FOOT_UTM31_PROJ4).to_wkt(): (
+            "US survey foot",
+            "US survey foot",
+            0.3048006096012192,
+        ),
+    }
+    for declared, (fragment, unit, factor) in rejected.items():
+        bad = provider.assess_crs(declared, tests)
+        assert bad.crs_resolved is False and bad.resolved_crs is None, declared
+        assert bad.declared_crs_semantically_matches_source is False, declared
+        assert bad.conflict and fragment in bad.conflict and "EPSG:32631" in bad.conflict, declared
+        assert bad.declared_crs_horizontal_unit == unit, declared
+        if factor is None:
+            assert bad.declared_crs_horizontal_unit_to_m_factor is None, declared
+        else:  # WKT serialization rounds the unit factor in its last digits
+            assert bad.declared_crs_horizontal_unit_to_m_factor == pytest.approx(
+                factor, rel=1e-12
+            ), declared
+        assert bad.reprojection_performed is False
+    # The foot systems satisfy every heuristic the pre-MAR-032A check relied on; only semantic
+    # comparison against the source-defined CRS plus the explicit unit check rejects them.
+    for proj4 in (_FOOT_UTM31_PROJ4, _US_FOOT_UTM31_PROJ4):
+        crs = CRS.from_user_input(proj4)
+        assert crs.is_projected and crs.utm_zone == "31N" and "1984" in crs.datum.name
+        assert provider.source_reference_crs() != crs
+        assert provider.horizontal_axis_unit(crs)[1] != 1.0
+    # A foot-CRS conflict makes the SPATIAL axis and the whole CPT evidence NOT_READY.
+    facts = cpt_readiness.CptEvidenceFacts(
+        source_package_resolved=True,
+        source_checksum_recorded=True,
+        machine_readable_profile_available=True,
+        canonical_profile_created=True,
+        **_VERIFIED_PRODUCT,
+        row_count=1,
+        test_count=1,
+        depth_reference=contract.DEPTH_BELOW_SEABED,
+        depth_bsf_available=True,
+        channels_present=(contract.QC_MPA,),
+        coordinates_available=True,
+        crs_resolved=False,
+        crs_conflict=provider.assess_crs(_FOOT_UTM31_PROJ4, tests).conflict,
+    )
+    result = cpt_readiness.assess_cpt_readiness(facts)
+    assert result.axis(contract.SPATIAL_REFERENCE).status == contract.NOT_READY
+    assert result.cpt_profile_status == contract.NOT_READY
+
+
+@pytest.mark.parametrize("declared", [_FOOT_UTM31_PROJ4, _US_FOOT_UTM31_PROJ4])
+def test_032a_rejected_foot_crs_writes_no_gpkg_and_nothing_is_reprojected(
+    tmp_path: Path, fake_http: list[str], declared: str
+):
+    result = evidence_build.run_cpt_evidence_build(_manifest(tmp_path, crs=declared))
+    assert "cpt_locations" not in result.outputs
+    assert not (tmp_path / "processed" / "cpt_locations.gpkg").exists()
+    assert "cpt_tests" in result.outputs and "cpt_measurements" in result.outputs
+    assert result.cpt_readiness.cpt_profile_status == contract.NOT_READY
+    assert result.cpt_readiness.axis(contract.SPATIAL_REFERENCE).status == contract.NOT_READY
+    ref = result.metadata["coordinate_reference"]
+    assert ref["source_reference_crs"] == "EPSG:32631" and ref["source_horizontal_unit"] == "metre"
+    assert ref["declared_crs_semantically_matches_source"] is False
+    assert ref["declared_crs_horizontal_unit"] in ("foot", "US survey foot")
+    assert ref["reprojection_performed"] is False and ref["resolved_crs"] is None
+    # Raw source coordinates are preserved untouched in the tests table -- no conversion applied.
+    tests = pd.read_parquet(result.outputs["cpt_tests"])
+    assert tests["position_x_raw"].tolist() == [1000.5, 1000.5]
+    assert tests["position_y_raw"].tolist() == [2000.5, 2000.5]
+    # The canonical product is still a marked, identity-verified MEASURED profile: the CRS
+    # conflict is a SPATIAL finding, never a reason to mislabel the measurements.
+    assert result.facts.canonical_product_identity_verified is True
+    for module in (provider, evidence_build, cpt_profile, cpt_adapter):
+        source = inspect.getsource(module)
+        assert ".to_crs(" not in source and "Transformer" not in source
+        assert "estimate_utm_crs" not in source
+
+
+def test_032a_end_to_end_marker_and_crs_facts_in_real_shape_outputs(
+    tmp_path: Path, fake_http: list[str]
+):
+    result = evidence_build.run_cpt_evidence_build(_manifest(tmp_path))
+    meta = result.metadata
+    marker = meta["canonical_product_marker"]
+    assert marker["verified"] is True
+    assert marker["product_role"] == contract.MEASURED_CPT_CPTU_PROFILE
+    assert marker["contract_version"] == contract.CPT_CANONICAL_PROFILE_CONTRACT
+    assert marker["evidence_id"] == "syn_cptu"
+    assert meta["canonical_product_identity_verified"] is True
+    assert meta["measured_cpt_profile_verified"] is True
+    on_disk = pd.read_parquet(result.outputs["cpt_measurements"])
+    assert meta["measurements_value_sha256"] == cpt_profile.canonical_value_sha256(on_disk)
+    assert cpt_profile.read_canonical_cpt_product_marker(
+        result.outputs["cpt_measurements"]
+    ).verified
+    ref = meta["coordinate_reference"]
+    assert ref["source_reference_crs"] == "EPSG:32631" and ref["source_horizontal_unit"] == "metre"
+    assert ref["declared_crs_semantically_matches_source"] is True
+    assert ref["declared_crs_horizontal_unit"] == "metre"
+    assert ref["declared_crs_horizontal_unit_to_m_factor"] == 1.0
+    assert ref["reprojection_performed"] is False and ref["resolved_crs"] == "EPSG:32631"
+    readiness = json.loads(result.outputs["cpt_readiness"].read_text(encoding="utf-8"))
+    assert readiness["measured_cpt_profile_verified"] is True
+    assert readiness["cpt_evidence_readiness"]["status"] == contract.READY_WITH_LIMITATIONS
+    liq = json.loads(result.outputs["liquefaction_readiness"].read_text(encoding="utf-8"))
+    assert liq["measured_cpt_profile_verified"] is True
+    assert liq["earthquake_induced"]["required_evidence"]["qc"] == contract.AVAILABLE
+    assert liq["earthquake_induced"]["required_evidence"]["qt"] == contract.NOT_AVAILABLE
+    assert liq["status"] == contract.NOT_EVALUABLE
+    # The genuine provider product registered through the generic project layer: as MEASURED it
+    # delegates to the same readiness and verifies; as DERIVED it keeps its role and is denied.
+    rel = result.outputs["cpt_measurements"].relative_to(tmp_path).as_posix()
+    measured = _register(_project_manifest(tmp_path, rel)).registration
+    assert measured.readiness_status_intrinsic == contract.READY_WITH_LIMITATIONS
+    assert measured.observed_facts["canonical_cpt_product_identity_verified"] is True
+    assert measured.observed_facts["canonical_product_marker"]["evidence_id"] == "syn_cptu"
+    derived = _register(_project_manifest(tmp_path, rel, role="DERIVED")).registration
+    assert derived.evidence_role == "DERIVED"
+    assert derived.readiness_status_intrinsic == contract.NOT_READY

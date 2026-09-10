@@ -44,6 +44,23 @@ def format_summary_lines(result: CptEvidenceBuildResult) -> list[str]:
             f"{'resolved' if facts.crs_resolved else 'unresolved'}"
             + (f"; CONFLICT: {facts.crs_conflict}" if facts.crs_conflict else "")
         )
+        crs_ref = result.metadata.get("coordinate_reference", {})
+        lines.append(
+            f"  source reference CRS: {crs_ref.get('source_reference_crs')} "
+            f"({crs_ref.get('source_horizontal_unit')}); declared CRS semantically matches "
+            f"source: {crs_ref.get('declared_crs_semantically_matches_source')}; declared "
+            f"horizontal unit: {crs_ref.get('declared_crs_horizontal_unit')} "
+            f"(x{crs_ref.get('declared_crs_horizontal_unit_to_m_factor')} m); reprojection "
+            f"performed: {crs_ref.get('reprojection_performed')}"
+        )
+        lines.append(
+            "  canonical product identity: "
+            f"{'VERIFIED' if facts.canonical_product_identity_verified else 'NOT VERIFIED'} "
+            f"(observed role {facts.canonical_product_role_observed}, contract "
+            f"{facts.canonical_product_contract_observed}); measured CPT profile verified: "
+            f"{facts.measured_cpt_profile_verified}; value SHA-256 "
+            f"{str(result.metadata.get('measurements_value_sha256'))[:16]}..."
+        )
     else:
         lines.append("Canonical numeric profile: NOT CREATED (no machine-readable numeric source)")
     lines.append("")
@@ -75,6 +92,7 @@ def format_summary_lines(result: CptEvidenceBuildResult) -> list[str]:
 
 def format_acceptance_lines(result: CptEvidenceBuildResult) -> list[str]:
     facts = result.facts
+    crs_ref = result.metadata.get("coordinate_reference", {})
     yes_no = lambda flag: "YES" if flag else "NO"  # noqa: E731
     return [
         "DOES CPT FILE EXISTENCE ALONE IMPLY LIQUEFACTION READINESS? NO",
@@ -82,6 +100,14 @@ def format_acceptance_lines(result: CptEvidenceBuildResult) -> list[str]:
         f"WAS THE ACQUIRED PACKAGE CHECKSUM-RECORDED? {yes_no(facts.source_checksum_recorded)}",
         "DOES THE PACKAGE CONTAIN MACHINE-READABLE NUMERIC CPT/CPTU PROFILES? "
         f"{yes_no(facts.machine_readable_profile_available)}",
+        "IS THE CANONICAL CPT PRODUCT IDENTITY VERIFIED FROM FILE METADATA? "
+        f"{yes_no(facts.canonical_product_identity_verified)}",
+        f"OBSERVED CANONICAL PRODUCT ROLE: {facts.canonical_product_role_observed}",
+        "CAN A CANONICAL-LOOKING UNMARKED PARQUET PASS AS A VERIFIED MAR CPT PROFILE? NO",
+        "IS THE DECLARED CRS SEMANTICALLY THE SOURCE-DEFINED "
+        f"{crs_ref.get('source_reference_crs')} ({crs_ref.get('source_horizontal_unit')})? "
+        f"{yes_no(crs_ref.get('declared_crs_semantically_matches_source'))}",
+        "WERE SOURCE COORDINATES REPROJECTED? NO",
         "WERE PDF/IMAGE LOGS OCR-DIGITIZED? NO",
         "CAN QC SILENTLY BECOME QT? NO",
         "ARE UNKNOWN CPT UNITS GUESSED FROM MAGNITUDE? NO",

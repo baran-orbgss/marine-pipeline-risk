@@ -26,7 +26,9 @@ paths:
 
 declared:
   # USER-declared CRS for the test positions. The source itself states "UTM 31 / WGS 84" with
-  # false northing 0.00 (northern hemisphere). This declaration is accepted as the resolved CRS
-  # only because the provider verifies it is semantically that same system (projected, UTM zone
-  # 31N, WGS 84 datum); it never overrides or reprojects the source coordinates.
+  # false northing 0.00 (northern hemisphere), metre -- i.e. EPSG:32631. This declaration is
+  # accepted as the resolved CRS only because the provider verifies (MAR-032A) that pyproj finds
+  # it SEMANTICALLY equivalent to EPSG:32631 and that its horizontal axes are in metres (a
+  # WGS 84 / UTM 31N system in feet is a conflict); it never overrides or reprojects the source
+  # coordinates.
   coordinate_crs: EPSG:32631

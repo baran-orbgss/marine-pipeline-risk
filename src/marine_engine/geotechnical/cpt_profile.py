@@ -20,13 +20,18 @@ Rules enforced here, not left to callers:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from marine_engine.geotechnical import cpt_contract as contract
 
@@ -34,13 +39,30 @@ __all__ = [
     "ChannelDeclaration",
     "DepthDeclaration",
     "CanonicalBuild",
+    "CanonicalProductMarker",
     "CptProfileError",
+    "CANONICAL_PRODUCT_COLUMNS",
     "conversion_factor",
     "build_canonical_measurements",
     "concat_canonical",
     "compute_profile_qa",
     "canonical_channels_present",
+    "canonical_units_contract",
+    "canonical_value_sha256",
+    "write_canonical_cpt_measurements",
+    "read_canonical_cpt_product_marker",
 ]
+
+# Every column a canonical CPT measurements product MUST carry (MAR-032A Section 8). Superset of
+# `contract.CANONICAL_STRUCTURAL_COLUMNS`: the writer refuses anything narrower.
+CANONICAL_PRODUCT_COLUMNS = (
+    *contract.IDENTITY_FIELDS,
+    contract.DEPTH_SOURCE_VALUE,
+    contract.DEPTH_SOURCE_UNIT,
+    contract.DEPTH_REFERENCE_FIELD,
+    contract.DEPTH_BSF_M,
+    *contract.CANONICAL_MEASUREMENT_FIELDS,
+)
 
 
 class CptProfileError(ValueError):
@@ -358,3 +380,151 @@ def is_finite_number(value: Any) -> bool:
         return math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
+
+
+# --- MAR-032A: canonical CPT product marker (file-level Parquet schema metadata) ------------------
+
+
+def canonical_units_contract() -> str:
+    """Deterministic serialized unit contract: sorted-key, whitespace-free JSON of
+    `contract.CANONICAL_FIELD_UNITS`. Stored verbatim in the product marker so a reader can prove
+    the file was written against the same unit contract it is about to be read with."""
+
+    return json.dumps(contract.CANONICAL_FIELD_UNITS, sort_keys=True, separators=(",", ":"))
+
+
+def canonical_value_sha256(measurements: pd.DataFrame) -> str:
+    """Content-VALUE identity of a canonical table: SHA-256 of a deterministic CSV serialization
+    (full-precision floats, LF line ends). Independent of Parquet encoding and file metadata, so
+    two files with different raw bytes but identical rows/values share this hash."""
+
+    payload = measurements.to_csv(index=False, lineterminator="\n", float_format="%.17g")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class CanonicalProductMarker:
+    """What the file's own schema metadata says about itself (OBSERVED, never declared), plus the
+    verification verdict against the current canonical contract. `observed` holds every
+    `marine_engine_*` metadata entry exactly as read (decoded), whether or not it verifies."""
+
+    observed: dict[str, str]
+    product_role: str | None
+    contract_version: str | None
+    evidence_id: str | None
+    canonical_units: str | None
+    verified: bool
+    problems: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "observed_metadata": dict(self.observed),
+            "product_role": self.product_role,
+            "contract_version": self.contract_version,
+            "evidence_id": self.evidence_id,
+            "canonical_units": self.canonical_units,
+            "verified": self.verified,
+            "problems": list(self.problems),
+            "expected": {
+                contract.PRODUCT_ROLE_METADATA_KEY: contract.MEASURED_CPT_CPTU_PROFILE,
+                contract.PRODUCT_CONTRACT_METADATA_KEY: contract.CPT_CANONICAL_PROFILE_CONTRACT,
+                contract.PRODUCT_CANONICAL_UNITS_METADATA_KEY: canonical_units_contract(),
+            },
+        }
+
+
+def write_canonical_cpt_measurements(
+    measurements: pd.DataFrame, path: Path, *, evidence_id: str
+) -> Path:
+    """The ONLY writer of a canonical MAR CPT measurements Parquet product. Writes the frame's
+    values unchanged (same pyarrow conversion pandas itself uses) and stamps the explicit,
+    versioned product marker into the file-level schema metadata:
+
+        marine_engine_product_role     = MEASURED_CPT_CPTU_PROFILE
+        marine_engine_cpt_contract     = CPT_CANONICAL_PROFILE_V1
+        marine_engine_evidence_id      = <non-empty evidence id>
+        marine_engine_canonical_units  = canonical_units_contract()
+
+    Refuses (raises `CptProfileError`) an empty evidence id or a frame missing any
+    `CANONICAL_PRODUCT_COLUMNS` member -- a product can never be narrower than its contract."""
+
+    if not isinstance(evidence_id, str) or not evidence_id.strip():
+        raise CptProfileError("canonical CPT product requires a non-empty evidence_id")
+    missing = [c for c in CANONICAL_PRODUCT_COLUMNS if c not in measurements.columns]
+    if missing:
+        raise CptProfileError(
+            f"canonical CPT product is missing required column(s) {missing}; refusing to write"
+        )
+    table = pa.Table.from_pandas(measurements, preserve_index=False)
+    marker = {
+        contract.PRODUCT_ROLE_METADATA_KEY: contract.MEASURED_CPT_CPTU_PROFILE,
+        contract.PRODUCT_CONTRACT_METADATA_KEY: contract.CPT_CANONICAL_PROFILE_CONTRACT,
+        contract.PRODUCT_EVIDENCE_ID_METADATA_KEY: evidence_id,
+        contract.PRODUCT_CANONICAL_UNITS_METADATA_KEY: canonical_units_contract(),
+    }
+    metadata = dict(table.schema.metadata or {})
+    metadata.update({k.encode("utf-8"): v.encode("utf-8") for k, v in marker.items()})
+    table = table.replace_schema_metadata(metadata)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, path)
+    return path
+
+
+def read_canonical_cpt_product_marker(path: Path) -> CanonicalProductMarker:
+    """Read the OBSERVED product marker from a Parquet file's schema metadata and verify it against
+    the current canonical contract. Reads the schema only (no row data). Raises whatever pyarrow
+    raises for a file that is not a readable Parquet file; the caller decides how to classify it.
+
+    Verification requires ALL of: role == MEASURED_CPT_CPTU_PROFILE, contract ==
+    CPT_CANONICAL_PROFILE_V1, non-empty evidence id, and a canonical-units entry that parses to
+    exactly `contract.CANONICAL_FIELD_UNITS`. Anything else is reported as a named problem."""
+
+    schema = pq.read_schema(path)
+    observed: dict[str, str] = {}
+    for raw_key, raw_value in (schema.metadata or {}).items():
+        try:
+            key = raw_key.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if key.startswith("marine_engine_"):
+            observed[key] = raw_value.decode("utf-8", errors="replace")
+
+    problems: list[str] = []
+    role = observed.get(contract.PRODUCT_ROLE_METADATA_KEY)
+    if role is None:
+        problems.append(f"no {contract.PRODUCT_ROLE_METADATA_KEY} metadata")
+    elif role != contract.MEASURED_CPT_CPTU_PROFILE:
+        problems.append(f"product role {role!r} is not {contract.MEASURED_CPT_CPTU_PROFILE!r}")
+    version = observed.get(contract.PRODUCT_CONTRACT_METADATA_KEY)
+    if version is None:
+        problems.append(f"no {contract.PRODUCT_CONTRACT_METADATA_KEY} metadata")
+    elif version != contract.CPT_CANONICAL_PROFILE_CONTRACT:
+        problems.append(
+            f"canonical contract {version!r} is not {contract.CPT_CANONICAL_PROFILE_CONTRACT!r}"
+        )
+    evidence_id = observed.get(contract.PRODUCT_EVIDENCE_ID_METADATA_KEY)
+    if evidence_id is None or not evidence_id.strip():
+        problems.append(f"missing or empty {contract.PRODUCT_EVIDENCE_ID_METADATA_KEY} metadata")
+    units = observed.get(contract.PRODUCT_CANONICAL_UNITS_METADATA_KEY)
+    if units is None:
+        problems.append(f"no {contract.PRODUCT_CANONICAL_UNITS_METADATA_KEY} metadata")
+    else:
+        try:
+            parsed = json.loads(units)
+        except ValueError:
+            parsed = None
+        if parsed != contract.CANONICAL_FIELD_UNITS:
+            problems.append(
+                "canonical unit contract in file differs from the current "
+                f"{contract.CPT_CANONICAL_PROFILE_CONTRACT} unit contract"
+            )
+    return CanonicalProductMarker(
+        observed=observed,
+        product_role=role,
+        contract_version=version,
+        evidence_id=evidence_id,
+        canonical_units=units,
+        verified=not problems,
+        problems=tuple(problems),
+    )

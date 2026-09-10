@@ -38,6 +38,14 @@ class CptEvidenceFacts:
     documentary_evidence_available: bool = False
     machine_readable_profile_available: bool = False
     canonical_profile_created: bool = False
+    # MAR-032A: OBSERVED canonical-product identity (file-level marker written by the canonical
+    # writer and read back from the bytes) and the measured-evidence-role gate. Both default to
+    # the honest 'not verified' state: canonical-looking columns alone never set them.
+    canonical_product_identity_verified: bool = False
+    canonical_product_role_observed: str | None = None
+    canonical_product_contract_observed: str | None = None
+    measured_evidence_role_verified: bool = False
+    registered_asset_sha256: str | None = None
     row_count: int = 0
     test_count: int = 0
     declared_test_count: int | None = None
@@ -70,6 +78,21 @@ class CptEvidenceFacts:
     wave_liquefaction_model_authorized: bool = False
     notes: tuple[str, ...] = field(default_factory=tuple)
 
+    @property
+    def measured_cpt_profile_verified(self) -> bool:
+        """MAR-032A Sections 10 and 14: the profile counts as MEASURED CPT/CPTU resistance evidence
+        only when a canonical profile exists AND its observed product identity verified AND the
+        measured-evidence-role gate passed. A DERIVED / SOURCE_INTERPRETED canonical product or an
+        unmarked structural lookalike is never measured CPT evidence."""
+
+        return bool(
+            self.machine_readable_profile_available
+            and self.canonical_profile_created
+            and self.row_count > 0
+            and self.canonical_product_identity_verified
+            and self.measured_evidence_role_verified
+        )
+
 
 @dataclass(frozen=True)
 class AxisAssessment:
@@ -93,6 +116,7 @@ class AxisAssessment:
 class CptReadinessResult:
     cpt_profile_status: str
     axes: tuple[AxisAssessment, ...]
+    measured_cpt_profile_verified: bool = False
 
     @property
     def status(self) -> str:
@@ -116,6 +140,7 @@ class CptReadinessResult:
                 "readiness of the CPT/CPTU EVIDENCE as a canonical numeric profile; NOT a "
                 "liquefaction susceptibility, hazard or risk statement"
             ),
+            "measured_cpt_profile_verified": self.measured_cpt_profile_verified,
             "axes": [a.to_dict() for a in self.axes],
             "blocking_reasons": [f"{a.axis}: {r}" for a in self.axes for r in a.blocking_reasons],
             "limitation_reasons": [
@@ -169,6 +194,7 @@ def assess_cpt_readiness(facts: CptEvidenceFacts) -> CptReadinessResult:
             facts={
                 "source_package_resolved": facts.source_package_resolved,
                 "source_checksum_recorded": facts.source_checksum_recorded,
+                "registered_asset_sha256": facts.registered_asset_sha256,
             },
             status_override=(contract.NOT_AVAILABLE if not facts.source_package_resolved else None),
         )
@@ -188,6 +214,16 @@ def assess_cpt_readiness(facts: CptEvidenceFacts) -> CptReadinessResult:
             override = contract.NOT_AVAILABLE
     elif not facts.canonical_profile_created or facts.row_count <= 0:
         blocking.append("machine-readable source present but no canonical profile row was created")
+    elif not facts.canonical_product_identity_verified:
+        # MAR-032A Section 9/11: structurally canonical-looking is not canonical. Only the
+        # observed, versioned product marker written by the canonical writer establishes identity.
+        blocking.append(
+            f"{contract.CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED}: the table is structurally "
+            "canonical-looking but carries no verified canonical CPT product marker (observed "
+            f"product role {facts.canonical_product_role_observed!r}, contract "
+            f"{facts.canonical_product_contract_observed!r}); column names are not measurement "
+            "semantics"
+        )
     axes.append(
         _axis(
             contract.DIGITAL_PROFILE,
@@ -197,6 +233,9 @@ def assess_cpt_readiness(facts: CptEvidenceFacts) -> CptReadinessResult:
                 "documentary_cpt_evidence_available": facts.documentary_evidence_available,
                 "machine_readable_cpt_profile_available": facts.machine_readable_profile_available,
                 "canonical_profile_created": facts.canonical_profile_created,
+                "canonical_product_identity_verified": facts.canonical_product_identity_verified,
+                "canonical_product_role_observed": facts.canonical_product_role_observed,
+                "canonical_product_contract_observed": facts.canonical_product_contract_observed,
                 "row_count": facts.row_count,
                 "test_count": facts.test_count,
             },
@@ -275,6 +314,15 @@ def assess_cpt_readiness(facts: CptEvidenceFacts) -> CptReadinessResult:
     # MEASUREMENT_SEMANTICS
     blocking, limitations = [], []
     present = set(facts.channels_present)
+    if not facts.measured_evidence_role_verified:
+        # MAR-032A Section 10: the declared evidence role is preserved exactly as declared, but a
+        # profile is advertised as MEASURED cone-resistance evidence only when BOTH the observed
+        # product role and the declared evidence role are measured. Nothing is re-labelled.
+        blocking.append(
+            f"{contract.CPT_MEASURED_EVIDENCE_ROLE_NOT_VERIFIED}: the profile is not established "
+            "as MEASURED CPT/CPTU evidence (observed canonical product role and declared evidence "
+            "role must both be measured); not advertised as measured cone-resistance evidence"
+        )
     if contract.QC_MPA not in present and contract.QT_MPA not in present:
         blocking.append("neither measured (qc) nor corrected (qt) cone resistance is available")
     if contract.QT_MPA not in present:
@@ -291,7 +339,10 @@ def assess_cpt_readiness(facts: CptEvidenceFacts) -> CptReadinessResult:
             contract.MEASUREMENT_SEMANTICS,
             blocking=blocking,
             limitations=limitations,
-            facts={"channels_present": list(facts.channels_present)},
+            facts={
+                "channels_present": list(facts.channels_present),
+                "measured_evidence_role_verified": facts.measured_evidence_role_verified,
+            },
             status_override=(contract.NOT_EVALUABLE if not digital_ready else None),
         )
     )
@@ -362,7 +413,11 @@ def assess_cpt_readiness(facts: CptEvidenceFacts) -> CptReadinessResult:
         overall = contract.READY_WITH_LIMITATIONS
     else:
         overall = contract.READY
-    return CptReadinessResult(cpt_profile_status=overall, axes=tuple(axes))
+    return CptReadinessResult(
+        cpt_profile_status=overall,
+        axes=tuple(axes),
+        measured_cpt_profile_verified=facts.measured_cpt_profile_verified,
+    )
 
 
 def _availability(flag: bool) -> str:
@@ -375,11 +430,13 @@ def assess_liquefaction_input_readiness(facts: CptEvidenceFacts) -> dict[str, An
     present. Evidence availability is itemized so the next ticket can see exactly what is
     missing."""
 
-    present = set(facts.channels_present)
+    # MAR-032A Section 14: resistance-input channels count only from a VERIFIED measured CPT
+    # profile. A DERIVED / SOURCE_INTERPRETED canonical product or an unmarked structural lookalike
+    # contributes no measured cone resistance, sleeve friction or pore pressure here.
+    measured_ok = facts.measured_cpt_profile_verified
+    present = set(facts.channels_present) if measured_ok else set()
     earthquake_items = {
-        "machine_readable_cpt_profile": _availability(
-            facts.machine_readable_profile_available and facts.canonical_profile_created
-        ),
+        "machine_readable_cpt_profile": _availability(measured_ok),
         "depth_below_seabed": _availability(
             facts.depth_reference == contract.DEPTH_BELOW_SEABED and facts.depth_bsf_available
         ),
@@ -417,9 +474,7 @@ def assess_liquefaction_input_readiness(facts: CptEvidenceFacts) -> dict[str, An
     wave_items = {
         "wave_forcing": _availability(facts.wave_forcing_available),
         "water_depth": _availability(facts.water_depth_available),
-        "soil_profile": _availability(
-            facts.machine_readable_profile_available and facts.canonical_profile_created
-        ),
+        "soil_profile": _availability(measured_ok),
         "soil_hydraulic_properties": _availability(facts.soil_hydraulic_properties_available),
         "soil_compressibility_stiffness_properties": _availability(
             facts.soil_compressibility_stiffness_available
@@ -439,6 +494,13 @@ def assess_liquefaction_input_readiness(facts: CptEvidenceFacts) -> dict[str, An
         "role": contract.LIQUEFACTION_INPUT_READINESS_ASSESSMENT,
         "status": contract.NOT_EVALUABLE,
         "mechanisms_kept_separate": True,
+        "measured_cpt_profile_verified": measured_ok,
+        "measured_evidence_gate": (
+            "CPT resistance inputs (profile, qc/qt, fs, u2) are counted only from a profile "
+            "whose observed canonical product identity verified AND whose measured evidence "
+            "role verified; DERIVED, SOURCE_INTERPRETED and unmarked lookalike tables contribute "
+            "none"
+        ),
         "earthquake_induced": {
             "mechanism": contract.EARTHQUAKE_INDUCED_LIQUEFACTION,
             "status": contract.NOT_EVALUABLE,
