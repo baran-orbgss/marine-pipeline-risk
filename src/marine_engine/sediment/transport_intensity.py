@@ -59,6 +59,31 @@ no BGS Folk -> D50 conversion, no PSA point interpolation. No intensity
 classes (LOW/HIGH/...) exist -- intensity is a continuous dimensionless
 quantity; zero means only "no positive excess above the MAR-013 threshold
 at that timestamp / tested scenario", not "no sediment movement in nature".
+
+MAR-013 source contract (MAR-030A)
+----------------------------------
+MAR-030A is a source/integration integrity repair, not new sediment science
+and not a new scientific validation. Before any intensity is derived, the
+supplied table must be proven to be structurally the accepted MAR-013
+product it claims to be: EVERY row carries
+`scientific_role == NONCOHESIVE_SEDIMENT_MOBILITY_CAPACITY` (null, empty,
+foreign, or mixed roles fail -- a missing source role is never converted
+into an asserted `source_scientific_role`); the observed `tested_d50_mm`
+vocabulary equals `noncohesive_mobility.TESTED_D50_SCENARIOS_MM` exactly
+(no extra, missing, null, or non-finite scenario; exact floating equality,
+never a tolerance that could reinterpret an arbitrary value as a scenario);
+`tested_d50_m == tested_d50_mm / 1000` within floating-point serialization
+noise only; `hydro_pair_id x time_utc x tested_d50_mm` source keys are
+unique (duplicates are never aggregated, deduplicated, or averaged); every
+`hydro_pair_id x time_utc` carries exactly the nine canonical scenarios
+once each; and the preserved `incipient_motion_status` agrees with MAR-013's
+own `classify_incipient_motion_status` re-applied to the supplied ratio
+(a mismatch fails, it is never corrected). The MAR-013 statistics
+cross-check first proves EXACT `hydro_pair_id x tested_d50_mm` key-set
+equality (no missing/extra/duplicate group on either side) before comparing
+counts, and the scenario GIS layer refuses to write a nominal nine-scenario
+feature set with silent `n/a` values for a hydro-pair-supported segment
+whose statistics are incomplete. Source rows are never mutated.
 """
 
 import sys
@@ -166,20 +191,51 @@ MOBILITY_RATIO_CONSISTENCY_RTOL = 1e-9
 MOBILITY_RATIO_CONSISTENCY_ATOL = 1e-12
 
 
-class TransportIntensitySchemaError(Exception):
+# --- MAR-013 source contract constants (MAR-030A) --------------------------------------
+
+# The accepted MAR-013 long table is keyed by hydro pair x timestamp x tested scenario.
+SOURCE_KEY_COLUMNS: tuple[str, ...] = ("hydro_pair_id", "time_utc", "tested_d50_mm")
+DUPLICATE_MAR013_MOBILITY_SOURCE_KEY = "DUPLICATE_MAR013_MOBILITY_SOURCE_KEY"
+# `tested_d50_m` must equal `tested_d50_mm / 1000` to within floating-point
+# serialization noise only. Adjacent tested scenarios differ by a factor of two,
+# so this tolerance can never reinterpret one scenario as another.
+D50_UNIT_CONSISTENCY_RTOL = 1e-9
+SOURCE_CONTRACT_SEMANTICS = (
+    "Source/integration integrity of the consumed MAR-013 product (structural identity of "
+    "the supplied table), not a new scientific validation and not new sediment physics."
+)
+
+
+class TransportIntensityError(Exception):
+    """Base class for every controlled MAR-030 / MAR-030A failure."""
+
+
+class TransportIntensitySchemaError(TransportIntensityError):
     """The MAR-013 source table lacks a required scientific column."""
 
 
-class TransportIntensitySourceRoleError(Exception):
-    """The source table does not carry the accepted MAR-013 scientific role."""
+class TransportIntensitySourceRoleError(TransportIntensityError):
+    """Not every source row carries the accepted MAR-013 scientific role (MAR-030A)."""
 
 
-class MobilityRatioConsistencyError(Exception):
+class TransportIntensityScenarioContractError(TransportIntensityError):
+    """The source violates the canonical MAR-013 tested-D50 scenario contract (MAR-030A)."""
+
+
+class TransportIntensitySourceKeyError(TransportIntensityError):
+    """Source `hydro_pair_id x time_utc x tested_d50_mm` keys are null or not unique (MAR-030A)."""
+
+
+class IncipientMotionStatusConsistencyError(TransportIntensityError):
+    """A preserved MAR-013 `incipient_motion_status` disagrees with its own ratio (MAR-030A)."""
+
+
+class MobilityRatioConsistencyError(TransportIntensityError):
     """A source row's mobility ratio / intensity disagrees with its own stresses."""
 
 
-class MobilityStatsCrossCheckError(Exception):
-    """MAR-030 counts disagree with the accepted MAR-013 statistics where definitions match."""
+class MobilityStatsCrossCheckError(TransportIntensityError):
+    """MAR-030 and MAR-013 statistics differ in group identity or counts."""
 
 
 REQUIRED_MOBILITY_COLUMNS: tuple[str, ...] = (
@@ -222,22 +278,254 @@ def compute_relative_excess_shields_intensity(mobility_ratio: np.ndarray) -> np.
 # --- Source validation and independent algebraic QA (Sections 11, 14) -----------------
 
 
-def validate_mobility_source(mobility_df: pd.DataFrame) -> None:
-    """Fail cleanly on a missing required scientific column or a foreign scientific role."""
+def _as_float_array(series: pd.Series, column: str) -> np.ndarray:
+    """A float view of a numeric source column; a non-numeric column is a contract failure."""
+
+    try:
+        return series.to_numpy(dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise TransportIntensityScenarioContractError(
+            f"source column {column!r} is not numeric: {exc}"
+        ) from exc
+
+
+def _verify_source_scientific_role(mobility_df: pd.DataFrame) -> None:
+    """EVERY row must carry `scientific_role == SOURCE_SCIENTIFIC_ROLE` (MAR-030A Section 5).
+
+    Null / missing roles are counted, never dropped -- a missing source role
+    must never be converted into an asserted `source_scientific_role`.
+    """
+
+    roles = mobility_df["scientific_role"]
+    is_null = roles.isna().to_numpy()
+    null_count = int(is_null.sum())
+    present = roles[~is_null]
+    unexpected = sorted(
+        {str(value) for value in present.unique().tolist() if value != SOURCE_SCIENTIFIC_ROLE}
+    )
+    if null_count or unexpected:
+        raise TransportIntensitySourceRoleError(
+            f"every source row must carry scientific_role={SOURCE_SCIENTIFIC_ROLE!r}; found "
+            f"{null_count} null/missing role(s) and unexpected role value(s) {unexpected} "
+            f"across {len(mobility_df)} row(s)"
+        )
+
+
+def _verify_tested_d50_scenario_vocabulary(mobility_df: pd.DataFrame) -> None:
+    """`set(tested_d50_mm) == set(TESTED_D50_SCENARIOS_MM)` exactly (MAR-030A Section 6).
+
+    Exact floating equality is deliberate: the tested scenarios are fixed
+    canonical constants serialized by MAR-013 as float64, not noisy
+    measurements, so no tolerance may reinterpret an arbitrary value as one
+    of them. Nothing is dropped, rounded, substituted, or mapped.
+    """
+
+    d50_mm = _as_float_array(mobility_df["tested_d50_mm"], "tested_d50_mm")
+    non_finite = ~np.isfinite(d50_mm)
+    if non_finite.any():
+        raise TransportIntensityScenarioContractError(
+            f"{int(non_finite.sum())} source row(s) carry a null/non-finite tested_d50_mm; "
+            f"first offending row positions: {np.flatnonzero(non_finite)[:10].tolist()}"
+        )
+    observed = set(np.unique(d50_mm).tolist())
+    canonical = set(TESTED_D50_SCENARIOS_MM)
+    if observed != canonical:
+        raise TransportIntensityScenarioContractError(
+            "source tested_d50_mm vocabulary is not exactly the canonical MAR-013 scenario set "
+            f"{sorted(canonical)}: missing {sorted(canonical - observed)}, unexpected "
+            f"{sorted(observed - canonical)}"
+        )
+
+
+def _verify_d50_unit_consistency(mobility_df: pd.DataFrame) -> None:
+    """`tested_d50_m == tested_d50_mm / 1000` per row within serialization noise (Section 7)."""
+
+    d50_mm = _as_float_array(mobility_df["tested_d50_mm"], "tested_d50_mm")
+    d50_m = _as_float_array(mobility_df["tested_d50_m"], "tested_d50_m")
+    non_finite = ~np.isfinite(d50_m)
+    if non_finite.any():
+        raise TransportIntensityScenarioContractError(
+            f"{int(non_finite.sum())} source row(s) carry a null/non-finite tested_d50_m; "
+            f"first offending row positions: {np.flatnonzero(non_finite)[:10].tolist()}"
+        )
+    inconsistent = ~np.isclose(d50_m, d50_mm / 1000.0, rtol=D50_UNIT_CONSISTENCY_RTOL, atol=0.0)
+    if inconsistent.any():
+        positions = np.flatnonzero(inconsistent)
+        examples = [
+            {"row": int(i), "tested_d50_mm": float(d50_mm[i]), "tested_d50_m": float(d50_m[i])}
+            for i in positions[:5]
+        ]
+        raise TransportIntensityScenarioContractError(
+            f"{len(positions)} source row(s) have tested_d50_m inconsistent with "
+            f"tested_d50_mm / 1000 (rtol={D50_UNIT_CONSISTENCY_RTOL}); the source is never "
+            f"recomputed or overwritten; examples: {examples}"
+        )
+
+
+def _verify_source_key_uniqueness(mobility_df: pd.DataFrame) -> None:
+    """`hydro_pair_id x time_utc x tested_d50_mm` must be non-null and unique (Section 9).
+
+    Duplicate source rows fail outright -- they are never aggregated,
+    deduplicated (first/last), or averaged.
+    """
+
+    key_columns = list(SOURCE_KEY_COLUMNS)
+    null_key = mobility_df[key_columns].isna().any(axis=1).to_numpy()
+    if null_key.any():
+        raise TransportIntensitySourceKeyError(
+            f"{int(null_key.sum())} source row(s) have a null hydro_pair_id / time_utc / "
+            f"tested_d50_mm key component; first offending row positions: "
+            f"{np.flatnonzero(null_key)[:10].tolist()}"
+        )
+    duplicated = mobility_df.duplicated(subset=key_columns, keep=False)
+    if duplicated.any():
+        duplicated_keys = mobility_df.loc[duplicated, key_columns].drop_duplicates()
+        raise TransportIntensitySourceKeyError(
+            f"{DUPLICATE_MAR013_MOBILITY_SOURCE_KEY}: {int(duplicated.sum())} source row(s) "
+            f"share {len(duplicated_keys)} non-unique hydro_pair_id x time_utc x tested_d50_mm "
+            "key(s); duplicates are never aggregated, deduplicated, or averaged; examples: "
+            f"{duplicated_keys.head(5).to_dict('records')}"
+        )
+
+
+def _verify_per_timestamp_scenario_completeness(mobility_df: pd.DataFrame) -> int:
+    """Every `hydro_pair_id x time_utc` carries exactly the nine canonical scenarios once (S8).
+
+    Run AFTER the global vocabulary and key checks: with every value already
+    proven to lie in the canonical set and every key non-null, a group of
+    exactly nine rows with nine distinct D50 values is exactly the canonical
+    set with no duplicate, missing, extra, or null scenario. Returns the
+    number of hydro-pair timestamps verified. Table structure only -- no
+    hydrodynamics are inferred.
+    """
+
+    expected = len(TESTED_D50_SCENARIOS_MM)
+    grouped = mobility_df.groupby(["hydro_pair_id", "time_utc"], sort=False, dropna=False)[
+        "tested_d50_mm"
+    ]
+    sizes = grouped.size()
+    distinct = grouped.nunique()
+    bad = (sizes != expected) | (distinct != expected)
+    if bad.any():
+        offending = sizes[bad]
+        examples = [
+            {"hydro_pair_id": key[0], "time_utc": str(key[1]), "scenario_rows": int(n)}
+            for key, n in offending.head(5).items()
+        ]
+        raise TransportIntensityScenarioContractError(
+            f"{len(offending)} hydro_pair_id x time_utc group(s) do not carry exactly the "
+            f"{expected} canonical tested D50 scenarios once each (missing, duplicate, or "
+            f"extra scenario); examples: {examples}"
+        )
+    return int(len(sizes))
+
+
+def verify_incipient_motion_status_consistency(mobility_df: pd.DataFrame) -> None:
+    """Preserved MAR-013 status must agree with MAR-013's own classifier (Section 10).
+
+    Re-applies `noncohesive_mobility.classify_incipient_motion_status` (the
+    accepted `>= 1` convention, no new threshold) to the supplied
+    `mobility_ratio` and requires the supplied `incipient_motion_status` to
+    match exactly, including null where the ratio is undefined. A mismatch
+    fails; the status is never corrected here.
+    """
+
+    if mobility_df.empty:
+        return
+    ratio = _as_float_array(mobility_df["mobility_ratio"], "mobility_ratio")
+    expected = ncm.classify_incipient_motion_status(ratio)
+    expected_is_null = np.array([value is None for value in expected], dtype=bool)
+    expected_text = np.where(expected_is_null, "", expected).astype(object)
+
+    status = mobility_df["incipient_motion_status"]
+    actual_is_null = status.isna().to_numpy()
+    actual_text = np.where(actual_is_null, "", status.to_numpy(dtype=object)).astype(object)
+
+    mismatch = (actual_is_null != expected_is_null) | (actual_text != expected_text)
+    if mismatch.any():
+        positions = np.flatnonzero(mismatch)
+        examples = [
+            {
+                "row": int(i),
+                "mobility_ratio": None if not np.isfinite(ratio[i]) else float(ratio[i]),
+                "incipient_motion_status": None if actual_is_null[i] else str(actual_text[i]),
+                "mar013_classifier": None if expected_is_null[i] else str(expected_text[i]),
+            }
+            for i in positions[:5]
+        ]
+        raise IncipientMotionStatusConsistencyError(
+            f"{len(positions)} source row(s) carry an incipient_motion_status that disagrees "
+            "with MAR-013's own classify_incipient_motion_status applied to the supplied "
+            f"mobility_ratio; the status is never corrected here; examples: {examples}"
+        )
+
+
+def _empty_source_contract() -> dict[str, Any]:
+    return {
+        "source_contract_semantics": SOURCE_CONTRACT_SEMANTICS,
+        "source_scientific_role_required": SOURCE_SCIENTIFIC_ROLE,
+        "canonical_tested_d50_scenarios_mm": list(TESTED_D50_SCENARIOS_MM),
+        "source_key_columns": list(SOURCE_KEY_COLUMNS),
+        "d50_unit_consistency_rtol": D50_UNIT_CONSISTENCY_RTOL,
+        "source_row_count": 0,
+        "source_hydro_pair_count": 0,
+        "source_hydro_pair_timestamp_count": 0,
+        "source_hydro_pair_d50_group_count": 0,
+        # Not applicable on an empty source: nothing was verified, nothing is asserted.
+        "scientific_role_all_rows_verified": None,
+        "exact_scenario_set_verified": None,
+        "d50_unit_consistency_verified": None,
+        "source_key_uniqueness_verified": None,
+        "per_timestamp_scenario_completeness_verified": None,
+        "incipient_motion_status_consistency_verified": None,
+    }
+
+
+def validate_mobility_source(mobility_df: pd.DataFrame) -> dict[str, Any]:
+    """Prove the supplied table is structurally the accepted MAR-013 product (MAR-030A).
+
+    Fails with a controlled `TransportIntensityError` subclass on: a missing
+    required column; any null/empty/foreign `scientific_role`; a
+    `tested_d50_mm` vocabulary other than exactly
+    `TESTED_D50_SCENARIOS_MM`; a `tested_d50_m` inconsistent with
+    `tested_d50_mm / 1000`; a null or duplicate
+    `hydro_pair_id x time_utc x tested_d50_mm` key; a hydro-pair timestamp
+    without exactly the nine canonical scenarios; or a preserved
+    `incipient_motion_status` inconsistent with MAR-013's own classifier.
+    Never mutates the source. Returns the machine-readable source-contract
+    record (every `*_verified` flag is True only because the corresponding
+    check ran and passed on this table; `None` on an empty source).
+    """
 
     missing = [c for c in REQUIRED_MOBILITY_COLUMNS if c not in mobility_df.columns]
     if missing:
         raise TransportIntensitySchemaError(
             f"MAR-013 source table is missing required column(s): {missing}"
         )
+    record = _empty_source_contract()
     if mobility_df.empty:
-        return
-    roles = set(mobility_df["scientific_role"].dropna().unique().tolist())
-    if roles != {SOURCE_SCIENTIFIC_ROLE}:
-        raise TransportIntensitySourceRoleError(
-            f"expected every source row to carry scientific_role={SOURCE_SCIENTIFIC_ROLE!r}, "
-            f"found {sorted(roles)}"
-        )
+        return record
+
+    _verify_source_scientific_role(mobility_df)
+    record["scientific_role_all_rows_verified"] = True
+    _verify_tested_d50_scenario_vocabulary(mobility_df)
+    record["exact_scenario_set_verified"] = True
+    _verify_d50_unit_consistency(mobility_df)
+    record["d50_unit_consistency_verified"] = True
+    _verify_source_key_uniqueness(mobility_df)
+    record["source_key_uniqueness_verified"] = True
+    timestamp_count = _verify_per_timestamp_scenario_completeness(mobility_df)
+    record["per_timestamp_scenario_completeness_verified"] = True
+    verify_incipient_motion_status_consistency(mobility_df)
+    record["incipient_motion_status_consistency_verified"] = True
+
+    record["source_row_count"] = int(len(mobility_df))
+    record["source_hydro_pair_count"] = int(mobility_df["hydro_pair_id"].nunique())
+    record["source_hydro_pair_timestamp_count"] = timestamp_count
+    record["source_hydro_pair_d50_group_count"] = int(
+        len(mobility_df[["hydro_pair_id", "tested_d50_mm"]].drop_duplicates())
+    )
+    return record
 
 
 def verify_mobility_ratio_consistency(
@@ -459,24 +747,62 @@ def compute_transport_intensity_stats(intensity_df: pd.DataFrame) -> pd.DataFram
 def cross_check_against_mobility_stats(
     intensity_stats_df: pd.DataFrame, mobility_stats_df: pd.DataFrame
 ) -> int:
-    """Cross-check MAR-030 counts against the accepted MAR-013 statistics (Section 15).
+    """Cross-check MAR-030 counts against the accepted MAR-013 statistics (Section 15 / 30A-11).
 
-    Where definitions are equivalent -- MAR-013 `valid_count` (finite
-    mobility ratios) vs `valid_intensity_timestamp_count`, and MAR-013
-    `threshold_exceedance_count` (`mobility_ratio >= 1`) vs
+    First proves EXACT `hydro_pair_id x tested_d50_mm` group identity: no
+    duplicate key in either table, and
+    `set(MAR-030 keys) == set(MAR-013 keys)` (a group missing from or extra
+    to either side fails -- an inner-merge intersection is never the only
+    identity test). Only then, where definitions are equivalent -- MAR-013
+    `valid_count` (finite mobility ratios) vs `valid_intensity_timestamp_count`,
+    and MAR-013 `threshold_exceedance_count` (`mobility_ratio >= 1`) vs
     `at_or_above_incipient_motion_count` -- the two products must agree
-    exactly for every `hydro_pair_id x tested_d50_mm` present in both.
-    Returns the number of groups compared; raises on any disagreement.
+    exactly for every group. Returns the number of groups compared.
     """
 
-    if intensity_stats_df.empty or mobility_stats_df.empty:
+    if intensity_stats_df.empty and mobility_stats_df.empty:
         return 0
     keys = ["hydro_pair_id", "tested_d50_mm"]
+    required = {
+        "MAR-030": (
+            intensity_stats_df,
+            [*keys, "valid_intensity_timestamp_count", "at_or_above_incipient_motion_count"],
+        ),
+        "MAR-013": (mobility_stats_df, [*keys, "valid_count", "threshold_exceedance_count"]),
+    }
+    for label, (frame, columns) in required.items():
+        missing = [c for c in columns if c not in frame.columns]
+        if missing:
+            raise TransportIntensitySchemaError(
+                f"{label} statistics are missing required column(s): {missing}"
+            )
+        duplicated = frame.duplicated(subset=keys, keep=False)
+        if duplicated.any():
+            raise MobilityStatsCrossCheckError(
+                f"{label} statistics carry duplicated hydro_pair_id x tested_d50_mm key(s): "
+                f"{frame.loc[duplicated, keys].drop_duplicates().head(5).to_dict('records')}"
+            )
+
+    mar030_keys = set(intensity_stats_df[keys].itertuples(index=False, name=None))
+    mar013_keys = set(mobility_stats_df[keys].itertuples(index=False, name=None))
+    if mar030_keys != mar013_keys:
+        only_030 = sorted(mar030_keys - mar013_keys, key=str)
+        only_013 = sorted(mar013_keys - mar030_keys, key=str)
+        raise MobilityStatsCrossCheckError(
+            "MAR-030 and MAR-013 hydro_pair_id x tested_d50_mm key sets differ: "
+            f"{len(only_030)} group(s) only in MAR-030 (e.g. {only_030[:5]}), "
+            f"{len(only_013)} group(s) only in MAR-013 (e.g. {only_013[:5]})"
+        )
+
     merged = intensity_stats_df.merge(
         mobility_stats_df[[*keys, "valid_count", "threshold_exceedance_count"]],
         on=keys,
         how="inner",
     )
+    if len(merged) != len(mar030_keys):
+        raise MobilityStatsCrossCheckError(
+            f"merged {len(merged)} group(s) but {len(mar030_keys)} unique key(s) were expected"
+        )
     valid_mismatch = merged["valid_intensity_timestamp_count"] != merged["valid_count"]
     exceed_mismatch = (
         merged["at_or_above_incipient_motion_count"] != merged["threshold_exceedance_count"]
@@ -571,9 +897,40 @@ def build_transport_intensity_segments(
             crs=mobility_segments_gdf.crs,
         )
 
-    stats_by_key = (
-        stats_df.set_index(["hydro_pair_id", "tested_d50_mm"]) if not stats_df.empty else None
-    )
+    stats_by_key = None
+    available_keys: set[tuple[Any, float]] = set()
+    if not stats_df.empty:
+        duplicated = stats_df.duplicated(subset=["hydro_pair_id", "tested_d50_mm"], keep=False)
+        if duplicated.any():
+            duplicated_stats_keys = stats_df.loc[duplicated, ["hydro_pair_id", "tested_d50_mm"]]
+            raise TransportIntensityScenarioContractError(
+                "MAR-030 statistics carry duplicated hydro_pair_id x tested_d50_mm key(s): "
+                f"{duplicated_stats_keys.head(5).to_dict('records')}"
+            )
+        stats_by_key = stats_df.set_index(["hydro_pair_id", "tested_d50_mm"])
+        available_keys = set(
+            stats_df[["hydro_pair_id", "tested_d50_mm"]].itertuples(index=False, name=None)
+        )
+
+    # MAR-030A Section 12: every accepted route segment WITH a hydro-pair assignment
+    # must have the complete canonical nine-scenario statistics set; a nominal
+    # nine-scenario feature set with silent n/a values is never written for it.
+    # A segment with no hydro-pair support (accepted MAR-013 semantics: null
+    # `hydro_pair_id`) keeps nine features with null statistics, as before.
+    supported_pairs = [p for p in mobility_segments_gdf["hydro_pair_id"].unique() if pd.notna(p)]
+    incomplete = {
+        pair_id: [d for d in sorted(TESTED_D50_SCENARIOS_MM) if (pair_id, d) not in available_keys]
+        for pair_id in supported_pairs
+    }
+    incomplete = {pair_id: missing for pair_id, missing in incomplete.items() if missing}
+    if incomplete:
+        examples = dict(list(incomplete.items())[:5])
+        raise TransportIntensityScenarioContractError(
+            f"{len(incomplete)} hydro-pair-supported MAR-013 route segment(s) lack complete "
+            f"{len(TESTED_D50_SCENARIOS_MM)}-scenario intensity statistics; the scenario GIS "
+            "layer is never written with silent n/a values for a supported segment; missing "
+            f"tested_d50_mm by hydro_pair_id: {examples}"
+        )
 
     records = []
     geometries = []
@@ -757,8 +1114,27 @@ def build_transport_intensity_metadata(
     row_count: int,
     hydro_pair_count: int,
     cross_checked_group_count: int,
+    source_contract: dict[str, Any],
 ) -> dict[str, Any]:
-    """Deterministic metadata dict; only `outputs` and the counts vary between studies."""
+    """Deterministic metadata dict; only `outputs`, the counts, and the contract record vary.
+
+    `source_contract` is the record returned by `validate_mobility_source`
+    (MAR-030A). The MAR-013 statistics key-set match is recorded as verified
+    only when the cross-check covered exactly every `hydro_pair_id x
+    tested_d50_mm` group the validated source carries.
+    """
+
+    expected_groups = int(source_contract.get("source_hydro_pair_d50_group_count") or 0)
+    if cross_checked_group_count != expected_groups:
+        raise MobilityStatsCrossCheckError(
+            f"{cross_checked_group_count} hydro_pair_id x tested_d50_mm group(s) were "
+            f"cross-checked but the validated source carries {expected_groups}"
+        )
+    source_contract_record = {
+        **source_contract,
+        "mar013_stats_key_set_match_verified": True if expected_groups else None,
+        "mar013_stats_groups_cross_checked": cross_checked_group_count,
+    }
 
     return {
         "scientific_role": SCIENTIFIC_ROLE,
@@ -856,6 +1232,7 @@ def build_transport_intensity_metadata(
             "nature.",
         ],
         "references": [dict(r) for r in REFERENCES],
+        "source_contract": source_contract_record,
         "source_row_count": row_count,
         "hydro_pair_count": hydro_pair_count,
         "outputs": outputs,
@@ -874,12 +1251,19 @@ def _fmt(value: Any, spec: str = ".4f") -> str:
         return str(value)
 
 
+def _flag_text(value: bool | None) -> str:
+    if value is None:
+        return "N/A (empty source)"
+    return "YES" if value else "NO"
+
+
 def print_transport_intensity_report(
     *,
     intensity_df: pd.DataFrame,
     stats_df: pd.DataFrame,
     segments_gdf: gpd.GeoDataFrame,
     cross_checked_group_count: int,
+    source_contract: dict[str, Any] | None = None,
     file: Any = None,
 ) -> None:
     file = file or sys.stdout
@@ -946,6 +1330,24 @@ def print_transport_intensity_report(
             f"{segments_gdf['tested_d50_mm'].nunique()} | crs={segments_gdf.crs}"
         )
     lines.append("")
+
+    if source_contract is not None:
+        lines.append("## MAR-013 source contract (MAR-030A: source/integration integrity)")
+        for flag in (
+            "scientific_role_all_rows_verified",
+            "exact_scenario_set_verified",
+            "d50_unit_consistency_verified",
+            "source_key_uniqueness_verified",
+            "per_timestamp_scenario_completeness_verified",
+            "incipient_motion_status_consistency_verified",
+        ):
+            lines.append(f"  {flag:<48} = {_flag_text(source_contract.get(flag))}")
+        lines.append(
+            f"  {'mar013_stats_key_set_match_verified':<48} = "
+            f"{_flag_text(True if cross_checked_group_count else None)} "
+            f"({cross_checked_group_count} group(s))"
+        )
+        lines.append("")
 
     lines.extend(
         [

@@ -3181,7 +3181,10 @@ def _cmd_build_sediment_transport_intensity(args: argparse.Namespace) -> int:
     )
 
     # --- MAR-030 core: validate source, independent algebraic QA, derive -----
+    # MAR-030A: the source-contract record (role / scenario vocabulary / units /
+    # keys / completeness / status) is produced first and carried into metadata.
     try:
+        source_contract = transport_intensity.validate_mobility_source(mobility_df)
         intensity_df = transport_intensity.build_transport_intensity_3hourly(mobility_df)
         stats_df = transport_intensity.compute_transport_intensity_stats(intensity_df)
         cross_checked = transport_intensity.cross_check_against_mobility_stats(
@@ -3190,12 +3193,7 @@ def _cmd_build_sediment_transport_intensity(args: argparse.Namespace) -> int:
         segments_gdf = transport_intensity.build_transport_intensity_segments(
             mobility_segments_gdf, stats_df
         )
-    except (
-        transport_intensity.TransportIntensitySchemaError,
-        transport_intensity.TransportIntensitySourceRoleError,
-        transport_intensity.MobilityRatioConsistencyError,
-        transport_intensity.MobilityStatsCrossCheckError,
-    ) as exc:
+    except transport_intensity.TransportIntensityError as exc:
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
@@ -3229,6 +3227,7 @@ def _cmd_build_sediment_transport_intensity(args: argparse.Namespace) -> int:
         row_count=int(len(intensity_df)),
         hydro_pair_count=int(intensity_df["hydro_pair_id"].nunique()) if len(intensity_df) else 0,
         cross_checked_group_count=cross_checked,
+        source_contract=source_contract,
     )
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
@@ -3246,6 +3245,7 @@ def _cmd_build_sediment_transport_intensity(args: argparse.Namespace) -> int:
         stats_df=stats_df,
         segments_gdf=segments_gdf,
         cross_checked_group_count=cross_checked,
+        source_contract=source_contract,
     )
     return 0
 

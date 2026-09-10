@@ -3005,3 +3005,103 @@ otherwise, never an interactive credential prompt.
   unchanged) / `ruff check` clean, offline suite 1633 passed (up from 1572),
   3 skipped, 25 live deselected, `uv audit --frozen` clean (87 packages).
   No further ticket has started.
+- **MAR-030A (MAR-013 source contract integrity repair for the transport
+  intensity POC, `src/marine_engine/sediment/transport_intensity.py`,
+  `build-sediment-transport-intensity`).** Narrow integrity repair on top of
+  MAR-030: the MAR-030 formula is unchanged
+  (`relative_excess_shields_intensity = max(mobility_ratio - 1, 0)`, null
+  stays null), no transport rate / flux / direction / D50 interpolation /
+  new threshold / new scenario / new physics was added, and
+  `combined_bed_shear.py`, `noncohesive_mobility.py`,
+  `noncohesive_mobility_map.py`, `change/*`, `scour/*`, `burial/*`,
+  `freespan/*`, `project/*` are byte-identical to the canonical base
+  (`adc14c2`). MAR-030A strengthens MAR-013 source identity / scenario /
+  group integrity: MAR-030 as accepted validated the source role with
+  `set(scientific_role.dropna())`, so a table mixing correct roles with
+  null roles could pass and every derived row would then assert
+  `source_scientific_role = NONCOHESIVE_SEDIMENT_MOBILITY_CAPACITY`; the
+  source `tested_d50_mm` vocabulary was never proven to be exactly
+  `TESTED_D50_SCENARIOS_MM` while GIS/metadata were generated from that
+  constant; and the MAR-013 stats cross-check used an inner merge, so a
+  group missing from or extra to either side escaped comparison.
+  `validate_mobility_source()` now requires EVERY row to carry the MAR-013
+  role (null, empty-string, foreign, and mixed roles fail with
+  `TransportIntensitySourceRoleError`, reporting the null count and the
+  unexpected values; no `dropna()`), `set(tested_d50_mm) ==
+  set(noncohesive_mobility.TESTED_D50_SCENARIOS_MM)` by exact floating
+  equality (the constant is reused, not copied; no extra / missing / null /
+  non-finite scenario; nothing dropped, rounded, substituted, or mapped --
+  `TransportIntensityScenarioContractError`), `tested_d50_m ==
+  tested_d50_mm / 1000` per row within `rtol 1e-9` only (0.250 mm with
+  0.000500 m fails; null/non-finite fails; the source is never recomputed),
+  non-null and unique `hydro_pair_id x time_utc x tested_d50_mm` keys
+  (`TransportIntensitySourceKeyError`, reason
+  `DUPLICATE_MAR013_MOBILITY_SOURCE_KEY`; duplicates are never aggregated,
+  kept-first/last, or averaged), exactly the nine canonical scenarios once
+  per `hydro_pair_id x time_utc` (table structure only), and
+  `incipient_motion_status` consistency by re-applying MAR-013's own
+  `classify_incipient_motion_status` to the supplied ratio (finite `M >= 1`
+  -> `ABOVE_OR_AT_...`, finite `M < 1` -> `BELOW_...`, undefined -> null;
+  a mismatch fails with `IncipientMotionStatusConsistencyError` and is
+  never corrected). It returns a machine-readable source-contract record
+  and never mutates the source. `cross_check_against_mobility_stats()` now
+  first rejects duplicate keys in either stats table and requires
+  `set(MAR-030 hydro_pair_id x tested_d50_mm) == set(MAR-013 keys)` --
+  a group only in MAR-030 or only in MAR-013 fails -- before the existing
+  exact `valid_count` / `threshold_exceedance_count` comparison; the inner
+  merge is no longer the identity test. `build_transport_intensity_segments()`
+  refuses to write the scenario GIS layer when any hydro-pair-supported
+  accepted MAR-013 route segment lacks the complete nine-scenario
+  statistics set (or the statistics carry duplicate keys), instead of
+  emitting a nominal nine-feature set with silent `n/a`; the accepted
+  MAR-013 semantics for a segment with no hydro-pair support (null
+  `hydro_pair_id` -> nine features with null statistics) are preserved.
+  All controlled failures share the new `TransportIntensityError` base,
+  which the CLI catches (the only `cli.py` change besides passing the
+  record into metadata/report). Metadata gains a `source_contract` block
+  (`source_scientific_role_required`, `canonical_tested_d50_scenarios_mm`,
+  `scientific_role_all_rows_verified`, `exact_scenario_set_verified`,
+  `d50_unit_consistency_verified`, `source_key_uniqueness_verified`,
+  `per_timestamp_scenario_completeness_verified`,
+  `incipient_motion_status_consistency_verified`,
+  `mar013_stats_key_set_match_verified` -- asserted only when the
+  cross-checked group count equals the validated source's
+  `hydro_pair_id x tested_d50_mm` group count -- plus source row / pair /
+  timestamp / group counts), explicitly labelled source/integration
+  integrity, not a new scientific validation; the report prints the same
+  flags. Tests: 44 added in `tests/test_transport_intensity.py` (101 in
+  the file; every builder fixture is now a contract-complete nine-scenario
+  table) covering the MAR-030A Section 14 matrix: role all-correct /
+  foreign / mixed-foreign / all-null / mixed-null / empty-string; exact
+  nine scenarios pass, one missing, unexpected 32 mm, a value 1e-9 off a
+  constant is not reinterpreted, null, non-finite, duplicate scenario
+  within a pair timestamp; mm/m pass, contradictory, null/inf/-inf;
+  duplicate and null source keys; per-pair-timestamp completeness caught
+  when the global vocabulary is still complete; status BELOW / ABOVE_OR_AT
+  pass, finite mismatch and undefined-with-status / finite-without-status
+  fail; stats exact key set passes, MAR-030 missing (with the inner merge
+  shown to agree), MAR-030 extra, MAR-013 missing, MAR-013 extra,
+  duplicate keys on either side, equal keys with unequal valid /
+  exceedance counts, one-sided empty; 14 x 9 PL854-like GIS structure
+  supported and missing / absent / duplicate segment statistics fail
+  rather than writing `n/a`; formula regression, null-stays-null, no
+  rate/flux/direction field, source unmodified on pass and on every
+  failure; metadata and report wording. Real PL854 regression (cached data
+  only, no network): MAR-013 re-run reproduced 655,074 rows / 126 stats /
+  14 sections with the 3-hourly and stats parquet byte-identical
+  (SHA-256 `480d49a5...`, `d65cd159...`); MAR-030A then produced
+  655,074 intensity rows (14 hydro pairs x 9 canonical tested D50 x 5,199
+  timestamps, 72,786 hydro-pair timestamps each carrying exactly nine
+  scenarios, 0 duplicate keys, 0 nulls, intensity 0.0 .. 7.971, 157,796
+  strictly positive rows, `max(M-1,0)` max abs difference 0.0), 126 stats
+  groups with exact key-set equality and exact valid / exceedance
+  agreement against MAR-013, 126 EPSG:32631 LineString features (14
+  segments x 9 scenarios, KP 0+000 .. KP 23+480.67, 0 null p95), a
+  168 KB matrix PNG, and every `source_contract` flag `true`; the MAR-030A
+  timestamp-level and stats parquet are byte-identical to the accepted
+  MAR-030 outputs (SHA-256 `a161d1b0...`, `90782a16...`), so the
+  intensity numbers are unchanged. Local verification: `uv lock --check`
+  clean, repo-wide `ruff format` (217 files unchanged) / `ruff check`
+  clean, offline suite 1677 passed (up from 1633), 3 skipped, 25 live
+  deselected, `uv audit --frozen` clean (87 packages). No further ticket
+  has started.

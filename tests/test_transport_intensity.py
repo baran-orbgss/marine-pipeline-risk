@@ -5,6 +5,13 @@ network access. Numbered comments map to MAR-030 Section 27's required test
 matrix. Synthetic MAR-013 rows are built THROUGH the accepted MAR-013
 helpers (`compute_mobility_ratio`, `classify_incipient_motion_status`) so
 the source semantics under test are MAR-013's own, not re-invented here.
+
+MAR-030A: `build_transport_intensity_3hourly` now enforces the MAR-013 source
+contract (every row's role, the exact canonical nine-scenario vocabulary,
+mm/m unit identity, unique source keys, per-timestamp scenario completeness,
+status consistency), so every fixture handed to the builder is a complete
+nine-scenario table (`_canonical_rows`); single-scenario `_mobility_rows`
+frames are used only where a function is exercised directly.
 """
 
 import ast
@@ -79,6 +86,38 @@ def _all_scenario_rows(ratios_by_d50: dict[float, list[float]] | None = None) ->
         )
         frames.append(_mobility_rows(ratios, d50_mm=d50_mm, tau_cr=0.1 * (i + 1)))
     return pd.concat(frames, ignore_index=True)
+
+
+def _canonical_rows(
+    ratios: list[float],
+    *,
+    pair_id: str = "pair_A",
+    tau_cr: float = 0.2,
+    start: str = "2024-01-01T00:00:00Z",
+) -> pd.DataFrame:
+    """A contract-complete MAR-013 table: the SAME ratio series for all nine scenarios.
+
+    The first block (0.063 mm) carries `ratios` in order, so `.loc[i]` and the
+    first stats group refer to the same ratio as a single-scenario frame would.
+    `tau_cr` is scaled per scenario so the stresses differ between scenarios as
+    they would in MAR-013, while the ratio -- and hence the intensity -- is fixed.
+    """
+
+    frames = [
+        _mobility_rows(ratios, pair_id=pair_id, d50_mm=d50_mm, tau_cr=tau_cr * (i + 1), start=start)
+        for i, d50_mm in enumerate(sorted(ncm.TESTED_D50_SCENARIOS_MM))
+    ]
+    return pd.concat(frames, ignore_index=True)
+
+
+def _contract_one_pair() -> dict:
+    return ti.validate_mobility_source(_all_scenario_rows())
+
+
+def _empty_contract() -> dict:
+    return ti.validate_mobility_source(
+        pd.DataFrame(columns=list(ncm.NONCOHESIVE_MOBILITY_3HOURLY_COLUMNS))
+    )
 
 
 # --- Formula (tests 1-7, Section 26) -------------------------------------------------
@@ -157,7 +196,7 @@ def test_8_mobility_ratio_agrees_with_tau_max_over_tau_cr_on_mar013_rows():
 
 
 def test_9_inconsistent_source_row_triggers_controlled_qa_failure():
-    df = _mobility_rows([0.5, 1.5, 2.0])
+    df = _canonical_rows([0.5, 1.5, 2.0])
     df.loc[1, "mobility_ratio"] = 1.5 * 1.01  # 1% off its own stresses
     with pytest.raises(ti.MobilityRatioConsistencyError):
         ti.verify_mobility_ratio_consistency(df)
@@ -189,7 +228,7 @@ def test_9_qa_tolerance_accepts_floating_point_noise_only():
 
 
 def test_10_invalid_tau_cr_cannot_produce_finite_intensity():
-    df = _mobility_rows([np.nan, 2.0])  # first row encoded with tau_cr = 0
+    df = _canonical_rows([np.nan, 2.0])  # first row encoded with tau_cr = 0
     assert df.loc[0, "tau_critical_pa"] == 0.0
     out = ti.build_transport_intensity_3hourly(df)
     assert np.isnan(out.loc[0, "relative_excess_shields_intensity"])
@@ -198,7 +237,7 @@ def test_10_invalid_tau_cr_cannot_produce_finite_intensity():
 
 
 def test_negative_tau_cr_cannot_produce_finite_intensity():
-    df = _mobility_rows([2.0])
+    df = _canonical_rows([2.0])
     df.loc[0, "tau_critical_pa"] = -0.2
     df.loc[0, "mobility_ratio"] = ncm.compute_mobility_ratio(
         df["tau_max_grain_skin_pa"].to_numpy(), df["tau_critical_pa"].to_numpy()
@@ -261,7 +300,7 @@ def test_11_to_15_identity_timestamp_d50_and_status_preserved_row_for_row():
 
 
 def test_15_exact_threshold_keeps_mar013_above_or_at_status_with_zero_excess():
-    df = _mobility_rows([1.0])
+    df = _canonical_rows([1.0])
     out = ti.build_transport_intensity_3hourly(df)
     assert out.loc[0, "incipient_motion_status"] == ncm.ABOVE_OR_AT_THRESHOLD
     assert out.loc[0, "relative_excess_shields_intensity"] == 0.0
@@ -324,7 +363,7 @@ def test_18_19_summaries_computed_from_timestamp_level_intensity_not_percentile_
     # Ratios chosen so that p95(max(M-1,0)) != max(p95(M)-1, 0) is NOT the point --
     # rather, the MEAN of clipped intensity differs from mean(M)-1 (the shortcut).
     ratios = [0.2, 0.4, 0.6, 1.2, 1.4]
-    df = _mobility_rows(ratios)
+    df = _canonical_rows(ratios)
     out = ti.build_transport_intensity_3hourly(df)
     stats = ti.compute_transport_intensity_stats(out)
     row = stats.iloc[0]
@@ -343,7 +382,7 @@ def test_18_19_summaries_computed_from_timestamp_level_intensity_not_percentile_
 def test_19_p50_of_clipped_series_differs_from_clipped_p50_of_ratio():
     # p50 of M is 0.6 -> shortcut max(0.6-1,0)=0 -- agrees. Use a case where they differ:
     ratios = [0.5, 0.9, 1.1, 1.3, 1.5, 0.7]
-    df = _mobility_rows(ratios)
+    df = _canonical_rows(ratios)
     stats = ti.compute_transport_intensity_stats(ti.build_transport_intensity_3hourly(df))
     intensity = np.maximum(np.array(ratios) - 1.0, 0.0)
     assert stats.iloc[0]["relative_excess_intensity_mean"] == pytest.approx(intensity.mean())
@@ -352,7 +391,7 @@ def test_19_p50_of_clipped_series_differs_from_clipped_p50_of_ratio():
 
 
 def test_20_exact_m_equals_one_counts_at_or_above_but_contributes_zero_positive_excess():
-    df = _mobility_rows([0.5, 1.0, 1.0, 1.5])
+    df = _canonical_rows([0.5, 1.0, 1.0, 1.5])
     stats = ti.compute_transport_intensity_stats(ti.build_transport_intensity_3hourly(df))
     row = stats.iloc[0]
     assert row["valid_intensity_timestamp_count"] == 4
@@ -364,7 +403,7 @@ def test_20_exact_m_equals_one_counts_at_or_above_but_contributes_zero_positive_
 
 
 def test_22_23_denominator_is_valid_timestamps_and_missing_rows_are_not_zero_observations():
-    df = _mobility_rows([np.nan, np.nan, 0.5, 1.5])
+    df = _canonical_rows([np.nan, np.nan, 0.5, 1.5])
     out = ti.build_transport_intensity_3hourly(df)
     stats = ti.compute_transport_intensity_stats(out)
     row = stats.iloc[0]
@@ -380,7 +419,7 @@ def test_22_23_denominator_is_valid_timestamps_and_missing_rows_are_not_zero_obs
 
 
 def test_all_null_group_reports_zero_valid_and_null_fractions_not_zero():
-    df = _mobility_rows([np.nan, np.nan])
+    df = _canonical_rows([np.nan, np.nan])
     stats = ti.compute_transport_intensity_stats(ti.build_transport_intensity_3hourly(df))
     row = stats.iloc[0]
     assert row["valid_intensity_timestamp_count"] == 0
@@ -436,7 +475,7 @@ def test_mar013_cross_check_disagreement_is_a_controlled_failure():
 
 
 def test_status_column_disagreeing_with_ratio_is_a_controlled_failure():
-    df = _mobility_rows([0.5, 1.5])
+    df = _canonical_rows([0.5, 1.5])
     out = ti.build_transport_intensity_3hourly(df)
     out.loc[1, "incipient_motion_status"] = ncm.BELOW_THRESHOLD  # tampered downstream
     with pytest.raises(ti.MobilityStatsCrossCheckError):
@@ -542,7 +581,11 @@ def test_no_intensity_classes_exist_in_module():
 
 def test_metadata_not_computed_claims_are_all_explicitly_false():
     md = ti.build_transport_intensity_metadata(
-        outputs={"x": "y"}, row_count=1, hydro_pair_count=1, cross_checked_group_count=1
+        outputs={"x": "y"},
+        row_count=36,
+        hydro_pair_count=1,
+        cross_checked_group_count=9,
+        source_contract=_contract_one_pair(),
     )
     for key in (
         "transport_rate_computed",
@@ -577,7 +620,11 @@ def test_metadata_not_computed_claims_are_all_explicitly_false():
 
 def test_metadata_van_rijn_wording_and_references_are_exact():
     md = ti.build_transport_intensity_metadata(
-        outputs={}, row_count=0, hydro_pair_count=0, cross_checked_group_count=0
+        outputs={},
+        row_count=0,
+        hydro_pair_count=0,
+        cross_checked_group_count=0,
+        source_contract=_empty_contract(),
     )
     assert md["van_rijn_relation"] == (
         "The MAR-030 intensity is algebraically equivalent to the relative-excess "
@@ -754,11 +801,20 @@ def test_43_identical_input_gives_identical_tabular_output():
 
 
 def test_44_metadata_deterministic_apart_from_outputs_and_counts():
+    contract = _contract_one_pair()
     a = ti.build_transport_intensity_metadata(
-        outputs={"p": "one"}, row_count=3, hydro_pair_count=1, cross_checked_group_count=9
+        outputs={"p": "one"},
+        row_count=36,
+        hydro_pair_count=1,
+        cross_checked_group_count=9,
+        source_contract=contract,
     )
     b = ti.build_transport_intensity_metadata(
-        outputs={"p": "two"}, row_count=3, hydro_pair_count=1, cross_checked_group_count=9
+        outputs={"p": "two"},
+        row_count=36,
+        hydro_pair_count=1,
+        cross_checked_group_count=9,
+        source_contract=dict(contract),
     )
     a.pop("outputs")
     b.pop("outputs")
@@ -785,3 +841,568 @@ def test_report_states_the_mandatory_negatives(capsys: pytest.CaptureFixture[str
     assert "Van Rijn bed-load transport-rate formula is NOT applied" in text
     assert "fraction of valid contemporaneous matched timestamps" in text
     assert "scenarios are NOT combined" in text
+
+
+# =======================================================================================
+# MAR-030A -- MAR-013 source contract integrity (numbered per the MAR-030A Section 14 matrix)
+# =======================================================================================
+
+
+def _two_pairs(ratios: list[float] | None = None) -> pd.DataFrame:
+    ratios = ratios or [0.5, 1.0, 1.5, 3.0]
+    return pd.concat(
+        [_canonical_rows(ratios, pair_id="pair_A"), _canonical_rows(ratios, pair_id="pair_B")],
+        ignore_index=True,
+    )
+
+
+def _stats_pair(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(MAR-030 stats, MAR-013 stats) for the same accepted-shaped source."""
+
+    mar030 = ti.compute_transport_intensity_stats(ti.build_transport_intensity_3hourly(df))
+    mar013 = ncm.compute_noncohesive_mobility_stats(df)
+    return mar030, mar013
+
+
+def _set_d50(df: pd.DataFrame, row: int, d50_mm: float) -> None:
+    df.loc[row, "tested_d50_mm"] = d50_mm
+    df.loc[row, "tested_d50_m"] = d50_mm / 1000.0
+
+
+def test_30a_exception_hierarchy_is_one_controlled_family():
+    for exc in (
+        ti.TransportIntensitySchemaError,
+        ti.TransportIntensitySourceRoleError,
+        ti.TransportIntensityScenarioContractError,
+        ti.TransportIntensitySourceKeyError,
+        ti.IncipientMotionStatusConsistencyError,
+        ti.MobilityRatioConsistencyError,
+        ti.MobilityStatsCrossCheckError,
+    ):
+        assert issubclass(exc, ti.TransportIntensityError)
+
+
+# --- Scientific role (1-6) ---------------------------------------------------------------
+
+
+def test_30a_01_every_correct_role_passes():
+    record = ti.validate_mobility_source(_canonical_rows([0.5, 1.5]))
+    assert record["scientific_role_all_rows_verified"] is True
+    assert record["source_scientific_role_required"] == ncm.SCIENTIFIC_ROLE
+    assert record["source_row_count"] == 18
+    assert record["source_hydro_pair_count"] == 1
+    assert record["source_hydro_pair_timestamp_count"] == 2
+    assert record["source_hydro_pair_d50_group_count"] == 9
+
+
+def test_30a_02_foreign_role_fails():
+    df = _canonical_rows([0.5, 1.5])
+    df["scientific_role"] = "SOULSBY_ALGEBRAIC_WAVE_CURRENT_BED_SHEAR_SENSITIVITY"
+    with pytest.raises(ti.TransportIntensitySourceRoleError, match="SOULSBY_ALGEBRAIC"):
+        ti.validate_mobility_source(df)
+
+
+def test_30a_03_mixed_correct_and_foreign_fails():
+    df = _canonical_rows([0.5, 1.5])
+    df.loc[3, "scientific_role"] = "SOMETHING_ELSE"
+    with pytest.raises(ti.TransportIntensitySourceRoleError, match="SOMETHING_ELSE"):
+        ti.build_transport_intensity_3hourly(df)
+
+
+def test_30a_04_all_null_role_fails():
+    df = _canonical_rows([0.5, 1.5])
+    df["scientific_role"] = None
+    with pytest.raises(ti.TransportIntensitySourceRoleError, match="18 null/missing"):
+        ti.validate_mobility_source(df)
+
+
+def test_30a_05_mixed_correct_and_null_fails_and_never_asserts_a_source_role():
+    df = _canonical_rows([0.5, 1.5]).astype({"scientific_role": object})
+    df.loc[0, "scientific_role"] = None
+    df.loc[7, "scientific_role"] = np.nan
+    with pytest.raises(ti.TransportIntensitySourceRoleError, match="2 null/missing"):
+        ti.validate_mobility_source(df)
+    # The dropna() escape hatch is gone: no derived table exists to carry an
+    # asserted source_scientific_role for rows whose source role is missing.
+    with pytest.raises(ti.TransportIntensitySourceRoleError):
+        ti.build_transport_intensity_3hourly(df)
+    assert "dropna" not in inspect.getsource(ti._verify_source_scientific_role)
+
+
+def test_30a_06_empty_string_role_fails():
+    df = _canonical_rows([0.5, 1.5])
+    df.loc[5, "scientific_role"] = ""
+    with pytest.raises(ti.TransportIntensitySourceRoleError, match=r"\[''\]"):
+        ti.validate_mobility_source(df)
+
+
+# --- Scenario vocabulary (7-12) -----------------------------------------------------------
+
+
+def test_30a_07_exact_canonical_nine_scenarios_pass():
+    record = ti.validate_mobility_source(_canonical_rows([0.5, 1.5]))
+    assert record["exact_scenario_set_verified"] is True
+    assert record["canonical_tested_d50_scenarios_mm"] == list(ncm.TESTED_D50_SCENARIOS_MM)
+    assert ti.TESTED_D50_SCENARIOS_MM is ncm.TESTED_D50_SCENARIOS_MM  # reused, not copied
+
+
+def test_30a_08_one_missing_scenario_fails():
+    df = _canonical_rows([0.5, 1.5])
+    df = df[df["tested_d50_mm"] != 16.0].reset_index(drop=True)
+    with pytest.raises(ti.TransportIntensityScenarioContractError, match=r"missing \[16.0\]"):
+        ti.build_transport_intensity_3hourly(df)
+
+
+def test_30a_09_unexpected_32mm_scenario_fails():
+    extra = _mobility_rows([0.5, 1.5], d50_mm=32.0, tau_cr=5.0)
+    df = pd.concat([_canonical_rows([0.5, 1.5]), extra], ignore_index=True)
+    with pytest.raises(ti.TransportIntensityScenarioContractError, match=r"unexpected \[32.0\]"):
+        ti.build_transport_intensity_3hourly(df)
+
+
+def test_30a_09b_nearly_canonical_value_is_not_reinterpreted_as_a_scenario():
+    df = _canonical_rows([0.5, 1.5])
+    df.loc[0, "tested_d50_mm"] = 0.063 * (1 + 1e-9)  # not the serialized MAR-013 constant
+    df.loc[0, "tested_d50_m"] = df.loc[0, "tested_d50_mm"] / 1000.0
+    with pytest.raises(ti.TransportIntensityScenarioContractError, match="unexpected"):
+        ti.validate_mobility_source(df)
+
+
+def test_30a_10_null_d50_fails():
+    df = _canonical_rows([0.5, 1.5])
+    df.loc[4, "tested_d50_mm"] = np.nan
+    with pytest.raises(
+        ti.TransportIntensityScenarioContractError, match="null/non-finite tested_d50_mm"
+    ):
+        ti.validate_mobility_source(df)
+
+
+def test_30a_11_non_finite_d50_fails():
+    df = _canonical_rows([0.5, 1.5])
+    df.loc[4, "tested_d50_mm"] = np.inf
+    with pytest.raises(
+        ti.TransportIntensityScenarioContractError, match="null/non-finite tested_d50_mm"
+    ):
+        ti.validate_mobility_source(df)
+
+
+def test_30a_12_duplicate_scenario_within_pair_timestamp_fails():
+    df = _canonical_rows([0.5, 1.5])
+    # Row 2 is (pair_A, t0, 0.125 mm); relabel it as 0.063 mm -> t0 carries 0.063 twice
+    # and lacks 0.125, while the GLOBAL vocabulary is still complete via t1.
+    assert df.loc[2, "tested_d50_mm"] == 0.125
+    _set_d50(df, 2, 0.063)
+    assert set(df["tested_d50_mm"]) == set(ncm.TESTED_D50_SCENARIOS_MM)
+    with pytest.raises(
+        ti.TransportIntensitySourceKeyError, match=ti.DUPLICATE_MAR013_MOBILITY_SOURCE_KEY
+    ):
+        ti.validate_mobility_source(df)
+
+
+# --- Unit identity (13-15) ---------------------------------------------------------------
+
+
+def test_30a_13_correct_mm_m_values_pass():
+    df = _canonical_rows([0.5, 1.5])
+    assert (df["tested_d50_m"] == df["tested_d50_mm"] / 1000.0).all()
+    record = ti.validate_mobility_source(df)
+    assert record["d50_unit_consistency_verified"] is True
+    # Serialization-noise-level differences are accepted; nothing is overwritten.
+    noisy = df.copy()
+    noisy["tested_d50_m"] = noisy["tested_d50_m"] * (1 + 1e-13)
+    ti.validate_mobility_source(noisy)
+
+
+def test_30a_14_contradictory_mm_vs_m_fails():
+    df = _canonical_rows([0.5, 1.5])
+    row = int(df.index[df["tested_d50_mm"] == 0.25][0])
+    df.loc[row, "tested_d50_m"] = 0.000500  # 0.250 mm <-> 0.000500 m
+    with pytest.raises(
+        ti.TransportIntensityScenarioContractError, match="tested_d50_m inconsistent"
+    ):
+        ti.validate_mobility_source(df)
+    assert df.loc[row, "tested_d50_m"] == 0.000500  # never silently recomputed
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_30a_15_null_or_non_finite_d50_m_fails(bad: float):
+    df = _canonical_rows([0.5, 1.5])
+    df.loc[6, "tested_d50_m"] = bad
+    with pytest.raises(
+        ti.TransportIntensityScenarioContractError, match="null/non-finite tested_d50_m"
+    ):
+        ti.validate_mobility_source(df)
+
+
+# --- Source keys (16-17) -----------------------------------------------------------------
+
+
+def test_30a_16_duplicate_source_key_fails_and_is_never_aggregated():
+    df = _canonical_rows([0.5, 1.5])
+    df = pd.concat([df, df.iloc[[3]]], ignore_index=True)  # exact duplicate of one row
+    with pytest.raises(ti.TransportIntensitySourceKeyError) as info:
+        ti.build_transport_intensity_3hourly(df)
+    assert ti.DUPLICATE_MAR013_MOBILITY_SOURCE_KEY in str(info.value)
+    assert "never aggregated" in str(info.value)
+    for forbidden in (
+        "drop_duplicates(subset=list(SOURCE_KEY_COLUMNS))",
+        'keep="first"',
+        'keep="last"',
+    ):
+        assert forbidden not in inspect.getsource(ti._verify_source_key_uniqueness)
+
+
+def test_30a_16b_null_key_component_fails():
+    df = _canonical_rows([0.5, 1.5]).astype({"hydro_pair_id": object})
+    df.loc[1, "hydro_pair_id"] = None
+    with pytest.raises(ti.TransportIntensitySourceKeyError, match="null hydro_pair_id"):
+        ti.validate_mobility_source(df)
+    df = _canonical_rows([0.5, 1.5])
+    df.loc[1, "time_utc"] = pd.NaT
+    with pytest.raises(ti.TransportIntensitySourceKeyError, match="null hydro_pair_id"):
+        ti.validate_mobility_source(df)
+
+
+def test_30a_17_scenario_completeness_checked_independently_per_pair_timestamp():
+    df = _two_pairs()
+    complete = ti.validate_mobility_source(df)
+    assert complete["per_timestamp_scenario_completeness_verified"] is True
+    assert complete["source_hydro_pair_timestamp_count"] == 8
+    # Remove ONE row: pair_B at its second timestamp loses the 0.5 mm scenario. The global
+    # vocabulary is still complete and every key is unique -- only completeness catches it.
+    t1 = df["time_utc"].sort_values().unique()[1]
+    victim = df.index[
+        (df["hydro_pair_id"] == "pair_B") & (df["time_utc"] == t1) & (df["tested_d50_mm"] == 0.5)
+    ]
+    assert len(victim) == 1
+    broken = df.drop(index=victim).reset_index(drop=True)
+    assert set(broken["tested_d50_mm"]) == set(ncm.TESTED_D50_SCENARIOS_MM)
+    assert not broken.duplicated(subset=list(ti.SOURCE_KEY_COLUMNS)).any()
+    with pytest.raises(ti.TransportIntensityScenarioContractError) as info:
+        ti.build_transport_intensity_3hourly(broken)
+    assert "1 hydro_pair_id x time_utc group(s)" in str(info.value)
+    assert "pair_B" in str(info.value)
+    # pair_A alone is untouched and still passes.
+    ti.validate_mobility_source(broken[broken["hydro_pair_id"] == "pair_A"].reset_index(drop=True))
+
+
+# --- Incipient-motion status QA (18-21) -----------------------------------------------------
+
+
+def test_30a_18_below_threshold_status_passes():
+    df = _canonical_rows([0.2, 0.5, 0.999])
+    assert set(df["incipient_motion_status"]) == {ncm.BELOW_THRESHOLD}
+    ti.verify_incipient_motion_status_consistency(df)
+    assert ti.validate_mobility_source(df)["incipient_motion_status_consistency_verified"] is True
+
+
+def test_30a_19_above_or_at_threshold_status_passes():
+    df = _canonical_rows([1.0, 1.001, 5.0])
+    assert set(df["incipient_motion_status"]) == {ncm.ABOVE_OR_AT_THRESHOLD}
+    ti.verify_incipient_motion_status_consistency(df)
+
+
+def test_30a_20_mismatched_finite_status_fails_and_is_not_corrected():
+    df = _canonical_rows([0.5, 1.5])
+    df.loc[1, "incipient_motion_status"] = ncm.BELOW_THRESHOLD  # ratio 1.5 says ABOVE_OR_AT
+    with pytest.raises(ti.IncipientMotionStatusConsistencyError, match="never corrected"):
+        ti.build_transport_intensity_3hourly(df)
+    assert df.loc[1, "incipient_motion_status"] == ncm.BELOW_THRESHOLD
+    df = _canonical_rows([0.5, 1.5])
+    df.loc[0, "incipient_motion_status"] = ncm.ABOVE_OR_AT_THRESHOLD  # ratio 0.5 says BELOW
+    with pytest.raises(ti.IncipientMotionStatusConsistencyError):
+        ti.validate_mobility_source(df)
+    # MAR-013's own classifier is what is re-applied -- no new threshold in MAR-030A.
+    assert "classify_incipient_motion_status" in inspect.getsource(
+        ti.verify_incipient_motion_status_consistency
+    )
+
+
+def test_30a_21_undefined_ratio_with_non_null_status_fails_and_vice_versa():
+    df = _canonical_rows([np.nan, 1.5])
+    assert pd.isna(df.loc[0, "incipient_motion_status"])
+    ti.verify_incipient_motion_status_consistency(df)  # null status for undefined ratio: OK
+    df.loc[0, "incipient_motion_status"] = ncm.BELOW_THRESHOLD
+    with pytest.raises(ti.IncipientMotionStatusConsistencyError):
+        ti.validate_mobility_source(df)
+    df = _canonical_rows([0.5, 1.5]).astype({"incipient_motion_status": object})
+    df.loc[1, "incipient_motion_status"] = None  # finite ratio with a missing status
+    with pytest.raises(ti.IncipientMotionStatusConsistencyError):
+        ti.validate_mobility_source(df)
+
+
+# --- Stats cross-check (22-30) -------------------------------------------------------------
+
+
+def test_30a_22_exact_key_set_passes():
+    mar030, mar013 = _stats_pair(_two_pairs())
+    assert ti.cross_check_against_mobility_stats(mar030, mar013) == 18
+
+
+def test_30a_23_mar030_missing_group_fails_even_though_intersection_agrees():
+    mar030, mar013 = _stats_pair(_two_pairs())
+    trimmed = mar030[~((mar030["hydro_pair_id"] == "pair_B") & (mar030["tested_d50_mm"] == 0.5))]
+    assert len(trimmed) == 17
+    # An inner merge alone would have passed: every intersecting group agrees.
+    merged = trimmed.merge(mar013, on=["hydro_pair_id", "tested_d50_mm"], how="inner")
+    assert (merged["valid_intensity_timestamp_count"] == merged["valid_count"]).all()
+    with pytest.raises(ti.MobilityStatsCrossCheckError, match="only in MAR-013"):
+        ti.cross_check_against_mobility_stats(trimmed, mar013)
+
+
+def test_30a_24_mar030_extra_group_fails():
+    mar030, mar013 = _stats_pair(_two_pairs())
+    extra = mar030.iloc[[0]].assign(tested_d50_mm=32.0)
+    with pytest.raises(ti.MobilityStatsCrossCheckError, match="only in MAR-030"):
+        ti.cross_check_against_mobility_stats(pd.concat([mar030, extra], ignore_index=True), mar013)
+
+
+def test_30a_25_mar013_missing_group_fails():
+    mar030, mar013 = _stats_pair(_two_pairs())
+    trimmed = mar013[~((mar013["hydro_pair_id"] == "pair_A") & (mar013["tested_d50_mm"] == 16.0))]
+    with pytest.raises(ti.MobilityStatsCrossCheckError, match="only in MAR-030"):
+        ti.cross_check_against_mobility_stats(mar030, trimmed)
+
+
+def test_30a_26_mar013_extra_group_fails():
+    mar030, mar013 = _stats_pair(_two_pairs())
+    extra = mar013.iloc[[0]].assign(hydro_pair_id="pair_C")
+    with pytest.raises(ti.MobilityStatsCrossCheckError, match="only in MAR-013"):
+        ti.cross_check_against_mobility_stats(mar030, pd.concat([mar013, extra], ignore_index=True))
+
+
+def test_30a_27_duplicate_mar013_stats_key_fails():
+    mar030, mar013 = _stats_pair(_two_pairs())
+    duplicated = pd.concat([mar013, mar013.iloc[[4]]], ignore_index=True)
+    with pytest.raises(
+        ti.MobilityStatsCrossCheckError, match="MAR-013 statistics carry duplicated"
+    ):
+        ti.cross_check_against_mobility_stats(mar030, duplicated)
+
+
+def test_30a_28_duplicate_mar030_stats_key_fails():
+    mar030, mar013 = _stats_pair(_two_pairs())
+    duplicated = pd.concat([mar030, mar030.iloc[[4]]], ignore_index=True)
+    with pytest.raises(
+        ti.MobilityStatsCrossCheckError, match="MAR-030 statistics carry duplicated"
+    ):
+        ti.cross_check_against_mobility_stats(duplicated, mar013)
+
+
+def test_30a_29_equal_keys_but_unequal_valid_count_fails():
+    mar030, mar013 = _stats_pair(_two_pairs())
+    tampered = mar013.copy()
+    tampered.loc[2, "valid_count"] -= 1
+    with pytest.raises(ti.MobilityStatsCrossCheckError, match="counts disagree"):
+        ti.cross_check_against_mobility_stats(mar030, tampered)
+
+
+def test_30a_30_equal_keys_but_unequal_exceedance_count_fails():
+    mar030, mar013 = _stats_pair(_two_pairs())
+    tampered = mar013.copy()
+    tampered.loc[2, "threshold_exceedance_count"] += 1
+    with pytest.raises(ti.MobilityStatsCrossCheckError, match="counts disagree"):
+        ti.cross_check_against_mobility_stats(mar030, tampered)
+
+
+def test_30a_cross_check_one_sided_empty_is_a_key_set_failure_not_zero():
+    mar030, mar013 = _stats_pair(_two_pairs())
+    empty030 = pd.DataFrame(columns=list(ti.TRANSPORT_INTENSITY_STATS_COLUMNS))
+    empty013 = pd.DataFrame(columns=list(ncm.NONCOHESIVE_MOBILITY_STATS_COLUMNS))
+    with pytest.raises(ti.MobilityStatsCrossCheckError):
+        ti.cross_check_against_mobility_stats(empty030, mar013)
+    with pytest.raises(ti.MobilityStatsCrossCheckError):
+        ti.cross_check_against_mobility_stats(mar030, empty013)
+    assert ti.cross_check_against_mobility_stats(empty030, empty013) == 0
+
+
+# --- GIS (31-32) ---------------------------------------------------------------------------
+
+
+def test_30a_31_canonical_14_x_9_pl854_like_structure_remains_supported():
+    pair_ids = [f"pair_{i:02d}" for i in range(14)]
+    df = pd.concat([_canonical_rows([0.5, 1.5], pair_id=p) for p in pair_ids], ignore_index=True)
+    record = ti.validate_mobility_source(df)
+    assert record["source_hydro_pair_count"] == 14
+    assert record["source_hydro_pair_d50_group_count"] == 126
+    mar030, mar013 = _stats_pair(df)
+    assert len(mar030) == 126
+    assert ti.cross_check_against_mobility_stats(mar030, mar013) == 126
+    gdf = ti.build_transport_intensity_segments(_mar013_segments(pair_ids), mar030)
+    assert len(gdf) == 126
+    assert gdf.groupby("segment_id")["tested_d50_mm"].nunique().tolist() == [9] * 14
+    assert gdf["relative_excess_intensity_p95"].notna().all()
+    assert gdf["valid_intensity_timestamp_count"].notna().all()
+
+
+def test_30a_32_missing_scenario_statistics_for_supported_segment_fails_not_silent_na():
+    segments = _mar013_segments(["pair_A", "pair_B"])
+    stats = _two_pair_stats()
+    trimmed = stats[~((stats["hydro_pair_id"] == "pair_B") & (stats["tested_d50_mm"] == 0.5))]
+    with pytest.raises(ti.TransportIntensityScenarioContractError) as info:
+        ti.build_transport_intensity_segments(segments, trimmed)
+    assert "pair_B" in str(info.value) and "[0.5]" in str(info.value)
+    # A supported segment whose pair has NO statistics at all fails the same way.
+    with pytest.raises(ti.TransportIntensityScenarioContractError):
+        ti.build_transport_intensity_segments(segments, stats[stats["hydro_pair_id"] == "pair_A"])
+    with pytest.raises(ti.TransportIntensityScenarioContractError):
+        ti.build_transport_intensity_segments(
+            segments, pd.DataFrame(columns=list(ti.TRANSPORT_INTENSITY_STATS_COLUMNS))
+        )
+    # Duplicate statistics keys never resolve to one feature silently.
+    with pytest.raises(ti.TransportIntensityScenarioContractError, match="duplicated"):
+        ti.build_transport_intensity_segments(
+            segments, pd.concat([stats, stats.iloc[[0]]], ignore_index=True)
+        )
+    # Accepted MAR-013 semantics preserved: a segment with NO hydro-pair support keeps
+    # nine features with null statistics (see test_segment_without_hydro_pair_...).
+    gdf = ti.build_transport_intensity_segments(_mar013_segments(["pair_A", None]), stats)
+    assert len(gdf) == 18
+
+
+# --- Regression (33-36) ----------------------------------------------------------------------
+
+
+def test_30a_33_formula_remains_exactly_max_m_minus_one_zero():
+    m = np.array([np.nan, 0.0, 0.5, 0.999, 1.0, 1.001, 1.25, 2.0, 5.0])
+    out = ti.compute_relative_excess_shields_intensity(m)
+    expected = np.where(np.isfinite(m), np.maximum(m - 1.0, 0.0), np.nan)
+    assert np.array_equal(out, expected, equal_nan=True)
+    src = inspect.getsource(ti.compute_relative_excess_shields_intensity)
+    assert "np.maximum(stage, 0.0)" in src
+    assert ti.INTENSITY_DEFINITION.startswith(
+        "relative_excess_shields_intensity = max(mobility_ratio - 1, 0)"
+    )
+
+
+def test_30a_34_null_mobility_remains_null_through_the_contract_checked_builder():
+    df = _canonical_rows([np.nan, 1.5])
+    out = ti.build_transport_intensity_3hourly(df)
+    null_rows = out[out["mobility_ratio"].isna()]
+    assert len(null_rows) == 9  # one undefined timestamp per scenario
+    assert null_rows["relative_excess_shields_intensity"].isna().all()
+    assert null_rows["relative_shields_stage"].isna().all()
+
+
+def test_30a_35_no_rate_flux_direction_field_introduced():
+    columns = [
+        *ti.TRANSPORT_INTENSITY_3HOURLY_COLUMNS,
+        *ti.TRANSPORT_INTENSITY_STATS_COLUMNS,
+        *ti.TRANSPORT_INTENSITY_SEGMENTS_COLUMNS,
+        *_contract_one_pair().keys(),
+    ]
+    for term in ("rate", "flux", "direction", "bedload", "suspended", "q_b", "kg_s", "m3_s"):
+        assert not any(term in c.lower() for c in columns), term
+    assert list(ti.TRANSPORT_INTENSITY_3HOURLY_COLUMNS) == [
+        "hydro_pair_id",
+        "current_node_id",
+        "wave_node_id",
+        "time_utc",
+        "tested_d50_mm",
+        "tested_d50_m",
+        "tau_max_grain_skin_pa",
+        "tau_critical_pa",
+        "critical_shields_parameter",
+        "mobility_ratio",
+        "incipient_motion_status",
+        "relative_shields_stage",
+        "relative_excess_shields_intensity",
+        "transport_intensity_support_semantics",
+        "scientific_role",
+        "source_scientific_role",
+    ]
+
+
+def test_30a_36_source_input_remains_unmodified_on_pass_and_on_every_failure():
+    good = _canonical_rows([np.nan, 0.5, 1.5])
+    before = good.copy(deep=True)
+    ti.validate_mobility_source(good)
+    ti.build_transport_intensity_3hourly(good)
+    pd.testing.assert_frame_equal(good, before)
+
+    failing = []
+    df = _canonical_rows([0.5, 1.5]).astype({"scientific_role": object})
+    df.loc[0, "scientific_role"] = None
+    failing.append(df)
+    df = _canonical_rows([0.5, 1.5])
+    df.loc[0, "tested_d50_m"] = 0.5
+    failing.append(df)
+    df = _canonical_rows([0.5, 1.5])
+    failing.append(pd.concat([df, df.iloc[[0]]], ignore_index=True))
+    df = _canonical_rows([0.5, 1.5])
+    df.loc[1, "incipient_motion_status"] = ncm.BELOW_THRESHOLD
+    failing.append(df)
+    for df in failing:
+        before = df.copy(deep=True)
+        with pytest.raises(ti.TransportIntensityError):
+            ti.build_transport_intensity_3hourly(df)
+        pd.testing.assert_frame_equal(df, before)
+
+
+# --- Metadata / report -----------------------------------------------------------------------
+
+
+def test_30a_metadata_source_contract_section_is_machine_readable_and_evidence_based():
+    contract = ti.validate_mobility_source(_two_pairs())
+    md = ti.build_transport_intensity_metadata(
+        outputs={},
+        row_count=72,
+        hydro_pair_count=2,
+        cross_checked_group_count=18,
+        source_contract=contract,
+    )
+    section = md["source_contract"]
+    assert section["source_scientific_role_required"] == ncm.SCIENTIFIC_ROLE
+    assert section["canonical_tested_d50_scenarios_mm"] == list(ncm.TESTED_D50_SCENARIOS_MM)
+    for flag in (
+        "scientific_role_all_rows_verified",
+        "exact_scenario_set_verified",
+        "d50_unit_consistency_verified",
+        "source_key_uniqueness_verified",
+        "per_timestamp_scenario_completeness_verified",
+        "incipient_motion_status_consistency_verified",
+        "mar013_stats_key_set_match_verified",
+    ):
+        assert section[flag] is True, flag
+    assert section["mar013_stats_groups_cross_checked"] == 18
+    assert "not a new scientific validation" in section["source_contract_semantics"]
+    json.dumps(md)  # serializable
+
+    # The key-set flag is never asserted when the cross-check did not cover every group.
+    with pytest.raises(ti.MobilityStatsCrossCheckError):
+        ti.build_transport_intensity_metadata(
+            outputs={},
+            row_count=72,
+            hydro_pair_count=2,
+            cross_checked_group_count=17,
+            source_contract=contract,
+        )
+    empty = ti.build_transport_intensity_metadata(
+        outputs={},
+        row_count=0,
+        hydro_pair_count=0,
+        cross_checked_group_count=0,
+        source_contract=_empty_contract(),
+    )
+    assert empty["source_contract"]["scientific_role_all_rows_verified"] is None
+    assert empty["source_contract"]["mar013_stats_key_set_match_verified"] is None
+
+
+def test_30a_report_prints_the_source_contract(capsys: pytest.CaptureFixture[str]):
+    df = _all_scenario_rows()
+    out = ti.build_transport_intensity_3hourly(df)
+    stats = ti.compute_transport_intensity_stats(out)
+    gdf = ti.build_transport_intensity_segments(_mar013_segments(["pair_A"]), stats)
+    ti.print_transport_intensity_report(
+        intensity_df=out,
+        stats_df=stats,
+        segments_gdf=gdf,
+        cross_checked_group_count=9,
+        source_contract=ti.validate_mobility_source(df),
+    )
+    text = capsys.readouterr().out
+    assert "MAR-013 source contract (MAR-030A: source/integration integrity)" in text
+    assert "scientific_role_all_rows_verified" in text
+    assert "per_timestamp_scenario_completeness_verified" in text
+    assert "mar013_stats_key_set_match_verified" in text
+    assert "= YES (9 group(s))" in text
