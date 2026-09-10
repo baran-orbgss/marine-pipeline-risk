@@ -44,6 +44,9 @@ class CptEvidenceFacts:
     canonical_product_identity_verified: bool = False
     canonical_product_role_observed: str | None = None
     canonical_product_contract_observed: str | None = None
+    # MAR-032B: the named reasons why identity did not verify (marker problems, required V1 columns
+    # absent from the schema, evidence-lineage problems). Empty when identity verified.
+    canonical_product_identity_problems: tuple[str, ...] = ()
     measured_evidence_role_verified: bool = False
     registered_asset_sha256: str | None = None
     row_count: int = 0
@@ -217,12 +220,32 @@ def assess_cpt_readiness(facts: CptEvidenceFacts) -> CptReadinessResult:
     elif not facts.canonical_product_identity_verified:
         # MAR-032A Section 9/11: structurally canonical-looking is not canonical. Only the
         # observed, versioned product marker written by the canonical writer establishes identity.
+        # MAR-032B: identity also requires the FULL required V1 column contract and a consistent
+        # evidence lineage; the precise named problems are reported, never a generic downgrade.
+        detail = (
+            "; ".join(facts.canonical_product_identity_problems)
+            if facts.canonical_product_identity_problems
+            else (
+                "the table is structurally canonical-looking but carries no verified canonical "
+                "CPT product marker"
+            )
+        )
         blocking.append(
-            f"{contract.CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED}: the table is structurally "
-            "canonical-looking but carries no verified canonical CPT product marker (observed "
+            f"{contract.CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED}: {detail} (observed "
             f"product role {facts.canonical_product_role_observed!r}, contract "
             f"{facts.canonical_product_contract_observed!r}); column names are not measurement "
             "semantics"
+        )
+    if (
+        not facts.canonical_product_identity_verified
+        and facts.canonical_product_identity_problems
+        and not any(contract.CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED in b for b in blocking)
+    ):
+        # A marked file whose schema is too narrow even for QA (structural columns absent) is
+        # still reported with the controlled identity reason and its explicit finding.
+        blocking.append(
+            f"{contract.CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED}: "
+            + "; ".join(facts.canonical_product_identity_problems)
         )
     axes.append(
         _axis(
@@ -236,6 +259,9 @@ def assess_cpt_readiness(facts: CptEvidenceFacts) -> CptReadinessResult:
                 "canonical_product_identity_verified": facts.canonical_product_identity_verified,
                 "canonical_product_role_observed": facts.canonical_product_role_observed,
                 "canonical_product_contract_observed": facts.canonical_product_contract_observed,
+                "canonical_product_identity_problems": list(
+                    facts.canonical_product_identity_problems
+                ),
                 "row_count": facts.row_count,
                 "test_count": facts.test_count,
             },
@@ -323,17 +349,29 @@ def assess_cpt_readiness(facts: CptEvidenceFacts) -> CptReadinessResult:
             "as MEASURED CPT/CPTU evidence (observed canonical product role and declared evidence "
             "role must both be measured); not advertised as measured cone-resistance evidence"
         )
-    if contract.QC_MPA not in present and contract.QT_MPA not in present:
-        blocking.append("neither measured (qc) nor corrected (qt) cone resistance is available")
-    if contract.QT_MPA not in present:
-        limitations.append(
-            "qt (corrected cone resistance) not provided by source; qt_mpa = null -- NOT derived "
-            "from qc (no unequal-area / pore-pressure correction in MAR-032)"
+    if not facts.canonical_product_identity_verified:
+        # MAR-032B Section 6: "channel unavailable" limitations describe a legitimately canonical
+        # representation whose required columns EXIST and hold nulls. A table whose product
+        # identity did not verify (unmarked, schema-narrow or lineage-inconsistent) gets no such
+        # downgrade; its channels are simply not assessed.
+        blocking.append(
+            f"{contract.CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED}: qc/qt/fs/u2 channel "
+            "availability is not assessed for a table whose canonical product identity did not "
+            "verify (a required V1 column absent from the schema is a product-contract "
+            "violation, not a channel-unavailable limitation)"
         )
-    if contract.FS_KPA not in present:
-        limitations.append("sleeve friction fs not available")
-    if contract.U2_KPA not in present:
-        limitations.append("pore pressure u2 not available")
+    else:
+        if contract.QC_MPA not in present and contract.QT_MPA not in present:
+            blocking.append("neither measured (qc) nor corrected (qt) cone resistance is available")
+        if contract.QT_MPA not in present:
+            limitations.append(
+                "qt (corrected cone resistance) not provided by source; qt_mpa = null -- NOT "
+                "derived from qc (no unequal-area / pore-pressure correction in MAR-032)"
+            )
+        if contract.FS_KPA not in present:
+            limitations.append("sleeve friction fs not available")
+        if contract.U2_KPA not in present:
+            limitations.append("pore pressure u2 not available")
     axes.append(
         _axis(
             contract.MEASUREMENT_SEMANTICS,

@@ -103,6 +103,10 @@ def format_acceptance_lines(result: CptEvidenceBuildResult) -> list[str]:
         "IS THE CANONICAL CPT PRODUCT IDENTITY VERIFIED FROM FILE METADATA? "
         f"{yes_no(facts.canonical_product_identity_verified)}",
         f"OBSERVED CANONICAL PRODUCT ROLE: {facts.canonical_product_role_observed}",
+        "ARE ALL REQUIRED CPT_CANONICAL_PROFILE_V1 COLUMNS PRESENT IN THE WRITTEN PRODUCT? "
+        f"{yes_no(result.metadata.get('canonical_product_required_columns_present'))}",
+        "DOES THE MARKER EVIDENCE ID EQUAL THE SINGLE ROW-LEVEL SOURCE ID? "
+        f"{yes_no((result.metadata.get('canonical_product_lineage') or {}).get('verified'))}",
         "CAN A CANONICAL-LOOKING UNMARKED PARQUET PASS AS A VERIFIED MAR CPT PROFILE? NO",
         "IS THE DECLARED CRS SEMANTICALLY THE SOURCE-DEFINED "
         f"{crs_ref.get('source_reference_crs')} ({crs_ref.get('source_horizontal_unit')})? "

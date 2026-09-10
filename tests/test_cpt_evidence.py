@@ -877,7 +877,9 @@ def test_45b_canonical_parquet_asset_delegates_to_generic_readiness(
     )
     parquet = tmp_path / "cpt_measurements.parquet"
     # MAR-032A: only the canonical writer produces a verified canonical product.
-    cpt_profile.write_canonical_cpt_measurements(build.measurements, parquet, evidence_id="syn")
+    cpt_profile.write_canonical_cpt_measurements(
+        build.measurements, parquet, evidence_id=SYNTHETIC_TAG
+    )
     result = _register(_project_manifest(tmp_path, "cpt_measurements.parquet"))
     reg = result.registration
     assert reg.readiness_status_intrinsic == contract.READY_WITH_LIMITATIONS
@@ -1345,7 +1347,7 @@ def _epsg_free_wkt_32631() -> str:
 def test_032a_writer_stamps_versioned_marker_and_values_are_unchanged(tmp_path: Path):
     df = _canonical_frame()
     marked = cpt_profile.write_canonical_cpt_measurements(
-        df, tmp_path / "marked.parquet", evidence_id="syn_ev"
+        df, tmp_path / "marked.parquet", evidence_id=SYNTHETIC_TAG
     )
     plain = tmp_path / "plain.parquet"
     df.to_parquet(plain, index=False)
@@ -1353,7 +1355,7 @@ def test_032a_writer_stamps_versioned_marker_and_values_are_unchanged(tmp_path: 
     assert marker.verified is True and marker.problems == ()
     assert marker.product_role == contract.MEASURED_CPT_CPTU_PROFILE
     assert marker.contract_version == "CPT_CANONICAL_PROFILE_V1"
-    assert marker.evidence_id == "syn_ev"
+    assert marker.evidence_id == SYNTHETIC_TAG
     assert json.loads(marker.canonical_units) == contract.CANONICAL_FIELD_UNITS
     assert set(marker.observed) == set(contract.CANONICAL_PRODUCT_METADATA_KEYS)
     # Same rows/values, different raw bytes: identity is compared on VALUES, not file SHA-256.
@@ -1373,7 +1375,7 @@ def test_032a_writer_stamps_versioned_marker_and_values_are_unchanged(tmp_path: 
         cpt_profile.write_canonical_cpt_measurements(df, tmp_path / "x.parquet", evidence_id="  ")
     with pytest.raises(cpt_profile.CptProfileError):
         cpt_profile.write_canonical_cpt_measurements(
-            df.drop(columns=[contract.QT_MPA]), tmp_path / "y.parquet", evidence_id="syn"
+            df.drop(columns=[contract.QT_MPA]), tmp_path / "y.parquet", evidence_id=SYNTHETIC_TAG
         )
     assert not (tmp_path / "x.parquet").exists() and not (tmp_path / "y.parquet").exists()
 
@@ -1418,7 +1420,7 @@ def test_032a_unmarked_lookalike_parquet_is_not_a_verified_cpt_profile(tmp_path:
 
 def test_032a_marked_bytes_with_non_measured_declared_role_are_denied(tmp_path: Path):
     marked = cpt_profile.write_canonical_cpt_measurements(
-        _canonical_frame(), tmp_path / "prod.parquet", evidence_id="syn"
+        _canonical_frame(), tmp_path / "prod.parquet", evidence_id=SYNTHETIC_TAG
     )
     measured = _register(_project_manifest(tmp_path, "prod.parquet", role="MEASURED")).registration
     assert measured.readiness_status_intrinsic == contract.READY_WITH_LIMITATIONS
@@ -1516,15 +1518,19 @@ def test_032a_defective_markers_and_structure_never_verify(
     if drop:
         assert obs["structural_canonical_columns_present"] is False
         assert obs["canonical_columns_missing"] == [drop]
+        # MAR-032B: the full V1 product contract is reported separately from the structural subset.
+        assert obs["canonical_product_required_columns_present"] is False
+        assert obs["canonical_product_columns_missing"] == [drop]
     else:
         assert obs["structural_canonical_columns_present"] is True
+        assert obs["canonical_product_required_columns_present"] is True
     # Whatever the file claims about itself is preserved verbatim as OBSERVED metadata.
     assert obs["canonical_product_marker"]["observed_metadata"] == marker
 
 
 def test_032a_registration_sha_is_recorded_and_never_invented(tmp_path: Path):
     marked = cpt_profile.write_canonical_cpt_measurements(
-        _canonical_frame(), tmp_path / "prod.parquet", evidence_id="syn"
+        _canonical_frame(), tmp_path / "prod.parquet", evidence_id=SYNTHETIC_TAG
     )
     expected = hashlib.sha256(marked.read_bytes()).hexdigest()
     reg = _register(_project_manifest(tmp_path, "prod.parquet")).registration
@@ -1560,7 +1566,7 @@ def test_032a_registration_sha_is_recorded_and_never_invented(tmp_path: Path):
 
 def test_032a_qc_qt_unit_and_depth_semantics_unchanged_through_the_writer(tmp_path: Path):
     marked = cpt_profile.write_canonical_cpt_measurements(
-        _canonical_frame(), tmp_path / "prod.parquet", evidence_id="syn"
+        _canonical_frame(), tmp_path / "prod.parquet", evidence_id=SYNTHETIC_TAG
     )
     back = pd.read_parquet(marked)
     obs = _simple_observations()
@@ -1730,3 +1736,332 @@ def test_032a_end_to_end_marker_and_crs_facts_in_real_shape_outputs(
     derived = _register(_project_manifest(tmp_path, rel, role="DERIVED")).registration
     assert derived.evidence_role == "DERIVED"
     assert derived.readiness_status_intrinsic == contract.NOT_READY
+
+
+# --- MAR-032B: full V1 product schema binding and evidence-id / source-id lineage -----------------
+
+_V1_REQUIRED_COLUMNS_UNDER_TEST = [
+    contract.LOCATION_ID,
+    contract.DEPTH_SOURCE_UNIT,
+    contract.QC_MPA,
+    contract.QT_MPA,
+    contract.FS_KPA,
+    contract.U2_KPA,
+    contract.DEPTH_BSF_M,  # core structural field
+]
+
+
+def _no_measured_inputs(facts: cpt_readiness.CptEvidenceFacts) -> None:
+    liq = cpt_readiness.assess_liquefaction_input_readiness(facts)
+    assert liq["measured_cpt_profile_verified"] is False
+    eq = liq["earthquake_induced"]["required_evidence"]
+    assert eq["machine_readable_cpt_profile"] == contract.NOT_AVAILABLE
+    assert eq["qc"] == contract.NOT_AVAILABLE and eq["qt"] == contract.NOT_AVAILABLE
+    assert eq["sleeve_friction_fs"] == contract.NOT_AVAILABLE
+    assert eq["pore_pressure_u2"] == contract.NOT_AVAILABLE
+    assert (
+        liq["wave_current_induced"]["required_evidence"]["soil_profile"] == contract.NOT_AVAILABLE
+    )
+
+
+def test_032b_writer_and_adapter_consume_one_required_column_authority():
+    # Single schema authority (Section 5): the adapter binds to the writer's tuple object itself.
+    assert cpt_adapter.CANONICAL_REQUIRED_COLUMNS is cpt_profile.CANONICAL_PRODUCT_COLUMNS
+    assert cpt_adapter.STRUCTURAL_LOOKALIKE_COLUMNS is contract.CANONICAL_STRUCTURAL_COLUMNS
+    product = set(cpt_profile.CANONICAL_PRODUCT_COLUMNS)
+    structural = set(contract.CANONICAL_STRUCTURAL_COLUMNS)
+    assert structural < product  # strict superset: structural lookalike != V1 product
+    assert product - structural == {
+        contract.LOCATION_ID,
+        contract.DEPTH_SOURCE_UNIT,
+        contract.QC_MPA,
+        contract.QT_MPA,
+        contract.FS_KPA,
+        contract.U2_KPA,
+    }
+    assert set(_V1_REQUIRED_COLUMNS_UNDER_TEST) <= product
+    # The adapter source defines no second column list of its own.
+    source = inspect.getsource(cpt_adapter)
+    assert "CANONICAL_STRUCTURAL_COLUMNS" in source  # observational concept still named ...
+    assert "identity_verified = bool(marker.verified and structural_present)" not in source
+    assert "verify_canonical_cpt_product" in source  # ... but identity comes from the shared check
+    # Helper agreement on a complete frame and an incomplete one.
+    frame = _canonical_frame()
+    assert cpt_profile.canonical_product_columns_missing(list(frame.columns)) == []
+    assert cpt_profile.canonical_product_columns_missing(
+        [c for c in frame.columns if c != contract.QT_MPA]
+    ) == [contract.QT_MPA]
+    # Extra raw__ channels are in the frame and are allowed by the contract.
+    assert [c for c in frame.columns if c.startswith(contract.RAW_CHANNEL_PREFIX)]
+
+
+@pytest.mark.parametrize("dropped", _V1_REQUIRED_COLUMNS_UNDER_TEST)
+def test_032b_valid_marker_missing_required_v1_column_never_verifies(tmp_path: Path, dropped: str):
+    df = _canonical_frame().drop(columns=[dropped])
+    # Marker metadata is entirely valid and lineage is consistent; ONLY the schema is short.
+    _write_with_metadata(tmp_path / "marked.parquet", df, _genuine_marker())
+    reg = _register(_project_manifest(tmp_path, "marked.parquet")).registration
+    assert reg.registration_status == project_registry.REGISTERED
+    obs = reg.observed_facts
+    assert obs["canonical_product_marker"]["verified"] is True  # the marker alone is fine ...
+    assert obs["canonical_product_lineage"]["verified"] is True  # ... and so is lineage ...
+    assert obs["canonical_product_required_columns_present"] is False  # ... schema is not
+    assert obs["canonical_product_columns_missing"] == [dropped]
+    assert obs["canonical_cpt_product_identity_verified"] is False
+    assert obs["measured_cpt_profile_verified"] is False
+    assert obs["measured_evidence_role_gate"]["verified"] is False
+    assert any(dropped in p for p in obs["canonical_product_identity_problems"])
+    assert reg.readiness_status_intrinsic == contract.NOT_READY
+    assert reg.readiness_status_effective == contract.NOT_READY
+    assert reg.readiness_result["measured_cpt_profile_verified"] is False
+    axes = {a["axis"]: a for a in reg.readiness_result["axes"]}
+    digital = axes[contract.DIGITAL_PROFILE]
+    assert digital["status"] != contract.READY
+    assert any(
+        contract.CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED in r and dropped in r
+        for r in digital["blocking_reasons"]
+    )
+    # Not downgraded to a mere channel-unavailable limitation.
+    all_limitations = [r for a in reg.readiness_result["axes"] for r in a["limitation_reasons"]]
+    assert not any("not provided by source" in r or "not available" in r for r in all_limitations)
+    if dropped in contract.CANONICAL_STRUCTURAL_COLUMNS:
+        assert obs["structural_canonical_columns_present"] is False
+        assert obs["canonical_columns_missing"] == [dropped]
+    else:
+        assert obs["structural_canonical_columns_present"] is True
+        assert obs["canonical_columns_missing"] == []
+    facts, _ = cpt_adapter.inspect_cpt_asset(
+        tmp_path / "marked.parquet", declared_evidence_role="MEASURED", registered_sha256=reg.sha256
+    )
+    assert facts.canonical_product_identity_verified is False
+    _no_measured_inputs(facts)
+    # The canonical writer refuses the same narrow frame before any file exists.
+    with pytest.raises(cpt_profile.CptProfileError, match=dropped):
+        cpt_profile.write_canonical_cpt_measurements(
+            df, tmp_path / "never.parquet", evidence_id=SYNTHETIC_TAG
+        )
+    assert not (tmp_path / "never.parquet").exists()
+
+
+def test_032b_all_null_required_channel_is_not_a_missing_column(tmp_path: Path):
+    frame = _canonical_frame()
+    assert frame[contract.QT_MPA].isna().all()  # qt column EXISTS and holds only nulls
+    frame["raw__extra_channel"] = 1.0  # extra raw__ column stays allowed
+    marked = cpt_profile.write_canonical_cpt_measurements(
+        frame, tmp_path / "prod.parquet", evidence_id=SYNTHETIC_TAG
+    )
+    reg = _register(_project_manifest(tmp_path, "prod.parquet")).registration
+    obs = reg.observed_facts
+    assert "raw__extra_channel" in obs["columns"]
+    assert obs["canonical_product_required_columns_present"] is True
+    assert obs["canonical_product_columns_missing"] == []
+    assert obs["canonical_cpt_product_identity_verified"] is True
+    assert obs["measured_cpt_profile_verified"] is True
+    assert reg.readiness_status_intrinsic == contract.READY_WITH_LIMITATIONS
+    axes = {a["axis"]: a for a in reg.readiness_result["axes"]}
+    assert axes[contract.DIGITAL_PROFILE]["status"] == contract.READY
+    assert any(
+        "qt_mpa = null" in r for r in axes[contract.MEASUREMENT_SEMANTICS]["limitation_reasons"]
+    )
+    facts, _ = cpt_adapter.inspect_cpt_asset(
+        marked, declared_evidence_role="MEASURED", registered_sha256=reg.sha256
+    )
+    eq = cpt_readiness.assess_liquefaction_input_readiness(facts)["earthquake_induced"]
+    assert eq["required_evidence"]["qc"] == contract.AVAILABLE
+    assert eq["required_evidence"]["qt"] == contract.NOT_AVAILABLE  # null channel, still uncomputed
+    # Same values with the qt COLUMN absent from the schema: a contract violation, NOT_READY.
+    _write_with_metadata(
+        tmp_path / "narrow.parquet", frame.drop(columns=[contract.QT_MPA]), _genuine_marker()
+    )
+    narrow = _register(_project_manifest(tmp_path, "narrow.parquet")).registration
+    assert narrow.readiness_status_intrinsic == contract.NOT_READY
+    assert narrow.observed_facts["canonical_product_columns_missing"] == [contract.QT_MPA]
+    assert narrow.observed_facts["canonical_cpt_product_identity_verified"] is False
+
+
+def _same_ids(actual: list[Any], expected: list[Any]) -> bool:
+    """Position-wise equality where a null (None / NaN, as pandas round-trips it) matches a null;
+    every non-null value must be exactly equal (no stripping, no casing)."""
+
+    if len(actual) != len(expected):
+        return False
+    for a, e in zip(actual, expected, strict=True):
+        a_null = a is None or (isinstance(a, float) and np.isnan(a))
+        e_null = e is None or (isinstance(e, float) and np.isnan(e))
+        if a_null or e_null:
+            if not (a_null and e_null):
+                return False
+        elif a != e:
+            return False
+    return True
+
+
+def _lineage_cases() -> list[tuple[str, list[Any], str]]:
+    a, b = "EVIDENCE_A", "EVIDENCE_B"
+    return [
+        ("evidence_id_mismatch", [b, b, b, b], a),
+        ("multiple_source_ids", [a, a, b, b], a),
+        ("null_source_id", [a, None, a, a], a),
+        ("blank_source_id", [a, "", "   ", a], a),
+    ]
+
+
+@pytest.mark.parametrize(("label", "row_ids", "evidence_id"), _lineage_cases())
+def test_032b_writer_refuses_inconsistent_lineage(
+    tmp_path: Path, label: str, row_ids: list[Any], evidence_id: str
+):
+    df = _canonical_frame()
+    df[contract.SOURCE_ID] = row_ids
+    lineage = cpt_profile.verify_canonical_lineage(df, evidence_id=evidence_id)
+    assert lineage.verified is False and lineage.problems, label
+    assert lineage.marker_evidence_id == evidence_id
+    assert lineage.evidence_id_matches_row_source_id is False
+    with pytest.raises(cpt_profile.CptProfileError, match="lineage"):
+        cpt_profile.write_canonical_cpt_measurements(
+            df, tmp_path / "never.parquet", evidence_id=evidence_id
+        )
+    assert not (tmp_path / "never.parquet").exists(), label
+    # No silent rewrite: the caller's frame still carries exactly the offending values.
+    assert _same_ids(df[contract.SOURCE_ID].tolist(), row_ids)
+
+
+def test_032b_writer_accepts_consistent_lineage_and_nothing_is_normalized(tmp_path: Path):
+    df = _canonical_frame()
+    df[contract.SOURCE_ID] = ["EVIDENCE_A"] * len(df)
+    lineage = cpt_profile.verify_canonical_lineage(df, evidence_id="EVIDENCE_A")
+    assert lineage.verified is True and lineage.problems == ()
+    assert lineage.row_source_id_unique_count == 1
+    assert lineage.row_source_id_values == ("EVIDENCE_A",)
+    assert lineage.null_or_blank_source_id_row_count == 0
+    marked = cpt_profile.write_canonical_cpt_measurements(
+        df, tmp_path / "ok.parquet", evidence_id="EVIDENCE_A"
+    )
+    assert cpt_profile.read_canonical_cpt_product_marker(marked).evidence_id == "EVIDENCE_A"
+    assert pd.read_parquet(marked)[contract.SOURCE_ID].unique().tolist() == ["EVIDENCE_A"]
+    # Exact comparison only: case, whitespace and prefix variants are NOT the same identity.
+    for variant in ("evidence_a", " EVIDENCE_A", "EVIDENCE_A ", "EVIDENCE_A_2"):
+        assert cpt_profile.verify_canonical_lineage(df, evidence_id=variant).verified is False
+    # A frame with no rows or no source_id column never verifies either.
+    empty = cpt_profile.verify_canonical_lineage(df.iloc[0:0], evidence_id="EVIDENCE_A")
+    assert empty.verified is False
+    no_column = cpt_profile.verify_canonical_lineage(
+        df.drop(columns=[contract.SOURCE_ID]), evidence_id="EVIDENCE_A"
+    )
+    assert no_column.verified is False and no_column.row_source_id_unique_count == 0
+
+
+@pytest.mark.parametrize(("label", "row_ids", "evidence_id"), _lineage_cases())
+def test_032b_adapter_rejects_manufactured_lineage_violations(
+    tmp_path: Path, label: str, row_ids: list[Any], evidence_id: str
+):
+    df = _canonical_frame()
+    df[contract.SOURCE_ID] = row_ids
+    # Externally modified bytes: a fully valid marker written around inconsistent rows.
+    _write_with_metadata(tmp_path / "forged.parquet", df, _genuine_marker(evidence_id))
+    reg = _register(_project_manifest(tmp_path, "forged.parquet")).registration
+    assert reg.registration_status == project_registry.REGISTERED
+    obs = reg.observed_facts
+    assert obs["canonical_product_marker"]["verified"] is True, label  # metadata strings valid
+    assert obs["canonical_product_required_columns_present"] is True, label  # schema complete
+    lineage = obs["canonical_product_lineage"]
+    assert lineage["marker_evidence_id"] == evidence_id
+    assert lineage["evidence_id_matches_row_source_id"] is False, label
+    assert lineage["verified"] is False, label
+    distinct_valid = {v for v in row_ids if isinstance(v, str) and v.strip()}
+    assert lineage["row_source_id_unique_count"] == len(distinct_valid), label
+    assert lineage["null_or_blank_source_id_row_count"] == sum(
+        1 for v in row_ids if v is None or (isinstance(v, str) and not v.strip())
+    )
+    assert obs["canonical_cpt_product_identity_verified"] is False, label
+    assert obs["measured_cpt_profile_verified"] is False, label
+    assert any("lineage" in p for p in obs["canonical_product_identity_problems"]), label
+    assert reg.readiness_status_intrinsic == contract.NOT_READY, label
+    assert reg.readiness_status_effective == contract.NOT_READY, label
+    axes = {a["axis"]: a for a in reg.readiness_result["axes"]}
+    assert any(
+        contract.CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED in r and "lineage" in r
+        for r in axes[contract.DIGITAL_PROFILE]["blocking_reasons"]
+    ), label
+    # No numeric confidence anywhere in the identity facts (only the two explicit counts).
+    for key, value in lineage.items():
+        if key not in ("row_source_id_unique_count", "null_or_blank_source_id_row_count"):
+            assert not (isinstance(value, (int, float)) and not isinstance(value, bool)), key
+    facts, _ = cpt_adapter.inspect_cpt_asset(
+        tmp_path / "forged.parquet", declared_evidence_role="MEASURED", registered_sha256=reg.sha256
+    )
+    _no_measured_inputs(facts)
+    # The file's own (inconsistent) bytes were never rewritten by inspection.
+    assert _same_ids(
+        pd.read_parquet(tmp_path / "forged.parquet")[contract.SOURCE_ID].tolist(), row_ids
+    )
+
+
+def test_032b_adapter_accepts_consistent_lineage_and_gates_are_unchanged(tmp_path: Path):
+    df = _canonical_frame()
+    df[contract.SOURCE_ID] = ["EVIDENCE_A"] * len(df)
+    _write_with_metadata(tmp_path / "ok.parquet", df, _genuine_marker("EVIDENCE_A"))
+    reg = _register(_project_manifest(tmp_path, "ok.parquet")).registration
+    obs = reg.observed_facts
+    assert obs["canonical_product_lineage"]["verified"] is True
+    assert obs["canonical_product_lineage"]["row_source_id_values"] == ["EVIDENCE_A"]
+    assert obs["canonical_cpt_product_identity_verified"] is True
+    assert obs["measured_cpt_profile_verified"] is True
+    assert reg.readiness_status_intrinsic == contract.READY_WITH_LIMITATIONS
+    # MAR-032A gates preserved on the same bytes: declared role still decides measured-ness ...
+    for role in ("SOURCE_INTERPRETED", "DERIVED"):
+        denied = _register(_project_manifest(tmp_path, "ok.parquet", role=role)).registration
+        assert denied.evidence_role == role
+        assert denied.observed_facts["canonical_cpt_product_identity_verified"] is True
+        assert denied.observed_facts["measured_cpt_profile_verified"] is False
+        assert denied.readiness_status_intrinsic == contract.NOT_READY
+    # ... the registered SHA is the actual computed SHA ...
+    assert reg.sha256 == hashlib.sha256((tmp_path / "ok.parquet").read_bytes()).hexdigest()
+    # ... and a wrong contract version / role / unit contract still fails even with good lineage.
+    for key, value in (
+        (contract.PRODUCT_CONTRACT_METADATA_KEY, "CPT_CANONICAL_PROFILE_V0"),
+        (contract.PRODUCT_ROLE_METADATA_KEY, "DERIVED_CPT_INTERPRETATION"),
+        (
+            contract.PRODUCT_CANONICAL_UNITS_METADATA_KEY,
+            json.dumps({**contract.CANONICAL_FIELD_UNITS, "qc_mpa": "kPa"}),
+        ),
+    ):
+        _write_with_metadata(
+            tmp_path / "bad.parquet", df, {**_genuine_marker("EVIDENCE_A"), key: value}
+        )
+        bad = _register(_project_manifest(tmp_path, "bad.parquet")).registration
+        assert bad.observed_facts["canonical_product_lineage"]["verified"] is True, key
+        assert bad.observed_facts["canonical_cpt_product_identity_verified"] is False, key
+        assert bad.readiness_status_intrinsic == contract.NOT_READY, key
+
+
+def test_032b_provider_build_reports_schema_and_lineage_from_written_bytes(
+    tmp_path: Path, fake_http: list[str]
+):
+    result = evidence_build.run_cpt_evidence_build(_manifest(tmp_path))
+    meta = result.metadata
+    assert meta["canonical_product_required_columns_present"] is True
+    assert meta["canonical_product_columns_missing"] == []
+    lineage = meta["canonical_product_lineage"]
+    assert lineage["marker_evidence_id"] == "syn_cptu"
+    assert lineage["row_source_id_values"] == ["syn_cptu"]
+    assert lineage["row_source_id_unique_count"] == 1
+    assert lineage["evidence_id_matches_row_source_id"] is True and lineage["verified"] is True
+    assert meta["canonical_product_verification"]["verified"] is True
+    assert meta["canonical_product_identity_problems"] == []
+    assert result.facts.canonical_product_identity_verified is True
+    assert result.facts.canonical_product_identity_problems == ()
+    on_disk = pd.read_parquet(result.outputs["cpt_measurements"])
+    assert cpt_profile.canonical_product_columns_missing(list(on_disk.columns)) == []
+    assert on_disk[contract.SOURCE_ID].unique().tolist() == ["syn_cptu"]
+    lines = cpt_report.format_acceptance_lines(result)
+    assert (
+        "ARE ALL REQUIRED CPT_CANONICAL_PROFILE_V1 COLUMNS PRESENT IN THE WRITTEN PRODUCT? YES"
+        in lines
+    )
+    assert "DOES THE MARKER EVIDENCE ID EQUAL THE SINGLE ROW-LEVEL SOURCE ID? YES" in lines
+    # No liquefaction physics appeared with the repair.
+    for module in (cpt_profile, cpt_adapter, cpt_readiness, evidence_build):
+        source = inspect.getsource(module)
+        for token in ("def compute_csr", "def compute_crr", "factor_of_safety", "def lpi"):
+            assert token not in source
+    assert result.liquefaction_readiness["status"] == contract.NOT_EVALUABLE

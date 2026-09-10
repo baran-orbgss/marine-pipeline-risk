@@ -164,6 +164,7 @@ def run_cpt_evidence_build(
     processed_dir.mkdir(parents=True, exist_ok=True)
     canonical_fields: list[str] = []
     marker: cpt_profile.CanonicalProductMarker | None = None
+    verification: cpt_profile.CanonicalProductVerification | None = None
     measurements_value_sha256: str | None = None
     if measurements is not None and qa["row_count"] > 0:
         measurements_path = processed_dir / "cpt_measurements.parquet"
@@ -171,6 +172,12 @@ def run_cpt_evidence_build(
             measurements, measurements_path, evidence_id=evidence_id
         )
         marker = cpt_profile.read_canonical_cpt_product_marker(measurements_path)
+        # MAR-032B: the full V1 column contract and the row-level source_id lineage are verified
+        # on the bytes that exist on disk, through the same reader-side authority the project
+        # adapter uses -- not on the in-memory frame.
+        verification = cpt_profile.verify_canonical_cpt_product(
+            pd.read_parquet(measurements_path), marker
+        )
         measurements_value_sha256 = cpt_profile.canonical_value_sha256(measurements)
         outputs["cpt_measurements"] = measurements_path
         canonical_fields = list(measurements.columns)
@@ -200,16 +207,22 @@ def run_cpt_evidence_build(
         documentary_evidence_available=documentary_available,
         machine_readable_profile_available=bool(machine_readable),
         canonical_profile_created=measurements is not None and qa["row_count"] > 0,
-        canonical_product_identity_verified=bool(marker is not None and marker.verified),
+        canonical_product_identity_verified=bool(
+            verification is not None and verification.verified
+        ),
         canonical_product_role_observed=marker.product_role if marker else None,
         canonical_product_contract_observed=marker.contract_version if marker else None,
+        canonical_product_identity_problems=(
+            verification.problems if verification is not None else ()
+        ),
         # Provider build path: the MEASURED role is established by the source-specific provider's
         # explicit channel declarations (quoted source statements), and the product marker read
         # back from the file carries exactly that role. There is no project manifest here; the
         # project layer applies its own declared-role gate on registration.
         measured_evidence_role_verified=bool(
-            marker is not None
-            and marker.verified
+            verification is not None
+            and verification.verified
+            and marker is not None
             and marker.product_role == contract.MEASURED_CPT_CPTU_PROFILE
         ),
         row_count=qa["row_count"],
@@ -284,7 +297,17 @@ def run_cpt_evidence_build(
         # content-VALUE hash (independent of Parquet file metadata; compare this, not the raw
         # file SHA, to prove measurement values are unchanged).
         "canonical_product_marker": marker.to_dict() if marker else None,
+        # MAR-032B: full V1 schema + row-level source_id lineage, verified from the written bytes.
+        "canonical_product_verification": verification.to_dict() if verification else None,
+        "canonical_product_required_columns_present": (
+            verification.required_columns_present if verification else False
+        ),
+        "canonical_product_columns_missing": (
+            list(verification.required_columns_missing) if verification else []
+        ),
+        "canonical_product_lineage": verification.lineage.to_dict() if verification else None,
         "canonical_product_identity_verified": facts.canonical_product_identity_verified,
+        "canonical_product_identity_problems": list(facts.canonical_product_identity_problems),
         "measured_evidence_role_verified": facts.measured_evidence_role_verified,
         "measured_evidence_role_basis": (
             "source-specific provider channel declarations (quoted source statements); the "

@@ -40,8 +40,14 @@ __all__ = [
     "DepthDeclaration",
     "CanonicalBuild",
     "CanonicalProductMarker",
+    "CanonicalLineage",
+    "CanonicalProductVerification",
     "CptProfileError",
     "CANONICAL_PRODUCT_COLUMNS",
+    "canonical_product_columns_missing",
+    "structural_columns_missing",
+    "verify_canonical_lineage",
+    "verify_canonical_cpt_product",
     "conversion_factor",
     "build_canonical_measurements",
     "concat_canonical",
@@ -53,8 +59,12 @@ __all__ = [
     "read_canonical_cpt_product_marker",
 ]
 
-# Every column a canonical CPT measurements product MUST carry (MAR-032A Section 8). Superset of
-# `contract.CANONICAL_STRUCTURAL_COLUMNS`: the writer refuses anything narrower.
+# Every column a CPT_CANONICAL_PROFILE_V1 measurements product MUST carry (MAR-032A Section 8;
+# MAR-032B Sections 4-5). This tuple is the SINGLE schema authority: the canonical writer refuses
+# anything narrower and the reader/adapter verifies canonical product identity against the same
+# tuple (`verify_canonical_cpt_product`). It is a strict superset of
+# `contract.CANONICAL_STRUCTURAL_COLUMNS`, which only says "structurally resembles CPT data" and
+# never establishes V1 product identity. Extra columns (e.g. `raw__*`) remain allowed.
 CANONICAL_PRODUCT_COLUMNS = (
     *contract.IDENTITY_FIELDS,
     contract.DEPTH_SOURCE_VALUE,
@@ -63,6 +73,20 @@ CANONICAL_PRODUCT_COLUMNS = (
     contract.DEPTH_BSF_M,
     *contract.CANONICAL_MEASUREMENT_FIELDS,
 )
+
+
+def canonical_product_columns_missing(columns: Sequence[str]) -> list[str]:
+    """Required V1 product columns absent from `columns`, in contract order (empty = complete)."""
+
+    present = set(columns)
+    return [c for c in CANONICAL_PRODUCT_COLUMNS if c not in present]
+
+
+def structural_columns_missing(columns: Sequence[str]) -> list[str]:
+    """Structural-lookalike columns absent from `columns` (observational only; never identity)."""
+
+    present = set(columns)
+    return [c for c in contract.CANONICAL_STRUCTURAL_COLUMNS if c not in present]
 
 
 class CptProfileError(ValueError):
@@ -445,15 +469,24 @@ def write_canonical_cpt_measurements(
         marine_engine_evidence_id      = <non-empty evidence id>
         marine_engine_canonical_units  = canonical_units_contract()
 
-    Refuses (raises `CptProfileError`) an empty evidence id or a frame missing any
-    `CANONICAL_PRODUCT_COLUMNS` member -- a product can never be narrower than its contract."""
+    Refuses (raises `CptProfileError`) an empty evidence id, a frame missing any
+    `CANONICAL_PRODUCT_COLUMNS` member -- a product can never be narrower than its contract --
+    and (MAR-032B Section 7) a frame whose row-level `source_id` lineage is not ONE non-null,
+    non-blank value exactly equal to `evidence_id`. Nothing is normalized, guessed or rewritten:
+    an inconsistent frame is rejected and no file is written."""
 
     if not isinstance(evidence_id, str) or not evidence_id.strip():
         raise CptProfileError("canonical CPT product requires a non-empty evidence_id")
-    missing = [c for c in CANONICAL_PRODUCT_COLUMNS if c not in measurements.columns]
+    missing = canonical_product_columns_missing(list(measurements.columns))
     if missing:
         raise CptProfileError(
             f"canonical CPT product is missing required column(s) {missing}; refusing to write"
+        )
+    lineage = verify_canonical_lineage(measurements, evidence_id=evidence_id)
+    if not lineage.verified:
+        raise CptProfileError(
+            "canonical CPT product evidence lineage is inconsistent "
+            f"({'; '.join(lineage.problems)}); refusing to write"
         )
     table = pa.Table.from_pandas(measurements, preserve_index=False)
     marker = {
@@ -527,4 +560,181 @@ def read_canonical_cpt_product_marker(path: Path) -> CanonicalProductMarker:
         canonical_units=units,
         verified=not problems,
         problems=tuple(problems),
+    )
+
+
+# --- MAR-032B: schema binding and evidence lineage of a CPT_CANONICAL_PROFILE_V1 product ----------
+# Permanent invariants: a valid marker + the small structural-lookalike column subset is NOT a
+# verified V1 product, and the marker's evidence id must be the row-level `source_id` identity
+# (exactly one non-null, non-blank value, equal to the evidence id, no normalization).
+
+_LINEAGE_VALUES_REPORTED = 20
+
+
+@dataclass(frozen=True)
+class CanonicalLineage:
+    """OBSERVED evidence lineage of a canonical measurements frame against a marker evidence id.
+
+    `row_source_id_values` are the DISTINCT row-level `source_id` values exactly as found (a null is
+    reported as None; a blank string is reported verbatim), capped for reporting; nothing is
+    stripped, cased or otherwise normalized before comparison."""
+
+    marker_evidence_id: str | None
+    row_source_id_values: tuple[Any, ...]
+    row_source_id_unique_count: int
+    null_or_blank_source_id_row_count: int
+    evidence_id_matches_row_source_id: bool
+    verified: bool
+    problems: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "marker_evidence_id": self.marker_evidence_id,
+            "row_source_id_values": list(self.row_source_id_values),
+            "row_source_id_unique_count": self.row_source_id_unique_count,
+            "null_or_blank_source_id_row_count": self.null_or_blank_source_id_row_count,
+            "evidence_id_matches_row_source_id": self.evidence_id_matches_row_source_id,
+            "verified": self.verified,
+            "problems": list(self.problems),
+        }
+
+
+def _is_null_or_blank(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def verify_canonical_lineage(
+    measurements: pd.DataFrame, *, evidence_id: str | None
+) -> CanonicalLineage:
+    """MAR-032B Sections 7-8. Verified only when the `source_id` column exists, no row is null or
+    blank, exactly one distinct value exists and that value == `evidence_id` exactly. Every
+    other case is reported as a named problem; nothing is repaired."""
+
+    problems: list[str] = []
+    if contract.SOURCE_ID not in measurements.columns:
+        problems.append(f"{contract.SOURCE_ID} column absent; row-level lineage cannot be verified")
+        return CanonicalLineage(
+            marker_evidence_id=evidence_id,
+            row_source_id_values=(),
+            row_source_id_unique_count=0,
+            null_or_blank_source_id_row_count=0,
+            evidence_id_matches_row_source_id=False,
+            verified=False,
+            problems=tuple(problems),
+        )
+    raw_values = measurements[contract.SOURCE_ID].tolist()
+    null_or_blank = sum(1 for v in raw_values if _is_null_or_blank(v))
+    distinct: list[Any] = []
+    seen: set[Any] = set()
+    for value in raw_values:
+        key = None if _is_null_or_blank(value) and not isinstance(value, str) else value
+        if key not in seen:
+            seen.add(key)
+            distinct.append(key)
+    valid_distinct = [v for v in distinct if not _is_null_or_blank(v)]
+    unique_count = len(valid_distinct)
+    if len(raw_values) == 0:
+        problems.append("no measurement rows; row-level lineage cannot be verified")
+    if null_or_blank:
+        problems.append(f"{null_or_blank} row(s) carry a null or blank {contract.SOURCE_ID}")
+    non_string = [v for v in valid_distinct if not isinstance(v, str)]
+    if non_string:
+        problems.append(f"{contract.SOURCE_ID} carries non-string value(s): {non_string[:5]}")
+    if unique_count > 1:
+        problems.append(
+            f"{unique_count} distinct {contract.SOURCE_ID} values in one canonical product "
+            f"(exactly one is required): {valid_distinct[:_LINEAGE_VALUES_REPORTED]}"
+        )
+    matches = (
+        unique_count == 1
+        and null_or_blank == 0
+        and isinstance(evidence_id, str)
+        and valid_distinct[0] == evidence_id
+    )
+    if unique_count == 1 and not matches and null_or_blank == 0:
+        problems.append(
+            f"row {contract.SOURCE_ID} {valid_distinct[0]!r} does not equal marker evidence id "
+            f"{evidence_id!r} (exact comparison; nothing normalized)"
+        )
+    return CanonicalLineage(
+        marker_evidence_id=evidence_id,
+        row_source_id_values=tuple(distinct[:_LINEAGE_VALUES_REPORTED]),
+        row_source_id_unique_count=unique_count,
+        null_or_blank_source_id_row_count=int(null_or_blank),
+        evidence_id_matches_row_source_id=bool(matches),
+        verified=not problems and bool(matches),
+        problems=tuple(problems),
+    )
+
+
+@dataclass(frozen=True)
+class CanonicalProductVerification:
+    """The three independent OBSERVED checks whose conjunction is CPT_CANONICAL_PROFILE_V1 product
+    identity: marker metadata valid, full required V1 column contract present, evidence lineage
+    consistent. The structural-lookalike observation is reported beside them but establishes
+    nothing."""
+
+    marker: CanonicalProductMarker
+    structural_columns_missing: tuple[str, ...]
+    required_columns_missing: tuple[str, ...]
+    lineage: CanonicalLineage
+
+    @property
+    def structural_columns_present(self) -> bool:
+        return not self.structural_columns_missing
+
+    @property
+    def required_columns_present(self) -> bool:
+        return not self.required_columns_missing
+
+    @property
+    def verified(self) -> bool:
+        return bool(
+            self.marker.verified and self.required_columns_present and self.lineage.verified
+        )
+
+    @property
+    def problems(self) -> tuple[str, ...]:
+        out = list(self.marker.problems)
+        if self.required_columns_missing:
+            out.append(
+                f"required {contract.CPT_CANONICAL_PROFILE_CONTRACT} product column(s) absent "
+                f"from schema: {list(self.required_columns_missing)}"
+            )
+        out.extend(f"evidence lineage: {p}" for p in self.lineage.problems)
+        return tuple(out)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "marker_verified": self.marker.verified,
+            "structural_canonical_columns_present": self.structural_columns_present,
+            "structural_canonical_columns_missing": list(self.structural_columns_missing),
+            "canonical_product_required_columns_present": self.required_columns_present,
+            "canonical_product_columns_missing": list(self.required_columns_missing),
+            "lineage": self.lineage.to_dict(),
+            "verified": self.verified,
+            "problems": list(self.problems),
+        }
+
+
+def verify_canonical_cpt_product(
+    measurements: pd.DataFrame, marker: CanonicalProductMarker
+) -> CanonicalProductVerification:
+    """Verify an already-read frame against an already-read marker. Shared by the project adapter
+    (registered bytes) and the provider build (written bytes read back) so there is one reader-side
+    authority, consuming the same `CANONICAL_PRODUCT_COLUMNS` the writer enforces."""
+
+    columns = list(measurements.columns)
+    return CanonicalProductVerification(
+        marker=marker,
+        structural_columns_missing=tuple(structural_columns_missing(columns)),
+        required_columns_missing=tuple(canonical_product_columns_missing(columns)),
+        lineage=verify_canonical_lineage(measurements, evidence_id=marker.evidence_id),
     )

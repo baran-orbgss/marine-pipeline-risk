@@ -18,6 +18,12 @@ Honest outcomes for a registered path:
 * a Parquet file (magic bytes `PAR1`, never the filename) that is structurally canonical-looking
   but carries no verified product marker -> `canonical_product_identity_verified = False` ->
   DIGITAL_PROFILE is BLOCKING (`CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED`) -> never READY;
+* (MAR-032B) a Parquet file carrying otherwise valid `CPT_CANONICAL_PROFILE_V1` marker metadata
+  but missing any required product column (`cpt_profile.CANONICAL_PRODUCT_COLUMNS`, the writer's
+  own contract) or whose row-level `source_id` is not exactly one non-null, non-blank value equal
+  to the marker evidence id -> identity NOT verified, same controlled reason with the precise
+  schema / lineage finding -> never READY. A required column that EXISTS but holds only nulls is a
+  different fact (a channel-unavailable limitation of a legitimately canonical product);
 * a genuine marked canonical product -> facts from its QA; it is advertised as MEASURED CPT
   evidence only when the observed product role is `MEASURED_CPT_CPTU_PROFILE` AND the declared
   evidence role is `MEASURED` (`measured_evidence_role_verified`); a SOURCE_INTERPRETED or
@@ -45,9 +51,17 @@ from marine_engine.geotechnical import cpt_inventory, cpt_profile
 from marine_engine.geotechnical.cpt_readiness import CptEvidenceFacts
 from marine_engine.project.categories import MEASURED
 
-__all__ = ["CptAssetLoadError", "CANONICAL_REQUIRED_COLUMNS", "inspect_cpt_asset"]
+__all__ = [
+    "CptAssetLoadError",
+    "CANONICAL_REQUIRED_COLUMNS",
+    "STRUCTURAL_LOOKALIKE_COLUMNS",
+    "inspect_cpt_asset",
+]
 
-CANONICAL_REQUIRED_COLUMNS = contract.CANONICAL_STRUCTURAL_COLUMNS
+# MAR-032B Section 5: the adapter consumes the WRITER's required-column contract -- one authority.
+CANONICAL_REQUIRED_COLUMNS = cpt_profile.CANONICAL_PRODUCT_COLUMNS
+# Observational only ("this table structurally resembles CPT data"); never establishes identity.
+STRUCTURAL_LOOKALIKE_COLUMNS = contract.CANONICAL_STRUCTURAL_COLUMNS
 _PARQUET_MAGIC = b"PAR1"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -106,12 +120,15 @@ def inspect_cpt_asset(
             df = pd.read_parquet(path)
         except Exception as exc:  # noqa: BLE001 -- any reader failure is a load failure
             raise CptAssetLoadError(f"CPT parquet could not be read: {path} ({exc})") from exc
-        missing = [c for c in CANONICAL_REQUIRED_COLUMNS if c not in df.columns]
-        structural_present = not missing
-        identity_verified = bool(marker.verified and structural_present)
-        identity_problems = list(marker.problems)
-        if missing:
-            identity_problems.append(f"required structural column(s) missing: {missing}")
+        # MAR-032B: ONE reader-side authority. Identity = marker valid AND every required V1
+        # product column present (`cpt_profile.CANONICAL_PRODUCT_COLUMNS`, the writer's own
+        # contract) AND row-level source_id lineage consistent with the marker evidence id. The
+        # structural-lookalike subset is reported as an observation only.
+        verification = cpt_profile.verify_canonical_cpt_product(df, marker)
+        structural_missing = list(verification.structural_columns_missing)
+        required_missing = list(verification.required_columns_missing)
+        identity_verified = verification.verified
+        identity_problems = list(verification.problems)
         role_verified = bool(
             identity_verified
             and marker.product_role == contract.MEASURED_CPT_CPTU_PROFILE
@@ -121,9 +138,12 @@ def inspect_cpt_asset(
             {
                 "columns": list(df.columns),
                 "record_count": int(len(df)),
-                "structural_canonical_columns_present": structural_present,
-                "canonical_columns_missing": missing,
+                "structural_canonical_columns_present": verification.structural_columns_present,
+                "canonical_columns_missing": structural_missing,  # MAR-032A key: structural subset
+                "canonical_product_required_columns_present": verification.required_columns_present,
+                "canonical_product_columns_missing": required_missing,
                 "canonical_product_marker": marker.to_dict(),
+                "canonical_product_lineage": verification.lineage.to_dict(),
                 "canonical_cpt_product_identity_verified": identity_verified,
                 "canonical_product_identity_problems": identity_problems,
                 "canonical_product_role_observed": marker.product_role,
@@ -138,9 +158,10 @@ def inspect_cpt_asset(
             "canonical_product_identity_verified": identity_verified,
             "canonical_product_role_observed": marker.product_role,
             "canonical_product_contract_observed": marker.contract_version,
+            "canonical_product_identity_problems": tuple(identity_problems),
             "measured_evidence_role_verified": role_verified,
         }
-        if missing:
+        if structural_missing:
             facts = CptEvidenceFacts(
                 **base,
                 **marker_facts,
@@ -148,7 +169,7 @@ def inspect_cpt_asset(
                 machine_readable_profile_available=False,
                 notes=(
                     "parquet is not a canonical CPT measurements table (missing "
-                    f"{missing}); no semantics are inferred from its columns",
+                    f"{structural_missing}); no semantics are inferred from its columns",
                 ),
             )
             return facts, observed
@@ -170,9 +191,14 @@ def inspect_cpt_asset(
         )
         if identity_verified:
             note = (
-                "canonical measurements product registered (product marker verified from file "
-                "metadata); test coordinates live in the separate locations product and are not "
-                "inferred from this table"
+                "canonical measurements product registered (product marker, full V1 column "
+                "contract and source_id lineage verified from file bytes); test coordinates live "
+                "in the separate locations product and are not inferred from this table"
+            )
+        elif marker.verified:
+            note = (
+                "parquet carries valid CPT_CANONICAL_PROFILE_V1 marker metadata but the product "
+                f"contract did not verify ({'; '.join(identity_problems)}); no identity is inferred"
             )
         else:
             note = (

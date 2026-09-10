@@ -3601,3 +3601,97 @@ otherwise, never an interactive credential prompt.
   `ruff check` clean, offline suite 1830 passed (up from 1816), 4 skipped,
   25 live deselected, `uv audit --frozen` clean (87 packages). No further
   ticket has started.
+- **MAR-032B (canonical CPT schema & lineage binding integrity repair;
+  product-contract repair of MAR-032A -- `geotechnical/cpt_profile.py`,
+  `geotechnical/cpt_readiness.py`, `geotechnical/evidence_build.py`,
+  `geotechnical/report.py`, `project/cpt_adapter.py`; NO CPT science change,
+  NO liquefaction physics, `cpt_contract.py` untouched).** Two remaining
+  `CPT_CANONICAL_PROFILE_V1` product-contract inconsistencies were repaired.
+  Defect A (full product schema): the MAR-032A writer refused a frame missing
+  any `cpt_profile.CANONICAL_PRODUCT_COLUMNS` member, but the generic project
+  adapter verified canonical product identity against only the smaller
+  `contract.CANONICAL_STRUCTURAL_COLUMNS` lookalike subset, so a manually
+  marked Parquet could keep a valid marker while losing `location_id`,
+  `depth_source_unit`, `qc_mpa`, `qt_mpa`, `fs_kpa` or `u2_kpa` and still
+  reach `READY_WITH_LIMITATIONS` with the loss reported as a mere "qt / fs /
+  u2 not available" limitation (reproduced before the fix). Permanent
+  invariant now enforced: valid marker + structural columns != verified V1
+  product. There is ONE schema authority, `cpt_profile.CANONICAL_PRODUCT_COLUMNS`,
+  consumed by the writer and, via the new shared reader-side check
+  `cpt_profile.verify_canonical_cpt_product(frame, marker)`, by the project
+  adapter (`cpt_adapter.CANONICAL_REQUIRED_COLUMNS` is that same tuple object)
+  and by the provider build (which now verifies the written bytes read back
+  from disk, not the in-memory frame). `CANONICAL_STRUCTURAL_COLUMNS` remains
+  an observation only ("structurally resembles CPT data"). New observed facts
+  on registration and in `cpt_metadata.json`:
+  `canonical_product_required_columns_present`,
+  `canonical_product_columns_missing` (the MAR-032A keys
+  `structural_canonical_columns_present` / `canonical_columns_missing` keep
+  their structural-subset meaning), `canonical_product_lineage` and
+  `canonical_product_identity_problems`. A required column that EXISTS but is
+  all null stays a channel-unavailable limitation of a legitimately canonical
+  product (qt for Sheringham); a required column ABSENT from the schema is a
+  product-contract violation -> `canonical_cpt_product_identity_verified =
+  false`, `measured_cpt_profile_verified = false`, CPT readiness `NOT_READY`
+  under the controlled reason `CPT_CANONICAL_PRODUCT_IDENTITY_NOT_VERIFIED`
+  naming the missing column(s); `MEASUREMENT_SEMANTICS` no longer emits qc/qt/
+  fs/u2 availability limitations for a table whose identity did not verify.
+  Extra `raw__*` columns remain allowed. Defect B (evidence lineage): the
+  marker's `marine_engine_evidence_id` and the row-level `source_id` were
+  never compared. `cpt_profile.verify_canonical_lineage(frame, evidence_id)`
+  now requires every row `source_id` non-null and non-blank, exactly one
+  distinct value, and that value exactly equal to the evidence id (no
+  stripping, casing or other normalization; nothing is rewritten). The
+  canonical writer raises `CptProfileError` and writes no file otherwise; the
+  adapter reads the actual `source_id` column of registered bytes and reports
+  `marker_evidence_id`, `row_source_id_values`, `row_source_id_unique_count`,
+  `null_or_blank_source_id_row_count`, `evidence_id_matches_row_source_id`.
+  Canonical identity now verifies only when marker metadata is valid AND the
+  full V1 required-column contract holds AND lineage is consistent; no numeric
+  confidence exists. Adversarial proof (synthetic, `tests/test_cpt_evidence.py`
+  56 -> 76): marker-preserving Parquets each missing `location_id`,
+  `depth_source_unit`, `qc_mpa`, `qt_mpa`, `fs_kpa`, `u2_kpa` or
+  `depth_bsf_m` -> identity false, measured false, `NOT_READY`, controlled
+  reason names the column, no channel limitation, no liquefaction input
+  AVAILABLE, writer refuses the same frame; all-null qt column vs absent qt
+  column distinguished; lineage cases evidence A / rows B, rows A+B, null
+  `source_id`, blank `source_id` -> writer refuses (no file) and adapter
+  rejects externally manufactured bytes with the precise lineage problem;
+  evidence A / rows A passes; case / whitespace / prefix variants of the id
+  never match; MAR-032A gates re-asserted on good-lineage bytes (wrong
+  contract version, wrong role, wrong unit contract, SOURCE_INTERPRETED and
+  DERIVED declared roles all `NOT_READY`, registered SHA-256 = computed SHA).
+  Existing MAR-032A fixtures that stamped evidence id `syn` over rows tagged
+  `SYNTHETIC_TEST_FIXTURE` were themselves lineage-inconsistent and were
+  aligned. Real Sheringham regression (cached MDE packages, both `already_cached
+  = true`, raw archive bytes and mtimes unchanged, no network, 6 s):
+  138,514 rows and 100 tests unchanged; depth / qc / fs / u2 null counts,
+  sums, minima and maxima identical; `qt_mpa` still null in all 138,514 rows;
+  value hash `8c1d3893...` unchanged; raw Parquet SHA `2f3bf2ac...` unchanged
+  (no bytes rewritten); `cpt_locations.gpkg` still 100 points EPSG:32631 with
+  identical coordinates; readiness `READY_WITH_LIMITATIONS` with the same five
+  limitations; marker verified; full V1 schema verified
+  (`canonical_product_columns_missing = []`); lineage verified
+  (`marker_evidence_id = row source_id = sheringham_shoal_2008_cptu`, unique
+  count 1, zero null/blank rows); `build-cpt-evidence-poc` acceptance lines
+  now also answer "ARE ALL REQUIRED CPT_CANONICAL_PROFILE_V1 COLUMNS PRESENT
+  IN THE WRITTEN PRODUCT? YES" and "DOES THE MARKER EVIDENCE ID EQUAL THE
+  SINGLE ROW-LEVEL SOURCE ID? YES". The real bytes registered through the
+  generic project layer: `MEASURED` -> `READY_WITH_LIMITATIONS`;
+  `SOURCE_INTERPRETED` / `DERIVED` -> role preserved, identity verified,
+  `NOT_READY`; marker-preserving copies of the REAL product with each of the
+  seven columns above removed, or with `source_id` rewritten to a foreign id,
+  split across two ids, or nulled in one row -> all `NOT_READY` with the
+  controlled reason, and the writer refused every such frame; the real file
+  remained untouched. Liquefaction-INPUT readiness unchanged: qc AVAILABLE, qt
+  NOT_AVAILABLE, wave `soil_profile` AVAILABLE only from the verified measured
+  profile; earthquake and wave blocks still `NOT_EVALUABLE`; no CSR, CRR, FoS,
+  rd, K-sigma, LPI, settlement, lateral spreading or wave pore-pressure code
+  added; qc / qt / fs / u2 / depth / unit / CRS semantics unchanged
+  (EPSG:32631 accepted, foot and US-survey-foot CRS still rejected, asserted).
+  Protected `terrain/`, `morphology/`, `metocean/`, `sediment/`, `change/`,
+  `scour/`, `burial/`, `freespan/`, `slope_stability/` untouched. Local
+  verification: `uv lock --check` clean, repo-wide `ruff format --check` /
+  `ruff check` clean, offline suite 1850 passed (up from 1830), 4 skipped,
+  25 live deselected, `uv audit --frozen` clean (87 packages). No further
+  ticket has started.
