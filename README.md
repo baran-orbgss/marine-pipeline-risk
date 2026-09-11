@@ -100,6 +100,48 @@ outside of any AI assistant, before this command's real acquisition steps
 can proceed -- it stops with a clear `CopernicusAuthenticationRequiredError`
 otherwise, never an interactive credential prompt.
 
+## Engineering Workbench
+
+UI-001 adds an internal, localhost-only Streamlit workbench under `ui/`
+(`ui/app.py`, `capability_registry.py`, `test_runner.py`,
+`output_inspector.py`, `repo_state.py`, `components.py`; tests in
+`tests/test_workbench.py`). Streamlit lives in the `ui` dependency group
+(a default group alongside `dev`), not in the scientific runtime
+dependencies.
+
+```bash
+uv sync
+uv run streamlit run ui/app.py
+```
+
+Pages: **Overview** (15-hazard capability matrix, summary strip computed
+from the registry, liquefaction card, supporting capabilities),
+**Capability Explorer** (what / scientific role / inputs / method /
+outputs / real benchmark / tests / scientific limits / next planned, flow
+view, local outputs), **Test Lab** (ast-discovered `test_*` functions of
+registered test files only; run one selected test or one capability's
+suite via argument-array `subprocess` calls, never a shell, always
+`-m "not live"`, with a timeout; source viewer; full suite only under
+*Advanced* with a warning), **Data & Outputs** (metadata-first inspection
+of local JSON / Parquet / GeoPackage / GeoTIFF / PNG / HTML outputs under
+`data/processed` and `data/interim`; a GeoTIFF preview is a decimated
+`DISPLAY PREVIEW -- NOT CANONICAL DATA`), **Roadmap**. The sidebar shows
+the project context (PL854, Sheringham Shoal 2020, Sheringham Shoal 2008
+CPTU, Barrow 2016) and read-only git facts (branch, HEAD, clean/dirty).
+
+What it is not: it is an internal local development UI, not an
+engineering qualification, not customer-facing, and it computes no
+science -- every value shown comes from the capability registry
+(presentation metadata), from the engine's own output files or from
+pytest. Missing local outputs render as `NOT PRESENT LOCALLY`; nothing is
+fabricated or downloaded. The maturity vocabulary (`QUALIFIED_POC`,
+`FOUNDATION_READY`, `PARTIAL`, `UNDER_CONSTRUCTION`) describes
+**software / scientific capability maturity**; it is not hazard severity,
+risk level, engineering acceptance or a safe/unsafe classification.
+Hazard 10 (Liquefaction) is shown as `FOUNDATION_READY`: the real
+Sheringham CPT/CPTU evidence foundation is complete, triggering physics is
+under construction.
+
 ## Status
 
 - `MAR-001`: project scaffold — structure, config system, CLI, and test

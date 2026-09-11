@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "workbench",
+      "runtimeExecutable": "C:\\Users\\baran\\AppData\\Roaming\\Python\\Python313\\Scripts\\uv.exe",
+      "runtimeArgs": ["run", "--frozen", "streamlit", "run", "ui/app.py", "--server.port", "8501", "--server.address", "localhost"],
+      "port": 8501
+    }
+  ]
+}

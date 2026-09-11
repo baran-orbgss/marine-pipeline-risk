@@ -31,11 +31,20 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.5",
 ]
+ui = [
+    "streamlit>=1.63.0",
+]
+
+[tool.uv]
+# UI-001: the engineering workbench (Streamlit) is UI infrastructure, not a scientific runtime
+# dependency. It lives in its own group; making it a default group lets the documented
+# `uv run streamlit run ui/app.py` work from a plain `uv sync`.
+default-groups = ["dev", "ui"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["src", "tests"]
+src = ["src", "tests", "ui"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
@@ -48,9 +57,15 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
 # Embeds real (trimmed) SeaDataNet CDI report HTML/JSON-LD verbatim as test
 # fixtures, for the same reason.
 "tests/test_cdi.py" = ["E501"]
+# UI-001 workbench: the capability registry is presentation prose (long literal strings) and the
+# components module embeds a CSS block; neither is executable logic worth reflowing.
+"ui/capability_registry.py" = ["E501"]
+"ui/components.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# UI-001: the `ui/` workbench package is imported by tests/test_workbench.py from the repo root.
+pythonpath = ["."]
 addopts = "-ra -m \"not live\""
 markers = [
     "live: requires network access to the real NSTA ArcGIS service (excluded by default; run with -m live)",

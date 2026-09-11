@@ -1,0 +1,17 @@
+# UI-001 engineering workbench: localhost-only, dark neutral engineering theme, no telemetry.
+[server]
+address = "localhost"
+headless = true
+runOnSave = false
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#2f8f83"
+backgroundColor = "#111417"
+secondaryBackgroundColor = "#181c21"
+textColor = "#d6dbe1"
+font = "sans serif"
