@@ -142,6 +142,63 @@ Hazard 10 (Liquefaction) is shown as `FOUNDATION_READY`: the real
 Sheringham CPT/CPTU evidence foundation is complete, triggering physics is
 under construction.
 
+## Guided View (UI-002)
+
+UI-002 adds a map-first **Guided View** as the workbench's default landing
+experience, alongside the original UI-001 console (now called
+**Engineering View**, reachable via a mode toggle at the top of the page).
+Presentation only: no `src/marine_engine/**` change, no scientific-method
+change, no new output regeneration.
+
+New modules: `ui/guided_story.py` (pure per-project stage sequences --
+plain-language "what you are looking at / what it means / what it does not
+mean" text, and an ordered list of real local visuals to try per stage; no
+Streamlit import) and `ui/map_view.py` (bounded, display-only rendering --
+existing map PNGs first, then a locally-composed vector scene or a
+decimated raster preview, then a chart; reprojects a copy for display,
+never the source; no Streamlit import). `ui/components.py` gained the
+Guided View widgets (mode toggle, stage navigator, map gallery, layer
+control, three-sentence block, CPT profile chart). `ui/app.py`'s entire
+previous body was extracted verbatim into `render_engineering_view()` --
+Engineering View's five pages are unchanged -- with a new
+`render_guided_view()` added alongside it.
+
+Guided stories, built only from real local outputs (nothing fabricated
+when a file is absent): **PL854** (10 stages: Route & Area, Bathymetry,
+Currents & Waves, Bed Shear, Sediment Mobility, Scour, Burial / Exposure,
+Free Span, Transport Intensity, Evidence Summary -- Burial/Exposure is
+honestly empty for this project, since PL854 has no local burial data; the
+capability is proven on Barrow 2016 instead), **Sheringham Shoal 2020**
+(5 stages: Survey Bathymetry, Terrain, Bedforms, Multi-epoch Change, Slope
+Screening), **Sheringham Shoal 2008 CPTU** (5 stages, including a **CPT
+profile viewer**: pick any of the 100 real `test_id`s and see its measured
+`qc`/`fs`/`u2` vs depth -- `qt` is verified unavailable for this source and
+is never plotted; no CRR, CSR or liquefaction factor of safety is computed
+anywhere), **Barrow 2016** (3 stages).
+
+MAR ticket numbers, CLI commands, and file paths are hidden by default in
+Guided View and surfaced only under an explicit "Show technical details"
+expander (sourced from the same `capability_registry` data Engineering
+View already uses). Software/scientific capability maturity is shown as a
+compact `AVAILABLE` / `FOUNDATION` / `PARTIAL` / `COMING SOON` badge -- the
+same four-value vocabulary as UI-001's `QUALIFIED_POC` / `FOUNDATION_READY`
+/ `PARTIAL` / `UNDER_CONSTRUCTION`, relabelled for a first-time reader,
+never a hazard-severity or risk claim.
+
+One scientific-safety finding surfaced during this ticket: Barrow's
+canonical burial value field (source-labelled `Z`) has an engine-recorded
+**unresolved reference point and sign convention**
+(`data/processed/barrow_2016/burial/source_burial_semantics.json`). The
+guided Burial Profile stage therefore never labels its axis "burial
+depth"; it reads the source's own caveat text at render time and shows the
+value exactly as measured.
+
+Tests: `tests/test_workbench.py` gained guided-story ordering/content
+tests, `map_view` containment/non-mutation/bounded-preview tests,
+CPT-profile measured-channel and unknown-`test_id` tests, and
+layer-availability tests -- alongside the existing UI-001 suite,
+unchanged.
+
 ## Status
 
 - `MAR-001`: project scaffold — structure, config system, CLI, and test
