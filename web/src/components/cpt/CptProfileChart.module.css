@@ -1,0 +1,21 @@
+.wrapper {
+  padding: var(--space-3);
+}
+
+.title {
+  font-size: 13px;
+  margin: 0 0 var(--space-3);
+}
+
+.channels {
+  display: flex;
+  gap: var(--space-3);
+  justify-content: space-between;
+}
+
+.axisNote {
+  font-size: 10px;
+  color: var(--color-text-muted);
+  text-align: center;
+  margin: var(--space-2) 0 0;
+}

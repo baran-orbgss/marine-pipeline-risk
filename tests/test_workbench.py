@@ -20,12 +20,10 @@ import pandas as pd
 import pytest
 from ui import REPO_ROOT, repo_state
 from ui import capability_registry as registry
-from ui import guided_story as gs
-from ui import map_view as mv
 from ui import output_inspector as oi
 from ui import test_runner as tr
 
-UI_MODULES = (registry, tr, oi, repo_state, gs, mv)
+UI_MODULES = (registry, tr, oi, repo_state)
 LIVE_FILES = {
     "tests/test_bathymetry_live.py",
     "tests/test_metocean_live.py",
@@ -648,304 +646,33 @@ def test_ui_never_imports_or_mutates_the_scientific_engine():
         assert "streamlit" not in inspect.getsource(module)
 
 
-# --- UI-002 guided view: story data (ui/guided_story.py) ----------------------------------------
+# --- UI-003: Guided View removed, app.py (source-text only -- top-level Streamlit calls execute
+# on import, so this file is never imported by tests, matching the app.py/components.py
+# convention) --------------------------------------------------------------------------------
 
 
-def test_every_project_has_exactly_one_guided_story_in_registry_order():
-    assert [story.project_id for story in gs.STORIES] == [p.id for p in registry.PROJECTS]
-
-
-def test_pl854_story_stage_order():
-    story = gs.story_for_project("pl854")
-    assert [stage.label for stage in story.stages] == [
-        "Route & Area",
-        "Bathymetry",
-        "Currents & Waves",
-        "Bed Shear",
-        "Sediment Mobility",
-        "Scour",
-        "Burial / Exposure",
-        "Free Span",
-        "Transport Intensity",
-        "Evidence Summary",
-    ]
-
-
-def test_sheringham_2020_story_stage_order():
-    story = gs.story_for_project("sheringham_shoal_2020")
-    assert [stage.label for stage in story.stages] == [
-        "Survey Bathymetry",
-        "Terrain",
-        "Bedforms",
-        "Multi-epoch Change",
-        "Slope Screening",
-    ]
-
-
-def test_cptu_story_stage_order():
-    story = gs.story_for_project("sheringham_shoal_2008_cptu")
-    assert [stage.label for stage in story.stages] == [
-        "Investigation Area",
-        "CPT Locations",
-        "CPT Evidence",
-        "Profile Availability",
-        "Liquefaction Foundation",
-    ]
-
-
-def test_barrow_story_stage_order():
-    story = gs.story_for_project("barrow_2016")
-    assert [stage.label for stage in story.stages] == [
-        "Route / Asset",
-        "Burial Profile",
-        "Observed Burial / Exposure State",
-    ]
-
-
-_JARGON_PATTERN = re.compile(
-    r"MAR-\d|QUALIFIED_POC|FOUNDATION_READY|UNDER_CONSTRUCTION|\.png|\.gpkg|\.parquet|\.tif"
-)
-
-
-def test_guided_text_has_no_ticket_numbers_filenames_or_registry_constants():
-    for story in gs.STORIES:
-        for stage in story.stages:
-            for text in (
-                stage.what_you_are_looking_at,
-                stage.what_it_means,
-                stage.what_it_does_not_mean,
-            ):
-                assert not _JARGON_PATTERN.search(text), (story.project_id, stage.key, text)
-
-
-def test_guided_text_blocks_stay_short():
-    for story in gs.STORIES:
-        for stage in story.stages:
-            for text in (
-                stage.what_you_are_looking_at,
-                stage.what_it_means,
-                stage.what_it_does_not_mean,
-            ):
-                assert text.count(". ") <= 2, (story.project_id, stage.key, text)
-                assert len(text) <= 260, (story.project_id, stage.key, text)
-
-
-def test_visual_candidate_rejects_traversal_globs():
-    with pytest.raises(ValueError):
-        gs.VisualCandidate(kind="png", label="x", glob="../escape.png")
-    with pytest.raises(ValueError):
-        gs.VisualCandidate(kind="png", label="x", glob="/etc/passwd")
-    with pytest.raises(ValueError):
-        gs.VisualCandidate(kind="vector", label="x", layers=(("../escape.gpkg", None, "x"),))
-    with pytest.raises(ValueError):
-        gs.VisualCandidate(kind="raster", label="x", raster_glob="../escape.tif")
-
-
-def test_visual_candidate_rejects_unknown_kind():
-    with pytest.raises(ValueError):
-        gs.VisualCandidate(kind="video", label="x")
-
-
-def test_stage_badge_maturity_is_a_strict_mapping_of_the_four_real_values():
-    for story in gs.STORIES:
-        for stage in story.stages:
-            badge = gs.stage_badge_maturity(stage)
-            if stage.capability_id is None:
-                assert badge is None
-            else:
-                assert badge in gs.BADGE_VOCABULARY
-    assert set(gs._BADGE_BY_MATURITY) == set(registry.MATURITY_VOCABULARY)
-
-
-def test_pl854_scour_stage_never_uses_the_not_available_sentinel_layer():
-    story = gs.story_for_project("pl854")
-    scour = next(stage for stage in story.stages if stage.key == "scour")
-    layer_names = [
-        layer[1]
-        for candidate in (*scour.visuals, *scour.optional_layers)
-        for layer in candidate.layers
-    ]
-    assert "site_specific_susceptibility_screening" not in layer_names
-    assert "tested_embedment_scenario_envelope" in layer_names
-    assert any(
-        "SITE_SPECIFIC_SCOUR_SUSCEPTIBILITY_NOT_AVAILABLE" in limitation
-        for limitation in scour.limitations
-    )
-
-
-def test_pl854_burial_stage_is_honestly_empty_not_fabricated():
-    story = gs.story_for_project("pl854")
-    burial = next(stage for stage in story.stages if stage.key == "burial_exposure")
-    assert burial.visuals == ()
-    assert burial.not_applicable_note
-
-
-# --- UI-002 guided view: rendering (ui/map_view.py) ---------------------------------------------
-
-
-def test_map_view_never_writes_or_reprojects_in_place():
-    source = inspect.getsource(mv)
-    assert ".to_file(" not in source
-    assert ".to_crs(" in source  # copy-reprojection only, never in place
-
-
-def test_render_raster_preview_delegates_to_bounded_geotiff_preview(data_root: Path):
-    import rasterio
-    from rasterio.transform import from_origin
-
-    path = data_root / "processed" / "demo" / "big.tif"
-    path.parent.mkdir(parents=True)
-    with rasterio.open(
-        path,
-        "w",
-        driver="GTiff",
-        height=2000,
-        width=1500,
-        count=1,
-        dtype="float32",
-        crs="EPSG:32631",
-        transform=from_origin(400000, 5900000, 1.0, 1.0),
-        nodata=-9999.0,
-    ) as dst:
-        dst.write(np.zeros((2000, 1500), dtype="float32"), 1)
-    fig, meta = mv.render_raster_preview("processed/demo/big.tif")
-    assert fig is not None
-    assert meta["label"] == oi.PREVIEW_LABEL
-    assert max(meta["preview_shape"]) <= 512
-
-
-def test_render_raster_preview_missing_file_is_reported_not_fabricated(data_root: Path):
-    fig, meta = mv.render_raster_preview("processed/demo/nope.tif")
-    assert fig is None
-    assert meta["present"] is False
-
-
-def test_render_vector_scene_reports_missing_layers_not_fabricated(data_root: Path):
-    fig, meta = mv.render_vector_scene([("processed/demo/nope.gpkg", None, "Ghost")])
-    assert fig is None
-    assert meta["missing_labels"] == ["Ghost"]
-    assert meta["present_labels"] == []
-
-
-def test_render_vector_scene_reprojects_a_copy_never_the_source(data_root: Path):
-    import geopandas as gpd
-    from shapely.geometry import LineString, Point
-
-    a = gpd.GeoDataFrame({"id": [1]}, geometry=[LineString([(0, 0), (100, 100)])], crs="EPSG:32631")
-    b = gpd.GeoDataFrame({"id": [1]}, geometry=[Point(500000, 5900000)], crs="EPSG:32632")
-    path_a = data_root / "processed" / "demo" / "a.gpkg"
-    path_b = data_root / "processed" / "demo" / "b.gpkg"
-    path_a.parent.mkdir(parents=True)
-    a.to_file(path_a, driver="GPKG")
-    b.to_file(path_b, driver="GPKG")
-    before_a, before_b = path_a.read_bytes(), path_b.read_bytes()
-    fig, meta = mv.render_vector_scene(
-        [("processed/demo/a.gpkg", None, "A"), ("processed/demo/b.gpkg", None, "B")]
-    )
-    assert fig is not None
-    assert meta["present_labels"] == ["A", "B"]
-    assert meta["crs"] == "EPSG:32631"
-    assert path_a.read_bytes() == before_a
-    assert path_b.read_bytes() == before_b
-
-
-def test_render_vector_scene_thins_large_point_layers_without_fabricating_points(data_root: Path):
-    import geopandas as gpd
-    from shapely.geometry import Point
-
-    points = gpd.GeoDataFrame(
-        {"id": list(range(500))}, geometry=[Point(x, 0) for x in range(500)], crs="EPSG:32631"
-    )
-    path = data_root / "processed" / "demo" / "pts.gpkg"
-    path.parent.mkdir(parents=True)
-    points.to_file(path, driver="GPKG")
-    fig, meta = mv.render_vector_scene(
-        [("processed/demo/pts.gpkg", None, "Points")], max_points_per_layer=50
-    )
-    assert fig is not None
-    assert meta["present_labels"] == ["Points"]
-
-
-def test_cpt_channel_profile_uses_measured_channels_only_and_qt_stays_unavailable():
-    profile = mv.cpt_channel_profile("CPT-A2")
-    if not profile["present"]:
-        pytest.skip("real CPT parquet not present locally")
-    assert profile["channels"]["qt_mpa"]["available"] is False
-    assert profile["channels"]["qt_mpa"]["values"] is None
-    for channel in ("qc_mpa", "fs_kpa", "u2_kpa"):
-        assert profile["channels"][channel]["available"] is True
-        assert profile["channels"][channel]["values"] is not None
-
-
-def test_cpt_profile_unknown_test_id_yields_no_fabricated_plot():
-    real = mv.resolve_first_existing([mv._CPT_MEASUREMENTS_GLOB])
-    if real is None:
-        pytest.skip("real CPT parquet not present locally")
-    fig, _meta = mv.render_cpt_profile("NOT-A-REAL-TEST-ID")
-    assert fig is None
-
-
-def test_render_cpt_profile_never_plots_an_unavailable_channel():
-    fig, meta = mv.render_cpt_profile("CPT-A2")
-    if fig is None:
-        pytest.skip("real CPT parquet not present locally")
-    assert meta["unavailable_channels"] == ["qt_mpa"]
-    axis_labels = [ax.get_xlabel() for ax in fig.axes]
-    assert not any(label.startswith("qt") for label in axis_labels)
-    assert len(fig.axes) == 3  # qc, fs, u2 only -- never a shared MPa/kPa axis
-
-
-def test_no_liquefaction_calculation_in_guided_or_map_view_modules():
-    for module in (gs, mv):
-        source = inspect.getsource(module)
-        for banned in ("CRR =", "CSR =", "= crr", "= csr", "liquefaction_factor_of_safety ="):
-            assert banned not in source, (module.__name__, banned)
-
-
-def test_render_burial_profile_never_asserts_a_burial_depth_label():
-    assert "source_burial_semantics" in inspect.getsource(mv.render_burial_profile)
-    fig, meta = mv.render_burial_profile()
-    if fig is None:
-        pytest.skip("real Barrow burial parquet not present locally")
-    ylabel = fig.axes[0].get_ylabel()
-    assert "burial depth" not in ylabel.lower()  # the actual rendered axis label, not prose
-    assert isinstance(meta["caveat"], str) and meta["caveat"]
-
-
-def test_cpt_locations_frame_uses_geometry_not_raw_declared_fields():
-    gdf = mv.cpt_locations_frame()
-    if gdf is None:
-        pytest.skip("real CPT locations gpkg not present locally")
-    assert {"easting_m", "northing_m", "test_id"} <= set(gdf.columns)
-    assert len(gdf) == 100
-    # Easting/northing are derived from the canonical geometry -- the source's own declared
-    # position_x_raw/position_y_raw columns pass through untouched alongside them (kept
-    # separate, never merged into or overwritten by the computed canonical value).
-    assert gdf["easting_m"].iloc[0] == pytest.approx(gdf.geometry.iloc[0].x)
-    assert gdf["northing_m"].iloc[0] == pytest.approx(gdf.geometry.iloc[0].y)
-
-
-def test_resolve_layer_state_never_allows_an_unavailable_layer_to_be_checked():
-    assert mv.resolve_layer_state(available=False, default_on=True, requested=True) is False
-    assert mv.resolve_layer_state(available=False, default_on=False, requested=None) is False
-    assert mv.resolve_layer_state(available=True, default_on=True, requested=None) is True
-    assert mv.resolve_layer_state(available=True, default_on=False, requested=True) is True
-    assert mv.resolve_layer_state(available=True, default_on=True, requested=False) is False
-
-
-# --- UI-002 guided view: app.py (source-text only -- top-level Streamlit calls execute on
-# import, so this file is never imported by tests, matching the app.py/components.py convention)
-
-
-def test_app_py_defaults_to_guided_mode():
+def test_app_py_has_no_guided_view_or_mode_toggle():
     source = (REPO_ROOT / "ui" / "app.py").read_text(encoding="utf-8")
-    assert 'st.session_state.setdefault("ui_mode", "guided")' in source
-    assert "mode = c.mode_toggle()" in source
+    for forbidden in (
+        "guided_story",
+        "map_view",
+        "render_guided_view",
+        "mode_toggle",
+        "ui_mode",
+        "guided_project_id",
+        "guided_stage_index",
+    ):
+        assert forbidden not in source, forbidden
 
 
-def test_app_py_preserves_all_five_engineering_pages_and_both_view_functions():
+def test_app_py_preserves_all_five_engineering_pages_and_dispatches_directly():
     source = (REPO_ROOT / "ui" / "app.py").read_text(encoding="utf-8")
     for page in ("Overview", "Capability Explorer", "Test Lab", "Data & Outputs", "Roadmap"):
         assert f'"{page}"' in source
     assert "def render_engineering_view" in source
-    assert "def render_guided_view" in source
+    assert "render_engineering_view()" in source
+
+
+def test_guided_view_modules_no_longer_exist():
+    assert not (REPO_ROOT / "ui" / "guided_story.py").exists()
+    assert not (REPO_ROOT / "ui" / "map_view.py").exists()

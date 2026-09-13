@@ -1,0 +1,16 @@
+.wrapper {
+  padding: var(--space-5) var(--space-4);
+  text-align: center;
+  color: var(--color-text-muted);
+}
+
+.title {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+
+.hint {
+  font-size: 12px;
+  margin: 0;
+}

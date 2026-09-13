@@ -27,6 +27,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
+api = [
+    "fastapi>=0.141.1",
+    "python-multipart>=0.0.32",
+    "rio-tiler>=9.4.4",
+    "uvicorn[standard]>=0.52.4",
+]
 dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.5",
@@ -39,12 +45,15 @@ ui = [
 # UI-001: the engineering workbench (Streamlit) is UI infrastructure, not a scientific runtime
 # dependency. It lives in its own group; making it a default group lets the documented
 # `uv run streamlit run ui/app.py` work from a plain `uv sync`.
-default-groups = ["dev", "ui"]
+# UI-003: the local API adapter (FastAPI) is the bounded backend for the GIS workspace frontend,
+# not a scientific runtime dependency either. Same reasoning, same treatment: its own group,
+# added to defaults so `uv run uvicorn api.main:app` works from a plain `uv sync`.
+default-groups = ["dev", "ui", "api"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["src", "tests", "ui"]
+src = ["src", "tests", "ui", "api"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4"]

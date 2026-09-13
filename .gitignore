@@ -35,9 +35,18 @@ htmlcov/
 data/raw/*
 data/interim/*
 data/processed/*
+data/staging/*
 !data/raw/.gitkeep
 !data/interim/.gitkeep
 !data/processed/.gitkeep
+!data/staging/.gitkeep
+
+# --- UI-003: web/ (React + TypeScript + MapLibre frontend) ---
+web/node_modules/
+web/dist/
+web/node_modules/.tmp/
+web/.vite/
+web/coverage/
 
 # Common large geospatial / scientific data formats, wherever they appear.
 *.tif

@@ -6,6 +6,18 @@
       "runtimeExecutable": "C:\\Users\\baran\\AppData\\Roaming\\Python\\Python313\\Scripts\\uv.exe",
       "runtimeArgs": ["run", "--frozen", "streamlit", "run", "ui/app.py", "--server.port", "8501", "--server.address", "localhost"],
       "port": 8501
+    },
+    {
+      "name": "api",
+      "runtimeExecutable": "C:\\Users\\baran\\AppData\\Roaming\\Python\\Python313\\Scripts\\uv.exe",
+      "runtimeArgs": ["run", "--frozen", "uvicorn", "api.main:app", "--reload", "--port", "8000", "--host", "localhost"],
+      "port": 8000
+    },
+    {
+      "name": "web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "web", "run", "dev", "--", "--port", "5173"],
+      "port": 5173
     }
   ]
 }

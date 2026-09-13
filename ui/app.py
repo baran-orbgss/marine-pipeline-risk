@@ -1,21 +1,18 @@
-"""MARINE ENGINE -- Engineering Workbench (UI-001) + Guided View (UI-002).
+"""MARINE ENGINE -- Engineering Workbench (UI-001).
 
 Internal, localhost-only Streamlit console. Launch with `uv run streamlit run ui/app.py`. It
 changes no scientific behaviour, runs no arbitrary shell command, never downloads data and
 fabricates no output.
 
-Guided View (default): map/visual-first, plain-language walkthroughs of the four real project
-demonstrations, for a first-time user.
-
-Engineering View: the original UI-001 console (capability explorer, test lab, local output
-inspector, roadmap) -- unchanged, reachable via the mode toggle.
+UI-003 replaced the primary product surface with a generic GIS workspace (`api/`, `web/`); this
+app is now reachable only as the internal Engineering Workbench (capability explorer, test lab,
+local output inspector, roadmap) -- no guided-story mode, no mode toggle.
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:  # `streamlit run ui/app.py` puts ui/ on sys.path, not the root
@@ -25,8 +22,6 @@ import streamlit as st  # noqa: E402
 
 from ui import capability_registry as registry  # noqa: E402
 from ui import components as c  # noqa: E402
-from ui import guided_story as gs  # noqa: E402
-from ui import map_view as mv  # noqa: E402
 from ui import output_inspector as oi  # noqa: E402
 from ui import repo_state  # noqa: E402
 from ui import test_runner as tr  # noqa: E402
@@ -42,13 +37,10 @@ c.inject_css()
 
 if "test_results" not in st.session_state:
     st.session_state.test_results = {}
-st.session_state.setdefault("ui_mode", "guided")
-st.session_state.setdefault("guided_project_id", None)
-st.session_state.setdefault("guided_stage_index", {})
 
 
 # =================================================================================================
-# Engineering View (UI-001) -- unchanged behaviour, reachable via the mode toggle.
+# Engineering View (UI-001) -- the only mode.
 # =================================================================================================
 
 
@@ -544,264 +536,4 @@ def render_engineering_view() -> None:
     }[page]()
 
 
-# =================================================================================================
-# Guided View (UI-002) -- map/visual-first default experience.
-# =================================================================================================
-
-
-def _project_thumbnail(project: registry.Project) -> str | None:
-    story = gs.story_for_project(project.id)
-    for stage in story.stages:
-        for candidate in stage.visuals:
-            if candidate.kind == "png":
-                path = mv.resolve_first_existing([candidate.glob])
-                if path is not None:
-                    return str(path)
-    return None
-
-
-def _render_home() -> None:
-    st.markdown('<p class="wb-header">MARINE ENGINE</p>', unsafe_allow_html=True)
-    st.markdown(
-        '<p class="wb-sub">Seabed data. Natural processes. Informed decisions.</p>',
-        unsafe_allow_html=True,
-    )
-    st.markdown("### Explore real marine projects")
-    st.caption("Maps, data and evidence for seafloor and pipeline assessment.")
-
-    with st.expander("START HERE", expanded=True):
-        st.markdown(
-            "1. Choose a project\n"
-            "2. Follow the map steps\n"
-            "3. Click layers to compare outputs\n"
-            "4. Open Engineering View only when you want tests or raw data"
-        )
-
-    cols = st.columns(len(registry.PROJECTS))
-    for col, project in zip(cols, registry.PROJECTS, strict=True):
-        with col:
-            if c.project_card(
-                project.title, project.description, image_path=_project_thumbnail(project)
-            ):
-                st.session_state.guided_project_id = project.id
-                st.session_state.guided_stage_index.setdefault(project.id, 0)
-                st.rerun()
-
-    st.divider()
-    st.markdown("**Explore the engine's current coverage**")
-    counts = registry.maturity_counts()
-    strip = st.columns(4)
-    labels = (
-        (registry.QUALIFIED_POC, "Hazard POCs"),
-        (registry.FOUNDATION_READY, "Foundation"),
-        (registry.PARTIAL, "Partial"),
-        (registry.UNDER_CONSTRUCTION, "Planned"),
-    )
-    for col, (maturity, label) in zip(strip, labels, strict=True):
-        col.metric(label, counts[maturity])
-
-
-def _stage_visuals(stage: gs.GuidedStage) -> tuple[list[tuple[str, Any]], list[str]]:
-    """Resolve one candidate list in priority order (existing PNG(s) -> vector -> raster);
-    returns (gallery_items, technical_paths). Empty lists mean nothing resolved locally."""
-
-    pngs = [v for v in stage.visuals if v.kind == "png"]
-    resolved: list[tuple[str, Any]] = []
-    technical: list[str] = []
-    for candidate in pngs:
-        path = mv.resolve_first_existing([candidate.glob])
-        if path is not None:
-            resolved.append((candidate.label, str(path)))
-            technical.append(path.relative_to(oi.DATA_ROOT).as_posix())
-    if resolved:
-        return resolved, technical
-
-    for candidate in stage.visuals:
-        if candidate.kind == "vector":
-            fig, meta = mv.render_vector_scene(candidate.layers, title=stage.label)
-            if fig is not None:
-                return [(candidate.label, fig)], [g for g, _layer, _lbl in candidate.layers]
-        elif candidate.kind == "raster":
-            fig, meta = mv.render_raster_preview(candidate.raster_glob, title=stage.label)
-            if fig is not None:
-                return [(candidate.label, fig)], [candidate.raster_glob]
-    return [], []
-
-
-def _render_optional_layers(stage: gs.GuidedStage, gallery_key: str) -> None:
-    if not stage.optional_layers:
-        return
-    rows = []
-    resolved_by_label: dict[str, tuple[gs.VisualCandidate, Any, dict]] = {}
-    for candidate in stage.optional_layers:
-        fig: Any = None
-        meta: dict = {}
-        if candidate.kind == "vector":
-            fig, meta = mv.render_vector_scene(candidate.layers, title=candidate.label)
-        elif candidate.kind == "raster":
-            fig, meta = mv.render_raster_preview(candidate.raster_glob, title=candidate.label)
-        elif candidate.kind == "png":
-            path = mv.resolve_first_existing([candidate.glob])
-            fig = str(path) if path else None
-        elif candidate.kind == "chart" and candidate.chart_id == "burial_profile":
-            fig, meta = mv.render_burial_profile()
-        available = fig is not None
-        resolved_by_label[candidate.label] = (candidate, fig, meta)
-        rows.append((candidate.label, available, False))
-
-    with st.expander("More layers", expanded=False):
-        chosen = c.layer_control(rows, key=gallery_key)
-        for label, is_on in chosen.items():
-            if not is_on:
-                continue
-            _candidate, fig, layer_meta = resolved_by_label[label]
-            if hasattr(fig, "savefig"):
-                st.pyplot(fig, use_container_width=True)
-                import matplotlib.pyplot as plt
-
-                plt.close(fig)
-            elif fig:
-                st.image(fig, use_container_width=True)
-            st.caption(label)
-            if layer_meta.get("caveat"):
-                st.caption(f"Source note: {layer_meta['caveat']}")
-
-
-def _render_stage(project: registry.Project, story: gs.ProjectStory, stage_index: int) -> None:
-    stage = story.stages[stage_index]
-    badge = gs.stage_badge_maturity(stage)
-
-    left, center, right = st.columns([2, 7, 2])
-
-    with left:
-        st.markdown("**Guided steps**")
-        items = [
-            (str(i + 1), s.label, gs.stage_badge_maturity(s)) for i, s in enumerate(story.stages)
-        ]
-        clicked = c.stage_nav(items, stage_index, key=f"nav-{project.id}")
-        if clicked != stage_index:
-            st.session_state.guided_stage_index[project.id] = clicked
-            st.rerun()
-
-    with center:
-        badge_html = c.guided_badge(badge) if badge else c.evidence_chip(project.evidence_kind)
-        st.markdown(f"### {stage.label} {badge_html}", unsafe_allow_html=True)
-
-        if stage.key == "cpt_locations" or stage.key == "investigation_area":
-            gdf = mv.cpt_locations_frame()
-            gallery_items, technical = _stage_visuals(stage)
-            c.map_gallery(
-                gallery_items, key=f"gallery-{project.id}-{stage.key}", technical_paths=technical
-            )
-            if gdf is not None:
-                with st.expander("View data", expanded=False):
-                    st.dataframe(
-                        gdf[["test_id", "easting_m", "northing_m"]].rename(
-                            columns={"easting_m": "Easting", "northing_m": "Northing"}
-                        ),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-        elif any(v.kind == "chart" for v in stage.visuals):
-            chart_id = next(v.chart_id for v in stage.visuals if v.kind == "chart")
-            if chart_id == "cpt_profile":
-                gdf = mv.cpt_locations_frame()
-                test_ids = sorted(gdf["test_id"]) if gdf is not None else []
-                c.cpt_profile_widget(test_ids, key=f"cpt-{project.id}-{stage.key}")
-            elif chart_id == "burial_profile":
-                fig, meta = mv.render_burial_profile(project.id)
-                if fig is None:
-                    c.mono("No visual output is present locally for this step.")
-                else:
-                    import matplotlib.pyplot as plt
-
-                    st.pyplot(fig, use_container_width=True)
-                    plt.close(fig)
-                    if meta.get("caveat"):
-                        st.caption(f"Source note: {meta['caveat']}")
-        elif stage.key == "liquefaction_foundation":
-            c.liquefaction_card()
-        elif any(v.kind == "readiness" for v in stage.visuals):
-            candidate = next(v for v in stage.visuals if v.kind == "readiness")
-            info = oi.inspect_json(candidate.glob)
-            if info["status"] != "PRESENT":
-                c.mono("No visual output is present locally for this step.")
-            else:
-                summary = oi.summarize_readiness(info["data"])
-                st.json(summary or info["data"], expanded=True)
-        elif stage.not_applicable_note:
-            c.mono("No visual output is present locally for this step.")
-            st.caption(stage.not_applicable_note)
-        else:
-            gallery_items, technical = _stage_visuals(stage)
-            html_candidates = [v for v in stage.visuals if v.kind == "html"]
-            c.map_gallery(
-                gallery_items, key=f"gallery-{project.id}-{stage.key}", technical_paths=technical
-            )
-            for candidate in html_candidates:
-                path = mv.resolve_first_existing([candidate.glob])
-                if path is None:
-                    continue
-                if st.checkbox(
-                    f"Render {candidate.label} (sandboxed iframe)", key=f"html-{stage.key}"
-                ):
-                    import streamlit.components.v1 as st_components
-
-                    st_components.html(
-                        path.read_text(encoding="utf-8", errors="replace"),
-                        height=800,
-                        scrolling=True,
-                    )
-
-        _render_optional_layers(stage, f"layers-{project.id}-{stage.key}")
-
-        if stage.limitations or stage.capability_id:
-            with st.expander("Show technical details", expanded=False):
-                if stage.limitations:
-                    c.limits_panel(stage.limitations)
-                if stage.capability_id:
-                    cap = registry.hazard_by_id(stage.capability_id)
-                    c.kv_table(
-                        {
-                            "tickets": ", ".join(cap.tickets) or "none",
-                            "cli": ", ".join(cap.cli_commands) or "none",
-                        }
-                    )
-
-    with right:
-        c.three_sentence_block(
-            stage.what_you_are_looking_at, stage.what_it_means, stage.what_it_does_not_mean
-        )
-        st.caption(mv.DISPLAY_VIEW_LABEL)
-
-    prev_col, _mid, next_col, home_col = st.columns([1, 4, 1, 1])
-    if prev_col.button("<- Previous", disabled=stage_index == 0):
-        st.session_state.guided_stage_index[project.id] = max(0, stage_index - 1)
-        st.rerun()
-    st.caption(f"{stage_index + 1} / {len(story.stages)}")
-    if next_col.button("Next ->", disabled=stage_index >= len(story.stages) - 1):
-        st.session_state.guided_stage_index[project.id] = min(
-            len(story.stages) - 1, stage_index + 1
-        )
-        st.rerun()
-    if home_col.button("Home"):
-        st.session_state.guided_project_id = None
-        st.rerun()
-
-
-def render_guided_view() -> None:
-    project_id = st.session_state.guided_project_id
-    if project_id is None:
-        _render_home()
-        return
-    project = registry.project_by_id(project_id)
-    story = gs.story_for_project(project_id)
-    stage_index = st.session_state.guided_stage_index.get(project_id, 0)
-    _render_stage(project, story, stage_index)
-
-
-mode = c.mode_toggle()
-if mode == "guided":
-    render_guided_view()
-else:
-    render_engineering_view()
+render_engineering_view()

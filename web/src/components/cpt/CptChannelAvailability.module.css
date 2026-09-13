@@ -1,0 +1,43 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.label {
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.unit {
+  font-weight: 400;
+  color: var(--color-text-muted);
+}
+
+.chart {
+  width: 100%;
+  height: auto;
+  background: var(--color-panel-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.gridline {
+  stroke: var(--color-border);
+  stroke-width: 1;
+}
+
+.line {
+  fill: none;
+  stroke: var(--color-accent);
+  stroke-width: 1.5;
+}
+
+.unavailable {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  font-style: italic;
+  padding: var(--space-3);
+  text-align: center;
+}

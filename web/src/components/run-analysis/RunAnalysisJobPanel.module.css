@@ -1,0 +1,32 @@
+.stepper {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  flex-wrap: wrap;
+}
+
+.step {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--color-badge-bg);
+}
+
+.stepDone {
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+.stepCurrent {
+  font-weight: 700;
+}
+
+.failureBanner {
+  margin: var(--space-3) var(--space-4);
+  padding: var(--space-3);
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}

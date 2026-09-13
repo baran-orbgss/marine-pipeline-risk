@@ -199,6 +199,102 @@ CPT-profile measured-channel and unknown-`test_id` tests, and
 layer-availability tests -- alongside the existing UI-001 suite,
 unchanged.
 
+**Superseded by UI-003.** UI-003 removed Guided View as the primary
+product UX in favour of the Marine GIS Workspace (below):
+`ui/guided_story.py` and `ui/map_view.py` were deleted, the mode toggle in
+`ui/app.py`/`ui/components.py` was removed, and the Streamlit app now
+renders only Engineering View. The description above is kept as history of
+what UI-002 built and why, per this repository's documentation discipline
+of not rewriting an earlier ticket as if its later removal had always been
+true.
+
+## Marine GIS Workspace (UI-003)
+
+UI-003 replaces Guided View as the primary product surface with a real,
+generic GIS workspace: `api/` (a bounded FastAPI adapter over the existing
+engine and local data, in its own `api` dependency group like `ui`) and
+`web/` (React + TypeScript + MapLibre GL JS, `npm`-managed under `web/`).
+`src/marine_engine/**` is unchanged by this ticket.
+
+```bash
+uv sync
+uv run uvicorn api.main:app --reload --port 8000   # backend
+npm --prefix web install && npm --prefix web run dev  # frontend (proxies /api to the backend)
+```
+
+The workspace auto-discovers spatial metadata (CRS, bounds, geometry,
+raster transform/resolution) from uploaded or already-registered data and
+fits the map automatically -- no manual AOI/CRS entry is required for the
+default workflow. `api/projects.py` builds a generic project catalog by
+scanning all three existing declared-source schemas (`StudyConfig`,
+`ProjectManifest`, the CPT `CptEvidenceManifest`) plus a new ad hoc
+manifest location (`data/processed/<id>/project/manifest.yaml`, written
+when a dropped-files session is explicitly saved), correlated
+case-insensitively against real `data/processed/*` output directories --
+no per-project special-casing.
+
+Layers carry an explicit spatial-support vocabulary (`AREA_SURFACE`,
+`AREA_VECTOR`, `CORRIDOR`, `LINEAR_ANALYSIS`, `LINEAR_ASSET`,
+`POINT_EVIDENCE`, `SOURCE_FOOTPRINT`, `SUPPORT_NODE`) and a full display
+specification (palette, legend, units, opacity, z-index, tooltip fields,
+default visibility) built server-side (`api/display_specs.py`,
+`api/layers.py`) -- the frontend renders from that specification, it never
+invents a palette or a scientific value. Raster layers are served as
+geographically registered map tiles via `rio-tiler` (`api/tiles.py`),
+reprojected on the fly for display only; nothing is ever written back to a
+canonical raster. An unmatched raster/vector displays as `Unclassified`
+rather than guessing a semantic role.
+
+`Run Analysis` launches only an explicit, small allowlist of the engine's
+39 CLI subcommands (`api/allowlist.py`): `build-highres-terrain-poc`,
+`build-seabed-change-poc`, `build-bedform-morphodynamics-poc`,
+`build-scour-susceptibility-poc`, `build-burial-exposure-poc`,
+`build-slope-instability-screening`, `build-cpt-evidence-poc`,
+`build-project-readiness`, `build-project-model` -- chosen because each is
+both explicitly documented as project-generic and writes into a
+per-project output directory a subsequent result-to-layer diff can find.
+Three commands that sound like they should belong here do not: sediment
+mobility (`build-noncohesive-mobility`) and canonical bathymetry
+ingestion predate the generic-POC command family and are coupled to a
+PL854-specific upstream chain; the free-span POC writes to a shared,
+non-per-project directory. All three are reported to the user as
+`NOT_APPLICABLE` with the specific reason, per the ticket's "disable it and
+explain why" requirement, rather than silently omitted -- where evidence
+from any of the three is already built (e.g. PL854's cached sediment
+mobility, scour and free-span evidence), it still appears as an ordinary
+map layer via the same output-discovery mechanism. A launched job snapshots
+the project's output directory, runs the allowlisted command as an
+argument-array subprocess (never a shell), and diffs the directory
+afterwards -- new/changed files matching a known output rule register as
+map layers automatically, with no per-capability special case.
+
+CPT works as a connected GIS interaction: clicking one of the 100 real
+Sheringham Shoal 2008 CPTU test locations highlights it and shows its
+measured `qc`/`fs`/`u2` vs depth; `qt` is reported explicitly as
+`"UNAVAILABLE_FOR_SOURCE"`, never silently dropped, and no CRR, CSR,
+liquefaction factor of safety or soil classification is computed or
+displayed anywhere in this ticket.
+
+What it is not: it does not duplicate any scientific formula in
+TypeScript (display only, from the backend's own display specification);
+it does not persist an ad hoc/dropped-files project into the
+hand-curated `configs/project_manifests/` tree (that stays reviewed and
+hand-authored); and it does not claim marine-project readiness for any
+hazard beyond what the underlying, unmodified engine readiness/evidence
+functions actually report.
+
+Tests: `tests/test_api_*.py` (project-catalog schema merge and
+case-insensitive correlation, spatial-metadata auto-discovery, display-spec
+completeness and the `Unclassified` fallback, bounded/non-mutating tile
+reads, feature-property allowlisting, CPT channel availability, upload
+path containment, the analysis allowlist against the real CLI parser, no
+`shell=True`, result-to-layer registration) and `web/src/**/*.test.ts(x)`
+(Vitest + React Testing Library: layer-tree visibility/active-layer
+independence, deterministic layer ordering, display-spec-to-map-layer
+conversion, legend-vs-palette consistency, the feature-identify allowlist,
+and that Run Analysis renders strictly from the backend's own
+availability value).
+
 ## Status
 
 - `MAR-001`: project scaffold — structure, config system, CLI, and test
