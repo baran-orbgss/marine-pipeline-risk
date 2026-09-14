@@ -3890,3 +3890,155 @@ availability value).
   `ruff check` clean, offline suite 1850 passed (up from 1830), 4 skipped,
   25 live deselected, `uv audit --frozen` clean (87 packages). No further
   ticket has started.
+
+- **MAR-033 (automatic data-to-analysis backend foundation & CPT-based
+  earthquake liquefaction triggering POC; `marine_engine/liquefaction/`,
+  `marine_engine/intake/`, `marine_engine/orchestration/`; extends
+  MAR-032/032A/032B, no CPT evidence semantics changed).** Two tightly
+  coupled additions. (1) The first scientifically defensible CPT-based
+  EARTHQUAKE liquefaction-TRIGGERING screening in the engine, following
+  Boulanger & Idriss (2014, UCD/CGM-14/01) as one internally consistent
+  framework: three accepted corrected-tip-resistance modes
+  (`QT_MEASURED_OR_SOURCE_CORRECTED`, `QC_PLUS_U2_AND_DECLARED_AREA_RATIO`
+  -- requires an explicit declared area ratio, never a typical value --,
+  `QC_EXPLICITLY_DECLARED_AREA_CORRECTED`; qc is never silently treated as
+  qt); two vertical-stress modes (an exact-depth-match-only explicit
+  profile -- never interpolated --, and a seabed-relative layered stress
+  model integrated analytically downward from z = 0, no water-column
+  overburden, no default unit weight); the qc1Ncs overburden-normalization
+  fixed point (CN -> qc1N -> qc1Ncs -> m -> CN, CN capped 1.7, the m
+  exponent's own qc1Ncs bounded [21, 254] only inside that expression,
+  explicit tolerance/max-iterations/convergence flag, vectorized over
+  whole CPT profiles); the clean-sand correction and
+  CRR_7.5,1atm/Csigma/Ksigma (Csigma capped 0.3, Ksigma capped 1.1, qc1Ncs
+  capped 211 only inside Ksigma)/MSF/MSFmax (capped 2.2) exactly as the
+  literal coefficients specify; the depth/magnitude-dependent
+  stress-reduction factor rd (with an explicit
+  `RD_DEEP_EXTRAPOLATION_LIMITATION` past 10 m, never silently
+  extrapolated as equally reliable); CSR = 0.65(a_max/g)(sigma_v0/
+  sigma'_v0)*rd; and FS_liq = CRR_M,sigma / CSR. Fines content accepts
+  four explicit sources (`MEASURED_LAB_FC`, `SOURCE_DECLARED_FC`,
+  `USER_DECLARED_FC_SCENARIO`, `CPT_ESTIMATED_FC_GENERAL_CORRELATION` via
+  the Robertson (2009) Ic/n joint iteration that Boulanger & Idriss
+  reference for their own FC correlation, exposing the three
+  literature-defined `C_FC` in {-0.29, 0.0, +0.29} as separate
+  `GENERAL_CORRELATION_SENSITIVITY` scenarios rather than one
+  silently-chosen value); cohesionless-soil applicability is either
+  `SOURCE_ESTABLISHED` or an explicit `CPT_IC_SCREEN` with a named
+  `ic_cutoff` (never an invisible default threshold). Every row is
+  independently gated to exactly one of five states (`MODEL_FS_BELOW_1` /
+  `_AT_1` / `_ABOVE_1` / `NOT_EVALUABLE` / `OUTSIDE_METHOD_SUPPORT`) with
+  named limitations (`CORRECTED_TIP_RESISTANCE_NOT_ESTABLISHED`,
+  `VERTICAL_STRESS_PROFILE_NOT_AVAILABLE`,
+  `MISSING_FINES_OR_APPLICABILITY`,
+  `COHESIONLESS_SOIL_APPLICABILITY_NOT_ESTABLISHED`,
+  `MISSING_EARTHQUAKE_SCENARIO`, `NONPOSITIVE_EFFECTIVE_STRESS`,
+  `NONPOSITIVE_CSR`, `CN_ITERATION_NOT_CONVERGED`, `NONFINITE_MODEL_RESULT`
+  for the rare qc1Ncs-far-outside-calibration overflow case,
+  `STATIC_SHEAR_OUTSIDE_MODEL_SCOPE`) -- never a safe/unsafe verdict, risk
+  class or probability. A new `liquefaction.readiness` module adds eight
+  Section-40 axes (`CPT_IDENTITY`, `CORRECTED_TIP_RESISTANCE`,
+  `DEPTH_REFERENCE`, `STRESS_PROFILE`, `FINES_OR_SOIL_APPLICABILITY`,
+  `EARTHQUAKE_MAGNITUDE`, `SEABED_PGA`, `METHOD_DOMAIN`) that DELEGATE
+  `CPT_IDENTITY`/`DEPTH_REFERENCE` to the existing, unmodified
+  `geotechnical.cpt_readiness.CptEvidenceFacts` rather than re-deriving
+  canonical-product verification; wave-induced liquefaction remains a
+  completely separate, unimplemented mechanism
+  (`NOT_GRANTED_IN_MAR_033`). A row-level Section-21 profile (29 columns,
+  full audit trail) and a Section-22 `POINT_ANALYSIS` summary (one row per
+  CPT test, `minimum_model_fs_liq` null when no row is evaluable) are the
+  only spatial products -- explicitly point-support only, never an
+  interpolated area hazard surface, Voronoi zone or raster.
+
+  (2) The generic backend architecture the product vision needs going
+  forward: `intake.fingerprint` observes real bytes only (magic-byte
+  container detection for Parquet/SQLite-GeoPackage/TIFF, extension only
+  where no fixed-offset signature exists) with zero scientific
+  interpretation; `intake.recognition`/`registry` run registered
+  recognizers and fold their candidates into one of five deterministic
+  states (`RECOGNIZED` / `AMBIGUOUS` / `UNCLASSIFIED` / `CONTRADICTED` /
+  `INVALID`) -- MAR-033 registers exactly one recognizer, for canonical
+  CPT evidence, which delegates entirely to the existing MAR-032B marker/
+  lineage verifier and reports `required_confirmation=True` (never
+  `RECOGNIZED`) for a structural lookalike with no verified marker; a
+  future recognizer registers here without the planner changing.
+  `orchestration.capability`/`planner` declare a capability's required/
+  produced roles, scenario requirements and dependencies, and answer
+  `AVAILABLE` / `BLOCKED_MISSING_INPUT` / `BLOCKED_AMBIGUOUS_SEMANTICS` /
+  `BLOCKED_INVALID_INPUT` / `NOT_APPLICABLE` with exact named reasons and
+  what would unlock it; a generic Kahn's-algorithm `topological_order`
+  proves the dependency graph acyclic (raises `CycleError` on a
+  constructed cycle) independent of how many capabilities exist.
+  `orchestration.execution` runs the one registered capability only when
+  the plan says `AVAILABLE` -- a blocked/not-applicable plan writes
+  nothing -- and, when it runs, writes a generic `AnalysisProductManifest`
+  (product_id, capability_id, scientific_role, evidence_role, support_type,
+  source_asset_ids, scenario_id, method_id, units, primary_value_fields,
+  geometry/raster path, readiness, limitations, display_name,
+  semantic_warning) as the canonical GIS-layer handoff, so the existing
+  API/UI layer would not need to rediscover scientific semantics by
+  globbing filenames (Section 38's `api/` wiring itself is out of scope
+  here -- UI-003A stays deferred). New CLI: `inspect-data` (fingerprint +
+  recognition only), `plan-processing` (capability availability + exact
+  blockers, optionally against a `--scenario-manifest`), `auto-process`
+  (inspect -> recognize -> plan -> execute unless `--plan-only`, never a
+  free-form shell-out), and `build-cpt-earthquake-liquefaction-poc` (direct
+  entry point for one canonical CPT parquet). A typed
+  `liquefaction.manifest.LiquefactionTriggeringScenarioManifest` YAML (Mw,
+  PGA, tip-resistance mode, stress model, fines source, soil applicability
+  -- no field ever defaults) is kept deliberately outside the generic
+  `project.manifest.ProjectManifest`, mirroring `slope_stability.
+  manifest`'s established precedent, so the generic project layer never
+  accumulates hazard-specific parameters.
+
+  Real Sheringham Shoal 2008 CPTU verification (`auto-process` /
+  `build-cpt-earthquake-liquefaction-poc` against the accepted MAR-032B
+  `cpt_measurements.parquet`, no MAR-032 file touched): recognized
+  `MEASURED_CPT_CPTU_PROFILE` from the verified canonical marker alone (a
+  misleadingly-named copy of the same file also recognizes correctly);
+  with no scenario declared, `BLOCKED_MISSING_INPUT` naming all six real
+  gaps simultaneously (`CORRECTED_TIP_RESISTANCE_NOT_ESTABLISHED`,
+  `VERTICAL_STRESS_PROFILE_NOT_AVAILABLE`,
+  `MISSING_FINES_OR_APPLICABILITY`,
+  `COHESIONLESS_SOIL_APPLICABILITY_NOT_ESTABLISHED`,
+  `MISSING_EARTHQUAKE_SCENARIO` for both Mw and PGA) -- matching the
+  ticket's own predicted outcome, since no source-declared scenario,
+  stress profile, tip-resistance correction or fines exist for this
+  evidence; a `SYNTHETIC_BENCHMARK`-labelled scenario manifest (Mw 7.0,
+  PGA 0.15 g, `QC_PLUS_U2_AND_DECLARED_AREA_RATIO` at the source-stated
+  but MAR-032-unapplied area ratio 0.75, a uniform 18 kN/m3 layered stress
+  model, 5% user-declared fines, source-established cohesionless
+  applicability) unlocks `AVAILABLE` and executes the full 138,514-row /
+  100-test computation in under 2 seconds, writing a 29-column profile
+  parquet, a 100-point `POINT_ANALYSIS` GeoPackage (EPSG:32631, joined to
+  the accepted `cpt_locations.gpkg`, zero unmatched tests), and two
+  product manifests whose `source_asset_ids` correctly cite
+  `sheringham_shoal_2008_cptu`; 4,169 rows (the negative-depth,
+  cone-still-in-rig rows the MAR-032 QA already reports) are
+  `NOT_EVALUABLE` for missing stress at that depth, 34 rows are
+  `NOT_EVALUABLE` via `NONFINITE_MODEL_RESULT` (qc1Ncs overflow a few
+  millimetres below the seabed, where effective stress is ~0), 77,288 rows
+  past 10 m carry `RD_DEEP_EXTRAPOLATION_LIMITATION` without being
+  invalidated; no existing MAR-032B invariant changed (138,514 rows / 100
+  tests, qc/fs/u2 available, qt still unavailable, canonical marker,
+  schema and lineage all unchanged, confirmed by the full, unmodified
+  `tests/test_cpt_evidence.py` suite still passing). PL854 regression:
+  `plan-processing` against its BGS surface-sediment evidence parquet
+  reports `UNCLASSIFIED` / `NOT_APPLICABLE` -- surface sediment is never
+  substituted for CPT/geotechnical evidence, and the existing
+  `geotechnical.cpt_readiness.pl854_cpt_status()` helper (untouched) still
+  reports `CPT_GEOTECHNICAL_PROFILE: NOT_AVAILABLE`.
+
+  Local verification: `uv lock --check` clean; repo-wide `ruff format
+  --check` / `ruff check` clean; offline suite 2033 passed (1971
+  pre-existing + 62 new MAR-033 tests, zero regressions), 4 skipped, 25
+  live deselected; `uv audit --frozen` clean (122 packages, no known
+  vulnerabilities or adverse statuses). Protected `geotechnical/`,
+  `project/`, `terrain/`, `burial/`, `slope_stability/` and every other
+  existing package untouched -- only `cli.py` gained four new subcommands
+  and imports. Structure can be auto-detected from real bytes; science may
+  only be auto-interpreted when evidence is sufficiently specific (a
+  verified MAR-032B marker for CPT; nothing else is auto-classified in
+  this ticket) -- the `RECOGNIZED` / `UNCLASSIFIED` / `BLOCKED_*` /
+  `AVAILABLE` states make that boundary explicit at every layer, and
+  automatic never means speculative. No further ticket has started.
