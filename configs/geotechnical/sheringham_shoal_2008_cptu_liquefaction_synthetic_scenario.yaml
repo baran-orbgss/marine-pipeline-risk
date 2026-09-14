@@ -1,0 +1,43 @@
+# MAR-033 SYNTHETIC_BENCHMARK earthquake-liquefaction-triggering scenario.
+#
+# NOT a real earthquake hazard declaration for the Sheringham Shoal site. The real Sheringham
+# Shoal 2008 CPTU evidence carries no source-declared Mw, PGA, stress profile, area-corrected
+# tip resistance, or fines content (see MAR-032's own liquefaction_readiness.json); every value
+# below is an explicit, user-declared SYNTHETIC_BENCHMARK input used only to demonstrate that the
+# MAR-033 capability planner and the Boulanger & Idriss (2014) computation chain execute
+# end-to-end once a complete scenario is declared. Do not read any of these values as a real
+# seismic-hazard or geotechnical assessment of Sheringham Shoal.
+scenario_id: sheringham_shoal_synthetic_benchmark_v1
+earthquake:
+  moment_magnitude_mw: 7.0
+  pga_g: 0.15
+  pga_reference: FREE_FIELD_SEABED_SURFACE_PGA
+tip_resistance:
+  mode: QC_PLUS_U2_AND_DECLARED_AREA_RATIO
+  basis: >-
+    SYNTHETIC_BENCHMARK: applies the cone area ratio (a = 0.75) that the 2008 GEO source report
+    states for the Van den Berg 60-degree cone (Part C, C.4.2) but that MAR-032 explicitly does
+    NOT apply on its own -- declared here as an explicit MAR-033 scenario input, not silently
+    inferred.
+  area_ratio: 0.75
+stress:
+  mode: SEABED_RELATIVE_LAYERED_STRESS
+  water_unit_weight_kn_m3: 10.0
+  layers:
+    - top_depth_m: 0.0
+      bottom_depth_m: 60.0
+      total_unit_weight_kn_m3: 18.0
+      basis: >-
+        SYNTHETIC_BENCHMARK: assumed uniform saturated-sand total unit weight; not a source-stated
+        Sheringham Shoal geotechnical property.
+fines:
+  source: USER_DECLARED_FC_SCENARIO
+  basis: "SYNTHETIC_BENCHMARK: assumed clean sand for the benchmark scenario."
+  fc_percent: 5.0
+soil_applicability:
+  established: true
+  basis_kind: SOURCE_ESTABLISHED
+  basis: >-
+    SYNTHETIC_BENCHMARK: assumed cohesionless (sand) throughout for the benchmark scenario; not a
+    source-stated Sheringham Shoal soil classification.
+static_shear_material: false

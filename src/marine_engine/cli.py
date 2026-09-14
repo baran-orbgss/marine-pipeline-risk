@@ -64,6 +64,10 @@ from marine_engine.freespan import synthetic as fs_synthetic
 from marine_engine.geotechnical import evidence_build as cpt_evidence_build
 from marine_engine.geotechnical import manifest as cpt_manifest
 from marine_engine.geotechnical import report as cpt_report
+from marine_engine.intake import registry as intake_registry
+from marine_engine.liquefaction import contract as liq_contract
+from marine_engine.liquefaction import manifest as liq_manifest
+from marine_engine.liquefaction import readiness as liq_readiness
 from marine_engine.metocean import (
     combined_bed_shear,
     combined_bed_shear_map,
@@ -76,6 +80,8 @@ from marine_engine.metocean import evidence as metocean_evidence
 from marine_engine.morphology import regional
 from marine_engine.morphology import sandwave_morphometry as swm
 from marine_engine.morphology import sandwave_morphometry_map as swmap
+from marine_engine.orchestration import execution as orch_execution
+from marine_engine.orchestration import planner as orch_planner
 from marine_engine.preprocessing import bathymetry, source_resolution
 from marine_engine.preprocessing.aoi import (
     InvalidAoiGeometryError,
@@ -11167,6 +11173,290 @@ def _cmd_build_cpt_evidence_poc(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_inspect_data(args: argparse.Namespace) -> int:
+    """MAR-033: generic structural fingerprint + semantic recognition for one input file
+    (Sections 26-29). Structure is auto-detected from real bytes; a scientific semantic role is
+    reported only when a registered recognizer's evidence is sufficiently specific -- an unknown
+    or ambiguous input stays UNCLASSIFIED/AMBIGUOUS rather than being guessed. Fully offline;
+    performs no scientific computation and writes nothing.
+    """
+
+    fingerprint, decision = intake_registry.inspect_and_recognize(args.path)
+    print(f"Path: {fingerprint.path}")
+    print(f"Container type: {fingerprint.container_type}")
+    print(f"Byte size: {fingerprint.byte_size}")
+    print(f"SHA-256: {fingerprint.sha256}")
+    if fingerprint.row_or_feature_count is not None:
+        print(f"Row/feature count: {fingerprint.row_or_feature_count}")
+    if fingerprint.crs:
+        print(f"CRS: {fingerprint.crs}")
+    if fingerprint.column_names:
+        shown = list(fingerprint.column_names[:12])
+        suffix = " ..." if len(fingerprint.column_names) > 12 else ""
+        print(f"Columns ({len(fingerprint.column_names)}): {shown}{suffix}")
+    for problem in fingerprint.read_problems:
+        print(f"  READ PROBLEM: {problem}")
+    print()
+    print(f"Recognition state: {decision.state}")
+    print(f"Recognized role: {decision.recognized_role}")
+    for candidate in decision.candidates:
+        print(
+            f"  candidate: role={candidate.role} confidence={candidate.confidence} "
+            f"required_confirmation={candidate.required_confirmation} "
+            f"recognizer={candidate.recognizer_id}"
+        )
+        for item in candidate.evidence:
+            print(f"    evidence: {item}")
+        for item in candidate.contradictions:
+            print(f"    contradiction: {item}")
+    for reason in decision.reasons:
+        print(f"  reason: {reason}")
+    return 0
+
+
+def _load_liquefaction_scenario(
+    scenario_manifest_path: Path | None,
+) -> tuple[
+    liq_manifest.LiquefactionTriggeringScenarioManifest | None,
+    Any,
+    Any,
+    Any,
+    Any,
+    Any,
+]:
+    """Shared by every MAR-033 command that accepts `--scenario-manifest`: load it (if given)
+    and convert to the core domain objects. Returns
+    `(raw_manifest, scenario, tip_resistance, stress_model, fines, soil_applicability)`, all
+    `None` when no manifest was supplied -- there is no default scenario anywhere (Section 6)."""
+
+    if scenario_manifest_path is None:
+        return None, None, None, None, None, None
+    raw_manifest = liq_manifest.load_liquefaction_scenario_manifest(scenario_manifest_path)
+    scenario, tip_resistance, stress_model, fines, soil_applicability = raw_manifest.to_core()
+    return raw_manifest, scenario, tip_resistance, stress_model, fines, soil_applicability
+
+
+def _cmd_plan_processing(args: argparse.Namespace) -> int:
+    """MAR-033 Section 31: for one input, report exactly which registered capabilities are
+    AVAILABLE / BLOCKED_MISSING_INPUT / BLOCKED_AMBIGUOUS_SEMANTICS / BLOCKED_INVALID_INPUT /
+    NOT_APPLICABLE, why, and (when blocked on a missing declaration) exactly what a scenario
+    manifest would need to supply to unlock it. Performs no scientific write.
+    """
+
+    _fingerprint, decision = intake_registry.inspect_and_recognize(args.path)
+    print(f"Recognition: {decision.state} ({decision.recognized_role})")
+
+    readiness_facts = None
+    if args.scenario_manifest is not None:
+        try:
+            raw_manifest, scenario, tip, stress, fines, applicability = _load_liquefaction_scenario(
+                args.scenario_manifest
+            )
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: scenario manifest {args.scenario_manifest} rejected: {exc}")
+            return 1
+        try:
+            inspection = orch_execution.inspect_cpt_evidence(args.path)
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"ERROR: could not inspect {args.path} as CPT evidence: {exc}")
+            return 1
+        readiness_facts = orch_execution.build_readiness_facts(
+            inspection,
+            tip_resistance=tip,
+            stress_model=stress,
+            stress_model_problem=None,
+            fines=fines,
+            soil_applicability=applicability,
+            scenario=scenario,
+            static_shear_material=raw_manifest.static_shear_material,
+        )
+
+    for plan in orch_planner.plan_capabilities(
+        recognition=decision, readiness_facts=readiness_facts
+    ):
+        print(f"Capability {plan.capability_id}: {plan.status}")
+        for reason in plan.reasons:
+            print(f"  reason: {reason}")
+        if plan.status != orch_planner.AVAILABLE:
+            for unlock in plan.unlocking_inputs:
+                print(f"  requires: {unlock}")
+    return 0
+
+
+def _cmd_auto_process(args: argparse.Namespace) -> int:
+    """MAR-033 Sections 33-39, 50-51: inspect -> recognize -> plan -> (unless --plan-only)
+    execute every AVAILABLE capability's safe local computation -> write product manifests. A
+    controlled STOP (reporting exact blockers) replaces any missing scientific/user input --
+    never an improvised default. No free-form command execution occurs anywhere: every step is
+    a direct function call into `geotechnical`/`liquefaction`/`intake`/`orchestration`.
+    """
+
+    _fingerprint, decision = intake_registry.inspect_and_recognize(args.path)
+    print(f"Recognition: {decision.state} ({decision.recognized_role})")
+    for reason in decision.reasons:
+        print(f"  {reason}")
+
+    scenario = tip = stress = fines = applicability = None
+    static_shear_material = False
+    if args.scenario_manifest is not None:
+        try:
+            raw_manifest, scenario, tip, stress, fines, applicability = _load_liquefaction_scenario(
+                args.scenario_manifest
+            )
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: scenario manifest {args.scenario_manifest} rejected: {exc}")
+            return 1
+        static_shear_material = raw_manifest.static_shear_material
+
+    try:
+        inspection = orch_execution.inspect_cpt_evidence(args.path)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"ERROR: could not inspect {args.path}: {exc}")
+        return 1
+
+    readiness_facts = orch_execution.build_readiness_facts(
+        inspection,
+        tip_resistance=tip,
+        stress_model=stress,
+        stress_model_problem=None,
+        fines=fines,
+        soil_applicability=applicability,
+        scenario=scenario,
+        static_shear_material=static_shear_material,
+    )
+    plan = orch_planner.plan_earthquake_cpt_liquefaction_triggering(
+        recognition=decision, readiness_facts=readiness_facts
+    )
+    print(f"Capability {plan.capability_id}: {plan.status}")
+    for reason in plan.reasons:
+        print(f"  reason: {reason}")
+    if plan.status != orch_planner.AVAILABLE:
+        for unlock in plan.unlocking_inputs:
+            print(f"  requires: {unlock}")
+        return 0
+    if args.plan_only:
+        print("(--plan-only: not executing)")
+        return 0
+
+    locations_gdf = gpd.read_file(args.locations) if args.locations is not None else None
+    evidence_id = args.evidence_id or inspection.evidence_id
+    out_dir = args.out or Path("data/processed") / evidence_id / "liquefaction"
+    result = orch_execution.execute_earthquake_cpt_liquefaction_triggering(
+        inspection,
+        evidence_id=evidence_id,
+        scenario=scenario,
+        tip_resistance=tip,
+        stress_model=stress,
+        stress_model_problem=None,
+        fines=fines,
+        soil_applicability=applicability,
+        static_shear_material=static_shear_material,
+        locations_gdf=locations_gdf,
+        out_dir=out_dir,
+    )
+    print(f"Profile rows: {len(result.profile_df)}")
+    print(f"Point summary rows: {len(result.point_summary_df)}")
+    for finding in result.point_analysis_findings:
+        print(f"  FINDING: {finding}")
+    for manifest in result.manifests:
+        print(f"  product manifest -> {manifest.product_id}")
+    return 0
+
+
+def _cmd_build_cpt_earthquake_liquefaction_poc(args: argparse.Namespace) -> int:
+    """MAR-033: direct earthquake CPT liquefaction-triggering POC entry point for one canonical
+    CPT parquet (Sections 3-24, 40, 46, 50). Without --scenario-manifest, reports only the
+    Section 40 axis-by-axis capability readiness (no computation: no default earthquake scenario
+    exists). With one, computes and writes the full Section 21 profile, Section 22 point-analysis
+    layer, and Section 36 product manifests for every CPT test in the evidence.
+    """
+
+    try:
+        inspection = orch_execution.inspect_cpt_evidence(args.cpt_measurements)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"ERROR: could not inspect {args.cpt_measurements}: {exc}")
+        return 1
+
+    evidence_id = args.evidence_id or inspection.evidence_id
+    print(
+        f"CPT evidence {evidence_id!r}: measured_cpt_profile_verified="
+        f"{inspection.cpt_evidence_facts.measured_cpt_profile_verified}"
+    )
+
+    try:
+        raw_manifest, scenario, tip, stress, fines, applicability = _load_liquefaction_scenario(
+            args.scenario_manifest
+        )
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: scenario manifest {args.scenario_manifest} rejected: {exc}")
+        return 1
+    static_shear_material = (
+        raw_manifest.static_shear_material if raw_manifest is not None else False
+    )
+
+    readiness_facts = orch_execution.build_readiness_facts(
+        inspection,
+        tip_resistance=tip,
+        stress_model=stress,
+        stress_model_problem=None,
+        fines=fines,
+        soil_applicability=applicability,
+        scenario=scenario,
+        static_shear_material=static_shear_material,
+    )
+    readiness_result = liq_readiness.assess_earthquake_triggering_readiness(readiness_facts)
+    print(f"EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING readiness: {readiness_result.status}")
+    for axis in readiness_result.axes:
+        print(f"  {axis.axis}: {axis.status}")
+        for reason in axis.blocking_reasons:
+            print(f"    BLOCKING: {reason}")
+        for reason in axis.limitation_reasons:
+            print(f"    LIMITATION: {reason}")
+    print(
+        f"WAVE_LIQUEFACTION: {liq_readiness.wave_liquefaction_status()['status']} "
+        "(separate mechanism, no method authority)"
+    )
+
+    if raw_manifest is None:
+        print("No scenario manifest supplied: no factor-of-safety will be computed.")
+        return 0
+    if readiness_result.status == liq_contract.NOT_READY:
+        print(
+            "BLOCKED: earthquake liquefaction triggering cannot be computed (see BLOCKING "
+            "reasons above)."
+        )
+        return 0
+
+    locations_gdf = gpd.read_file(args.locations) if args.locations is not None else None
+    out_dir = args.out or Path("data/processed") / evidence_id / "liquefaction"
+    result = orch_execution.execute_earthquake_cpt_liquefaction_triggering(
+        inspection,
+        evidence_id=evidence_id,
+        scenario=scenario,
+        tip_resistance=tip,
+        stress_model=stress,
+        stress_model_problem=None,
+        fines=fines,
+        soil_applicability=applicability,
+        static_shear_material=static_shear_material,
+        locations_gdf=locations_gdf,
+        out_dir=out_dir,
+    )
+    print()
+    print(f"Plan status: {result.plan.status}")
+    print(f"Profile rows: {len(result.profile_df) if result.profile_df is not None else 0}")
+    summary_row_count = len(result.point_summary_df) if result.point_summary_df is not None else 0
+    print(f"Point summary rows: {summary_row_count}")
+    for finding in result.point_analysis_findings:
+        print(f"  FINDING: {finding}")
+    for manifest in result.manifests:
+        print(f"  product manifest -> {manifest.product_id}")
+    print()
+    print(f"method: {liq_contract.METHOD_ID}")
+    print(f"authority: {liq_contract.METHOD_AUTHORITY}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -11760,6 +12050,152 @@ def build_parser() -> argparse.ArgumentParser:
         "manifest", type=Path, help="Path to a typed CPT evidence manifest YAML file."
     )
     build_cpt_evidence_poc_parser.set_defaults(func=_cmd_build_cpt_evidence_poc)
+
+    inspect_data_parser = subparsers.add_parser(
+        "inspect-data",
+        help=(
+            "MAR-033: generic structural fingerprint + semantic recognition for one input file. "
+            "Structure is auto-detected from real bytes (container type, CRS, columns, geometry); "
+            "a scientific semantic role is reported only when a registered recognizer's evidence "
+            "is sufficiently specific -- never guessed. Fully offline; writes nothing."
+        ),
+    )
+    inspect_data_parser.add_argument("path", type=Path, help="Path to the file to inspect.")
+    inspect_data_parser.set_defaults(func=_cmd_inspect_data)
+
+    plan_processing_parser = subparsers.add_parser(
+        "plan-processing",
+        help=(
+            "MAR-033: report which registered capabilities are AVAILABLE / BLOCKED_MISSING_INPUT "
+            "/ BLOCKED_AMBIGUOUS_SEMANTICS / BLOCKED_INVALID_INPUT / NOT_APPLICABLE for one input, "
+            "with exact reasons and (when blocked on a missing declaration) exactly what a "
+            "scenario manifest would need to supply. Fully offline; performs no scientific write."
+        ),
+    )
+    plan_processing_parser.add_argument("path", type=Path, help="Path to the file to plan against.")
+    plan_processing_parser.add_argument(
+        "--scenario-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Optional explicit earthquake-liquefaction scenario manifest YAML (typed, "
+            "hazard-specific; not part of the generic project manifest). Without it, capability "
+            "availability is reported using only automatic recognition."
+        ),
+    )
+    plan_processing_parser.set_defaults(func=_cmd_plan_processing)
+
+    auto_process_parser = subparsers.add_parser(
+        "auto-process",
+        help=(
+            "MAR-033: inspect -> recognize -> plan -> (unless --plan-only) execute every "
+            "AVAILABLE capability's safe local computation -> write product manifests, for one "
+            "input file. A controlled STOP (reporting exact blockers) replaces any missing "
+            "scientific/user input -- never an improvised default. No free-form command "
+            "execution; no automatic network acquisition."
+        ),
+    )
+    auto_process_parser.add_argument("path", type=Path, help="Path to the file to process.")
+    auto_process_parser.add_argument(
+        "--scenario-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Optional explicit earthquake-liquefaction scenario manifest YAML. Without it, no "
+            "factor of safety is computed even when the input recognizes as canonical CPT."
+        ),
+    )
+    auto_process_parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Inspect, recognize and plan, but do not execute even an AVAILABLE capability.",
+    )
+    auto_process_parser.add_argument(
+        "--locations",
+        type=Path,
+        default=None,
+        help=(
+            "Optional CPT test-locations vector file (e.g. cpt_locations.gpkg) for the "
+            "POINT_ANALYSIS layer."
+        ),
+    )
+    auto_process_parser.add_argument(
+        "--evidence-id",
+        type=str,
+        default=None,
+        help=(
+            "Evidence id for product provenance (default: the canonical product's own verified "
+            "marker evidence_id, falling back to the file stem only if unrecognized)."
+        ),
+    )
+    auto_process_parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help=(
+            "Output directory for written products (default: "
+            "data/processed/<evidence-id>/liquefaction)."
+        ),
+    )
+    auto_process_parser.set_defaults(func=_cmd_auto_process)
+
+    build_cpt_earthquake_liquefaction_poc_parser = subparsers.add_parser(
+        "build-cpt-earthquake-liquefaction-poc",
+        help=(
+            "MAR-033: deterministic Boulanger & Idriss (2014) CPT-based earthquake liquefaction "
+            "TRIGGERING screening POC for one canonical MAR-032B CPT parquet. Without "
+            "--scenario-manifest, reports only the axis-by-axis capability readiness (no default "
+            "earthquake scenario exists). With one, computes and writes the full row-level "
+            "triggering profile, a POINT_ANALYSIS summary layer, and product manifests for every "
+            "CPT test. Computes no wave-induced liquefaction, LPI, settlement, lateral spreading, "
+            "probability, or risk class."
+        ),
+    )
+    build_cpt_earthquake_liquefaction_poc_parser.add_argument(
+        "cpt_measurements",
+        type=Path,
+        help="Path to a canonical CPT_CANONICAL_PROFILE_V1 measurements parquet.",
+    )
+    build_cpt_earthquake_liquefaction_poc_parser.add_argument(
+        "--scenario-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Optional explicit earthquake-liquefaction scenario manifest YAML (typed, "
+            "hazard-specific; not part of the generic project manifest). Without it no factor of "
+            "safety is computed."
+        ),
+    )
+    build_cpt_earthquake_liquefaction_poc_parser.add_argument(
+        "--locations",
+        type=Path,
+        default=None,
+        help=(
+            "Optional CPT test-locations vector file (e.g. cpt_locations.gpkg) for the "
+            "POINT_ANALYSIS layer."
+        ),
+    )
+    build_cpt_earthquake_liquefaction_poc_parser.add_argument(
+        "--evidence-id",
+        type=str,
+        default=None,
+        help=(
+            "Evidence id for product provenance (default: the canonical product's own verified "
+            "marker evidence_id, falling back to the file stem only if unrecognized)."
+        ),
+    )
+    build_cpt_earthquake_liquefaction_poc_parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help=(
+            "Output directory for written products (default: "
+            "data/processed/<evidence-id>/liquefaction)."
+        ),
+    )
+    build_cpt_earthquake_liquefaction_poc_parser.set_defaults(
+        func=_cmd_build_cpt_earthquake_liquefaction_poc
+    )
 
     return parser
 
