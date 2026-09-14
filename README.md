@@ -4041,4 +4041,135 @@ availability value).
   verified MAR-032B marker for CPT; nothing else is auto-classified in
   this ticket) -- the `RECOGNIZED` / `UNCLASSIFIED` / `BLOCKED_*` /
   `AVAILABLE` states make that boundary explicit at every layer, and
-  automatic never means speculative. No further ticket has started.
+  automatic never means speculative.
+
+- **MAR-033A (scientific convergence & generic auto-processing architecture
+  repair; repairs MAR-033 acceptance gaps -- no CPT evidence semantics
+  changed, no Boulanger & Idriss 2014 equation redesigned).** An acceptance
+  repair of MAR-033, in two parts.
+
+  **Part A -- scientific contract repairs.** (1) `pga_reference` on
+  `EarthquakeScenario`/`EarthquakeDeclaration` lost its silent
+  `FREE_FIELD_SEABED_SURFACE_PGA` default and is now a REQUIRED, explicit
+  field on both the domain dataclass and the Pydantic manifest model -- a
+  scenario omitting it now fails construction/parsing outright (the only
+  currently supported value may still be declared, just never implicitly).
+  (2) `CN_ITERATION_NOT_CONVERGED` moved from a limitation-only note to a
+  BLOCKING reason: a row whose overburden-normalization fixed point never
+  numerically settled can no longer report a `MODEL_FS_*` state, only
+  `NOT_EVALUABLE` -- the intermediate CN/qc1Ncs values stay in the row for
+  auditability, just never treated as an accepted result. (3) Ic/n
+  iteration's `evaluable` and `converged` flags are now inspected
+  independently everywhere Ic feeds a decision: an Ic/n result that is
+  mathematically `evaluable` but never converged can no longer be silently
+  consumed to derive CPT-estimated fines content OR to decide the
+  `CPT_IC_SCREEN` cohesionless-soil-applicability gate -- both now block
+  with `IC_ITERATION_NOT_CONVERGED`. (4) The originally-specified but
+  never-wired `GENERAL_CORRELATION_SENSITIVITY` automatic fines mode is now
+  real: declaring it (a fifth `FinesDeclaration` source, semantically
+  distinct from the single-value `CPT_ESTIMATED_FC_GENERAL_CORRELATION`
+  "expert mode") makes `orchestration.execution` fan out into THREE fully
+  independent row-level profile computations -- one per literature `C_FC`
+  in `{-0.29, 0.0, +0.29}` (`earthquake_triggering.
+  expand_general_correlation_sensitivity_fines`) -- each with its own
+  variant scenario id (`<parent_scenario_id>__C_FC_{MINUS_0P29,0P00,
+  PLUS_0P29}`), own profile/point-summary parquet, own GeoPackage, and own
+  pair of `AnalysisProductManifest`s naming the shared parent scenario in
+  `display_name`. Never averaged, never collapsed to one value, never
+  turned into a probability or an auto-selected "best" result -- proved on
+  real Sheringham Shoal data below, where the three variants' mean
+  CPT-estimated fines content differ by design (21.7% / 38.4% / 56.8%) and
+  every `evaluation_state` distribution differs accordingly.
+
+  **Part B -- generic auto-processing architecture.** The MAR-033
+  orchestration foundation is now a genuinely generic backend rather than a
+  one-capability scaffold. A new `orchestration.context.PlanningContext`
+  (recognized assets, an opaque per-capability `capability_declarations`
+  bag, and `produced_manifests` from capabilities already executed this
+  run) replaces the liquefaction-typed `(recognition, readiness_facts)`
+  pair the old `plan_capabilities()` accepted -- the generic planner now
+  carries no capability-specific dataclass in its own signature. A new
+  `orchestration.runtime.CapabilityRuntime` (`definition` +
+  `readiness_adapter` + `planner_adapter` + `executor`) is the registration
+  unit a capability plugs into `CAPABILITY_RUNTIMES`; CPT earthquake
+  triggering becomes the first (and, in this ticket, only) registered
+  runtime, via three thin adapters in `orchestration.execution` that wrap
+  the existing, unmodified `plan_earthquake_cpt_liquefaction_triggering`/
+  `execute_earthquake_cpt_liquefaction_triggering` functions -- both remain
+  exactly as MAR-033 left them, callable directly, still exercised by their
+  own existing tests. Generic `orchestration.runtime.plan_all(context)` and
+  `execute_plan(context)` dispatch through that registry only; neither
+  contains an `if capability == ...` branch, and neither did before this
+  ticket's synthetic-capability tests existed to prove it. The Kahn's-
+  algorithm `topological_order` MAR-033 already shipped is now actually
+  load-bearing: `build_dependency_order()` builds edges from every
+  registered runtime's OWN declared `CapabilityDefinition.dependencies`,
+  rejects an unknown dependency (`ValueError`) or a cycle (`CycleError`)
+  BEFORE any execution, and `execute_plan` re-plans each capability
+  immediately before its own turn in that order -- so a capability that
+  depends on another sees the dependency's just-produced
+  `scientific_role`s (folded into a fresh, immutable `PlanningContext` via
+  `with_produced_manifests`) in the same run. Proved with synthetic
+  `A -> produces ROLE_A`, `B` (depends on `A`) `-> produces ROLE_B`, `C`
+  (depends on `B`) `-> produces ROLE_C` capabilities (execute in that exact
+  order; `B`/`C` are `BLOCKED_MISSING_INPUT` against the pre-execution
+  context, `AVAILABLE` once their dependency has actually run) and a
+  synthetic `A <-> B` cycle (`CycleError`, zero executor calls) --
+  registered only for the duration of each test, never polluting the real
+  registry. `auto-process` is now a real generic orchestration command:
+  `marine-engine auto-process INPUT [INPUT ...]` fingerprints/recognizes
+  every supplied input, builds one `PlanningContext`, prints
+  `orchestration.runtime.plan_all`'s snapshot for every registered
+  capability, stops after printing on `--plan-only` (no write), otherwise
+  calls `execute_plan` and prints the resulting product manifests --
+  `_cmd_auto_process`'s own source contains no reference to
+  `plan_earthquake_cpt_liquefaction_triggering(`,
+  `execute_earthquake_cpt_liquefaction_triggering(`,
+  `evaluate_triggering_profile`, or any other capability-specific
+  execution/science symbol (asserted by an `inspect.getsource` regression
+  test), and correctly reasons over a CPT file and an unrelated,
+  unrecognized file supplied together (the second stays `UNCLASSIFIED`,
+  never blocking or contaminating the first). `plan-processing` was
+  likewise regenericized onto `PlanningContext`/`plan_all`. Recognizer
+  behaviour is untouched and reconfirmed: canonical MAR-032B CPT still
+  `RECOGNIZED` regardless of filename, a structural lookalike without a
+  verified marker still only `UNCLASSIFIED`/`AMBIGUOUS`, an unknown raster
+  stays `UNCLASSIFIED`, a random `LineString` never becomes a pipeline.
+
+  Real Sheringham Shoal 2008 CPTU re-verification (same accepted MAR-032B
+  `cpt_measurements.parquet`, no MAR-032 file touched, all via the generic
+  `auto-process` path): without a scenario, `BLOCKED_MISSING_INPUT` naming
+  the same six gaps MAR-033 reported; with the existing
+  `SYNTHETIC_BENCHMARK` scenario manifest, `AVAILABLE` and an identical
+  138,514-row / 100-test computation to MAR-033's own run -- 4,169 rows
+  `NOT_EVALUABLE` for missing stress at depth (now ALSO carrying
+  `CN_ITERATION_NOT_CONVERGED`, since NaN propagates through the fixed
+  point for a row with no stress input; this adds no newly-blocked row,
+  confirmed by `NOT_EVALUABLE` staying at exactly 4,203 = 4,169 + the same
+  34 `NONFINITE_MODEL_RESULT` rows as before), 77,288 rows past 10 m still
+  carrying `RD_DEEP_EXTRAPOLATION_LIMITATION`, the 100-point `POINT_ANALYSIS`
+  GeoPackage still EPSG:32631 with zero unmatched tests. A new
+  `sheringham_shoal_2008_cptu_liquefaction_sensitivity_scenario.yaml`
+  (identical to the synthetic-benchmark manifest except
+  `fines.source: GENERAL_CORRELATION_SENSITIVITY`) executed against the
+  same real evidence writes exactly six product manifests (three variants
+  x profile + points), each variant's 138,514-row profile a separate
+  parquet file, mean CPT-estimated fines content 21.7% / 38.4% / 56.8% for
+  `C_FC` -0.29 / 0.00 / +0.29 respectively -- distinct arrays confirmed
+  pairwise non-identical, never averaged. PL854 regression: `inspect-data`/
+  `plan-processing` against its BGS surface-sediment evidence parquet still
+  report `UNCLASSIFIED` / `NOT_APPLICABLE` -- surface sediment is never
+  substituted for CPT/geotechnical evidence.
+
+  Local verification: `uv lock --check` clean (123 packages); repo-wide
+  `ruff format --check` / `ruff check` clean; offline suite 2,057 passed
+  (2,033 pre-existing + 24 new MAR-033A tests, zero regressions), 4
+  skipped, 25 live deselected; `uv audit --frozen` clean (122 packages, no
+  known vulnerabilities or adverse statuses). Protected `geotechnical/`,
+  `project/`, `terrain/`, `burial/`, `slope_stability/` and every other
+  existing package untouched outside `liquefaction/`, `orchestration/`
+  (plus two new modules, `orchestration.context` and `orchestration.
+  runtime`) and `cli.py`'s `plan-processing`/`auto-process` commands (the
+  latter's positional argument becoming `paths` with `nargs="+"`; no other
+  CLI command's argument shape changed). UI-003A remains deferred; no
+  React/MapLibre file was touched. No further ticket has started.

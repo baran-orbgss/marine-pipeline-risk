@@ -11,15 +11,17 @@ with exact, named reasons -- what can run now, what cannot, why, and what input 
 no assumption about any particular capability graph shape, so a future capability's own
 `dependencies` list plugs in without this function changing.
 
-Dispatch to each capability's own planning logic goes through `_CAPABILITY_PLANNERS`, a registry
-keyed by `capability_id` -- adding capability #2 means registering one more entry, never editing
-this module's shared mechanics (`CapabilityPlan`, the five plan states, `topological_order`) or
-any other capability's planning function.
+`plan_capabilities` (MAR-033A Section 9/12) is the generic entry point: it accepts a
+`PlanningContext` and dispatches through the capability RUNTIME registry
+(`orchestration.runtime.CAPABILITY_RUNTIMES`) -- adding capability #2 means registering one more
+`orchestration.runtime.CapabilityRuntime`, never editing this module's shared mechanics
+(`CapabilityPlan`, the five plan states, `topological_order`) or any other capability's own
+planning function (e.g. `plan_earthquake_cpt_liquefaction_triggering`, which remains the
+capability-specific adapter behind that registry).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,6 +43,7 @@ from marine_engine.orchestration.capability import (
     CAPABILITY_REGISTRY,
     EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING,
 )
+from marine_engine.orchestration.context import PlanningContext
 
 __all__ = [
     "AVAILABLE",
@@ -170,21 +173,17 @@ def plan_earthquake_cpt_liquefaction_triggering(
     return CapabilityPlan(capability_id, AVAILABLE, (), ())
 
 
-_CAPABILITY_PLANNERS: dict[str, Callable[..., CapabilityPlan]] = {
-    EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING: plan_earthquake_cpt_liquefaction_triggering,
-}
+def plan_capabilities(context: PlanningContext) -> list[CapabilityPlan]:
+    """MAR-033A Section 9/12: generic capability planning, dispatched through the capability
+    runtime registry (`orchestration.runtime.CAPABILITY_RUNTIMES`) rather than a
+    liquefaction-typed `(recognition, readiness_facts)` pair. Adding capability #2 means
+    registering one more `orchestration.runtime.CapabilityRuntime`, never editing this function or
+    any other capability's planning logic.
 
+    Imports `orchestration.runtime` lazily (not at module level) to avoid a circular import:
+    `runtime` depends on this module for `CapabilityPlan`/`AVAILABLE`/`topological_order`.
+    """
 
-def plan_capabilities(
-    *,
-    recognition: RecognitionDecision,
-    readiness_facts: EarthquakeTriggeringReadinessFacts | None,
-) -> list[CapabilityPlan]:
-    """Dispatches to each registered capability's own planning function via
-    `_CAPABILITY_PLANNERS`. Adding capability #2 means registering one more entry there, never
-    editing this function's body or any other capability's planning logic."""
+    from marine_engine.orchestration.runtime import plan_all
 
-    return [
-        planner(recognition=recognition, readiness_facts=readiness_facts)
-        for planner in _CAPABILITY_PLANNERS.values()
-    ]
+    return plan_all(context)

@@ -46,7 +46,12 @@ FULLY_DECLARED_KWARGS = {
     "soil_applicability_declared": SoilApplicabilityDeclaration(
         established=True, basis_kind=contract.SOURCE_ESTABLISHED, basis="x"
     ),
-    "scenario_declared": EarthquakeScenario(scenario_id="x", moment_magnitude_mw=7.5, pga_g=0.2),
+    "scenario_declared": EarthquakeScenario(
+        scenario_id="x",
+        moment_magnitude_mw=7.5,
+        pga_g=0.2,
+        pga_reference=contract.FREE_FIELD_SEABED_SURFACE_PGA,
+    ),
 }
 
 

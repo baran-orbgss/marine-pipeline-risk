@@ -116,14 +116,6 @@ SOURCE_DECLARED_FC = "SOURCE_DECLARED_FC"
 USER_DECLARED_FC_SCENARIO = "USER_DECLARED_FC_SCENARIO"
 CPT_ESTIMATED_FC_GENERAL_CORRELATION = "CPT_ESTIMATED_FC_GENERAL_CORRELATION"
 
-FINES_CONTENT_SOURCES = frozenset(
-    {
-        MEASURED_LAB_FC,
-        SOURCE_DECLARED_FC,
-        USER_DECLARED_FC_SCENARIO,
-        CPT_ESTIMATED_FC_GENERAL_CORRELATION,
-    }
-)
 MISSING_FINES_OR_APPLICABILITY = "MISSING_FINES_OR_APPLICABILITY"
 
 # --- Section 14: CPT-estimated fines (Robertson 2009 Ic / n, as adopted by Boulanger & Idriss
@@ -136,10 +128,25 @@ IC_N_DEFAULT_MAX_ITERATIONS = 50
 IC_ITERATION_NOT_CONVERGED = "IC_ITERATION_NOT_CONVERGED"
 IC_NOT_EVALUABLE_NONPOSITIVE_TERM = "IC_NOT_EVALUABLE_NONPOSITIVE_TERM"
 
+# GENERAL_CORRELATION_SENSITIVITY (MAR-033A Part A item 6) is deliberately a FIFTH fines source,
+# semantically distinct from CPT_ESTIMATED_FC_GENERAL_CORRELATION: the latter is the single-C_FC
+# "expert mode" (one explicit, user-chosen C_FC -- MAR-033A Part A item 7); the former is the
+# automatic mode that fans out into all three literature-defined C_FC variants below and must
+# never be reduced to one value, averaged, or turned into a probability by this engine.
 GENERAL_CORRELATION_SENSITIVITY = "GENERAL_CORRELATION_SENSITIVITY"
 GENERAL_CORRELATION_C_FC_VALUES: tuple[float, ...] = (-0.29, 0.0, 0.29)
 FC_BOUND_LOW = 0.0
 FC_BOUND_HIGH = 100.0
+
+FINES_CONTENT_SOURCES = frozenset(
+    {
+        MEASURED_LAB_FC,
+        SOURCE_DECLARED_FC,
+        USER_DECLARED_FC_SCENARIO,
+        CPT_ESTIMATED_FC_GENERAL_CORRELATION,
+        GENERAL_CORRELATION_SENSITIVITY,
+    }
+)
 
 # --- Section 15: cohesionless-soil applicability --------------------------------------------------
 

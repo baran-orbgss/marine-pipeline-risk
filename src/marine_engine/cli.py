@@ -80,8 +80,11 @@ from marine_engine.metocean import evidence as metocean_evidence
 from marine_engine.morphology import regional
 from marine_engine.morphology import sandwave_morphometry as swm
 from marine_engine.morphology import sandwave_morphometry_map as swmap
+from marine_engine.orchestration import capability as orch_capability
+from marine_engine.orchestration import context as orch_context
 from marine_engine.orchestration import execution as orch_execution
 from marine_engine.orchestration import planner as orch_planner
+from marine_engine.orchestration import runtime as orch_runtime
 from marine_engine.preprocessing import bathymetry, source_resolution
 from marine_engine.preprocessing.aoi import (
     InvalidAoiGeometryError,
@@ -11236,44 +11239,60 @@ def _load_liquefaction_scenario(
     return raw_manifest, scenario, tip_resistance, stress_model, fines, soil_applicability
 
 
+def _build_earthquake_triggering_declaration(
+    args: argparse.Namespace,
+) -> orch_execution.EarthquakeTriggeringDeclaration | None:
+    """Shared by `plan-processing`/`auto-process`: loads `--scenario-manifest` (if given) into the
+    generic `PlanningContext.capability_declarations` shape this capability's runtime adapters
+    expect. Returns `None` (never a fabricated declaration) when no manifest was supplied."""
+
+    if args.scenario_manifest is None:
+        return None
+    raw_manifest, scenario, tip, stress, fines, applicability = _load_liquefaction_scenario(
+        args.scenario_manifest
+    )
+    locations_gdf = (
+        gpd.read_file(args.locations) if getattr(args, "locations", None) is not None else None
+    )
+    return orch_execution.EarthquakeTriggeringDeclaration(
+        scenario=scenario,
+        tip_resistance=tip,
+        stress_model=stress,
+        fines=fines,
+        soil_applicability=applicability,
+        static_shear_material=raw_manifest.static_shear_material,
+        evidence_id=getattr(args, "evidence_id", None),
+        locations_gdf=locations_gdf,
+        out_dir=getattr(args, "out", None),
+    )
+
+
 def _cmd_plan_processing(args: argparse.Namespace) -> int:
-    """MAR-033 Section 31: for one input, report exactly which registered capabilities are
-    AVAILABLE / BLOCKED_MISSING_INPUT / BLOCKED_AMBIGUOUS_SEMANTICS / BLOCKED_INVALID_INPUT /
-    NOT_APPLICABLE, why, and (when blocked on a missing declaration) exactly what a scenario
-    manifest would need to supply to unlock it. Performs no scientific write.
+    """MAR-033 Section 31 / MAR-033A Section 12: for one input, report exactly which registered
+    capabilities are AVAILABLE / BLOCKED_MISSING_INPUT / BLOCKED_AMBIGUOUS_SEMANTICS /
+    BLOCKED_INVALID_INPUT / NOT_APPLICABLE, why, and (when blocked on a missing declaration)
+    exactly what a scenario manifest would need to supply to unlock it. Performs no scientific
+    write. Dispatches generically through `orchestration.runtime.plan_all` -- no capability-
+    specific branch here.
     """
 
-    _fingerprint, decision = intake_registry.inspect_and_recognize(args.path)
+    fingerprint, decision = intake_registry.inspect_and_recognize(args.path)
     print(f"Recognition: {decision.state} ({decision.recognized_role})")
 
-    readiness_facts = None
-    if args.scenario_manifest is not None:
-        try:
-            raw_manifest, scenario, tip, stress, fines, applicability = _load_liquefaction_scenario(
-                args.scenario_manifest
-            )
-        except (OSError, ValueError) as exc:
-            print(f"ERROR: scenario manifest {args.scenario_manifest} rejected: {exc}")
-            return 1
-        try:
-            inspection = orch_execution.inspect_cpt_evidence(args.path)
-        except (OSError, ValueError, RuntimeError) as exc:
-            print(f"ERROR: could not inspect {args.path} as CPT evidence: {exc}")
-            return 1
-        readiness_facts = orch_execution.build_readiness_facts(
-            inspection,
-            tip_resistance=tip,
-            stress_model=stress,
-            stress_model_problem=None,
-            fines=fines,
-            soil_applicability=applicability,
-            scenario=scenario,
-            static_shear_material=raw_manifest.static_shear_material,
-        )
+    declarations: dict[str, Any] = {}
+    try:
+        declaration = _build_earthquake_triggering_declaration(args)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: scenario manifest {args.scenario_manifest} rejected: {exc}")
+        return 1
+    if declaration is not None:
+        declarations[orch_capability.EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING] = declaration
 
-    for plan in orch_planner.plan_capabilities(
-        recognition=decision, readiness_facts=readiness_facts
-    ):
+    context = orch_context.PlanningContext(
+        recognized_assets=(orch_context.RecognizedAsset(Path(args.path), fingerprint, decision),),
+        capability_declarations=declarations,
+    )
+    for plan in orch_runtime.plan_all(context):
         print(f"Capability {plan.capability_id}: {plan.status}")
         for reason in plan.reasons:
             print(f"  reason: {reason}")
@@ -11284,82 +11303,54 @@ def _cmd_plan_processing(args: argparse.Namespace) -> int:
 
 
 def _cmd_auto_process(args: argparse.Namespace) -> int:
-    """MAR-033 Sections 33-39, 50-51: inspect -> recognize -> plan -> (unless --plan-only)
-    execute every AVAILABLE capability's safe local computation -> write product manifests. A
-    controlled STOP (reporting exact blockers) replaces any missing scientific/user input --
-    never an improvised default. No free-form command execution occurs anywhere: every step is
-    a direct function call into `geotechnical`/`liquefaction`/`intake`/`orchestration`.
+    """MAR-033A Sections 15-16: generic inspect -> recognize -> plan -> (unless --plan-only)
+    execute every AVAILABLE registered capability's safe local computation -> write product
+    manifests, for one or more input files. A controlled STOP (reporting exact blockers) replaces
+    any missing scientific/user input -- never an improvised default. No free-form command
+    execution occurs anywhere. Dispatch is entirely through the capability runtime registry
+    (`orchestration.runtime`): this function contains no CPT/liquefaction-specific execution
+    branch -- it never calls `plan_earthquake_cpt_liquefaction_triggering` or
+    `execute_earthquake_cpt_liquefaction_triggering` itself.
     """
 
-    _fingerprint, decision = intake_registry.inspect_and_recognize(args.path)
-    print(f"Recognition: {decision.state} ({decision.recognized_role})")
-    for reason in decision.reasons:
-        print(f"  {reason}")
+    recognized_assets = []
+    for raw_path in args.paths:
+        path = Path(raw_path)
+        fingerprint, decision = intake_registry.inspect_and_recognize(path)
+        print(f"{path}: {decision.state} ({decision.recognized_role})")
+        for reason in decision.reasons:
+            print(f"  {reason}")
+        recognized_assets.append(orch_context.RecognizedAsset(path, fingerprint, decision))
 
-    scenario = tip = stress = fines = applicability = None
-    static_shear_material = False
-    if args.scenario_manifest is not None:
-        try:
-            raw_manifest, scenario, tip, stress, fines, applicability = _load_liquefaction_scenario(
-                args.scenario_manifest
-            )
-        except (OSError, ValueError) as exc:
-            print(f"ERROR: scenario manifest {args.scenario_manifest} rejected: {exc}")
-            return 1
-        static_shear_material = raw_manifest.static_shear_material
-
+    declarations: dict[str, Any] = {}
     try:
-        inspection = orch_execution.inspect_cpt_evidence(args.path)
-    except (OSError, ValueError, RuntimeError) as exc:
-        print(f"ERROR: could not inspect {args.path}: {exc}")
+        declaration = _build_earthquake_triggering_declaration(args)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: scenario manifest {args.scenario_manifest} rejected: {exc}")
         return 1
+    if declaration is not None:
+        declarations[orch_capability.EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING] = declaration
 
-    readiness_facts = orch_execution.build_readiness_facts(
-        inspection,
-        tip_resistance=tip,
-        stress_model=stress,
-        stress_model_problem=None,
-        fines=fines,
-        soil_applicability=applicability,
-        scenario=scenario,
-        static_shear_material=static_shear_material,
+    context = orch_context.PlanningContext(
+        recognized_assets=tuple(recognized_assets), capability_declarations=declarations
     )
-    plan = orch_planner.plan_earthquake_cpt_liquefaction_triggering(
-        recognition=decision, readiness_facts=readiness_facts
-    )
-    print(f"Capability {plan.capability_id}: {plan.status}")
-    for reason in plan.reasons:
-        print(f"  reason: {reason}")
-    if plan.status != orch_planner.AVAILABLE:
-        for unlock in plan.unlocking_inputs:
-            print(f"  requires: {unlock}")
-        return 0
+
+    for plan in orch_runtime.plan_all(context):
+        print(f"Capability {plan.capability_id}: {plan.status}")
+        for reason in plan.reasons:
+            print(f"  reason: {reason}")
+        if plan.status != orch_planner.AVAILABLE:
+            for unlock in plan.unlocking_inputs:
+                print(f"  requires: {unlock}")
+
     if args.plan_only:
         print("(--plan-only: not executing)")
         return 0
 
-    locations_gdf = gpd.read_file(args.locations) if args.locations is not None else None
-    evidence_id = args.evidence_id or inspection.evidence_id
-    out_dir = args.out or Path("data/processed") / evidence_id / "liquefaction"
-    result = orch_execution.execute_earthquake_cpt_liquefaction_triggering(
-        inspection,
-        evidence_id=evidence_id,
-        scenario=scenario,
-        tip_resistance=tip,
-        stress_model=stress,
-        stress_model_problem=None,
-        fines=fines,
-        soil_applicability=applicability,
-        static_shear_material=static_shear_material,
-        locations_gdf=locations_gdf,
-        out_dir=out_dir,
-    )
-    print(f"Profile rows: {len(result.profile_df)}")
-    print(f"Point summary rows: {len(result.point_summary_df)}")
-    for finding in result.point_analysis_findings:
-        print(f"  FINDING: {finding}")
-    for manifest in result.manifests:
-        print(f"  product manifest -> {manifest.product_id}")
+    _final_context, outcomes = orch_runtime.execute_plan(context)
+    for outcome in outcomes:
+        for manifest in outcome.manifests:
+            print(f"  product manifest -> {manifest.product_id}")
     return 0
 
 
@@ -12088,14 +12079,26 @@ def build_parser() -> argparse.ArgumentParser:
     auto_process_parser = subparsers.add_parser(
         "auto-process",
         help=(
-            "MAR-033: inspect -> recognize -> plan -> (unless --plan-only) execute every "
-            "AVAILABLE capability's safe local computation -> write product manifests, for one "
-            "input file. A controlled STOP (reporting exact blockers) replaces any missing "
-            "scientific/user input -- never an improvised default. No free-form command "
-            "execution; no automatic network acquisition."
+            "MAR-033A: generic inspect -> recognize -> plan -> (unless --plan-only) execute "
+            "every AVAILABLE registered capability's safe local computation -> write product "
+            "manifests, for one or more input files. Dispatch is entirely through the capability "
+            "runtime registry (orchestration.runtime) -- no CPT/liquefaction-specific branch. A "
+            "controlled STOP (reporting exact blockers) replaces any missing scientific/user "
+            "input -- never an improvised default. No free-form command execution; no automatic "
+            "network acquisition."
         ),
     )
-    auto_process_parser.add_argument("path", type=Path, help="Path to the file to process.")
+    auto_process_parser.add_argument(
+        "paths",
+        type=Path,
+        nargs="+",
+        metavar="INPUT",
+        help=(
+            "Path(s) to the file(s) to process. Every input is fingerprinted and recognized "
+            "generically; MAR-033A registers exactly one capability (CPT earthquake-liquefaction "
+            "triggering), but the architecture reasons over any number of supplied inputs."
+        ),
+    )
     auto_process_parser.add_argument(
         "--scenario-manifest",
         type=Path,

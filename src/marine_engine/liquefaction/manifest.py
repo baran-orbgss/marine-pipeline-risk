@@ -46,7 +46,7 @@ class EarthquakeDeclaration(BaseModel):
 
     moment_magnitude_mw: float
     pga_g: float
-    pga_reference: str = contract.FREE_FIELD_SEABED_SURFACE_PGA
+    pga_reference: str
 
     def to_core(self, scenario_id: str) -> EarthquakeScenario:
         return EarthquakeScenario(

@@ -22,6 +22,7 @@ from shapely.geometry import LineString
 from marine_engine.geotechnical import cpt_contract as contract
 from marine_engine.geotechnical import cpt_profile
 from marine_engine.intake import recognition, registry
+from marine_engine.liquefaction import contract as liq_contract
 from marine_engine.liquefaction.earthquake_triggering import (
     FinesDeclaration,
     SoilApplicabilityDeclaration,
@@ -321,7 +322,12 @@ def test_available_execution_writes_product_manifests_with_source_lineage(tmp_pa
     path = tmp_path / "cpt.parquet"
     _write_canonical_cpt(path)
     inspection = orch_execution.inspect_cpt_evidence(path)
-    scenario = EarthquakeScenario(scenario_id="demo", moment_magnitude_mw=7.5, pga_g=0.2)
+    scenario = EarthquakeScenario(
+        scenario_id="demo",
+        moment_magnitude_mw=7.5,
+        pga_g=0.2,
+        pga_reference=liq_contract.FREE_FIELD_SEABED_SURFACE_PGA,
+    )
     tip = TipResistanceDeclaration(
         mode="QC_PLUS_U2_AND_DECLARED_AREA_RATIO", basis="x", area_ratio=0.75
     )
@@ -355,3 +361,95 @@ def test_available_execution_writes_product_manifests_with_source_lineage(tmp_pa
         on_disk = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert on_disk["source_asset_ids"] == ["synthetic_evidence"]
     assert (out_dir / "earthquake_liquefaction_triggering_profile.parquet").is_file()
+
+
+# --- MAR-033A: GENERAL_CORRELATION_SENSITIVITY executes exactly three traceable variants --------
+
+
+def _sensitivity_execution_kwargs(inspection, out_dir):
+    scenario = EarthquakeScenario(
+        scenario_id="sensitivity_demo",
+        moment_magnitude_mw=7.5,
+        pga_g=0.2,
+        pga_reference=liq_contract.FREE_FIELD_SEABED_SURFACE_PGA,
+    )
+    tip = TipResistanceDeclaration(
+        mode="QC_PLUS_U2_AND_DECLARED_AREA_RATIO", basis="x", area_ratio=0.75
+    )
+    stress = LayeredStressModel(
+        layers=(SoilLayer(0.0, 50.0, 18.0, "x"),), water_unit_weight_kn_m3=10.0
+    )
+    sensitivity_fines = FinesDeclaration(
+        source=liq_contract.GENERAL_CORRELATION_SENSITIVITY, basis="automatic sensitivity"
+    )
+    applicability = SoilApplicabilityDeclaration(
+        established=True, basis_kind="SOURCE_ESTABLISHED", basis="x"
+    )
+    return {
+        "inspection": inspection,
+        "evidence_id": "synthetic_evidence",
+        "scenario": scenario,
+        "tip_resistance": tip,
+        "stress_model": stress,
+        "stress_model_problem": None,
+        "fines": sensitivity_fines,
+        "soil_applicability": applicability,
+        "out_dir": out_dir,
+    }
+
+
+def test_general_correlation_sensitivity_executes_exactly_three_traceable_variants(tmp_path):
+    path = tmp_path / "cpt.parquet"
+    _write_canonical_cpt(path)
+    inspection = orch_execution.inspect_cpt_evidence(path)
+    out_dir = tmp_path / "out"
+
+    result = orch_execution.execute_earthquake_cpt_liquefaction_triggering(
+        **_sensitivity_execution_kwargs(inspection, out_dir)
+    )
+
+    assert result.plan.status == orch_planner.AVAILABLE
+    # Three variants x (profile manifest + points manifest) = six, never merged into one, never
+    # averaged, never a "best" pick.
+    assert len(result.manifests) == 6
+    variant_scenario_ids = {manifest.scenario_id for manifest in result.manifests}
+    assert len(variant_scenario_ids) == 3
+    for scenario_id in variant_scenario_ids:
+        assert scenario_id.startswith("sensitivity_demo__C_FC_")
+
+    product_ids = [manifest.product_id for manifest in result.manifests]
+    assert len(set(product_ids)) == len(product_ids)  # every manifest is uniquely identified
+
+    for manifest in result.manifests:
+        assert manifest.capability_id == EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING
+        assert "synthetic_evidence" in manifest.source_asset_ids
+        manifest_path = out_dir / f"{manifest.product_id}.product_manifest.json"
+        assert manifest_path.is_file()
+        on_disk = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert on_disk["scenario_id"] == manifest.scenario_id
+
+    # Each variant's profile parquet is its own distinct, traceable file -- never a shared file two
+    # variants would both need to be filtered out of.
+    profile_files = sorted(
+        out_dir.glob("earthquake_liquefaction_triggering__C_FC_*_profile.parquet")
+    )
+    assert len(profile_files) == 3
+
+    # The combined in-memory profile carries all three variants, distinguishable by scenario_id --
+    # an "explicitly indexed combined result", never a blended/averaged one.
+    assert set(result.profile_df["scenario_id"]) == variant_scenario_ids
+
+
+def test_general_correlation_sensitivity_blocked_plan_writes_nothing(tmp_path):
+    path = tmp_path / "cpt.parquet"
+    _write_canonical_cpt(path)
+    inspection = orch_execution.inspect_cpt_evidence(path)
+    out_dir = tmp_path / "out"
+    kwargs = _sensitivity_execution_kwargs(inspection, out_dir)
+    kwargs["scenario"] = None  # withhold the scenario -> plan cannot be AVAILABLE
+
+    result = orch_execution.execute_earthquake_cpt_liquefaction_triggering(**kwargs)
+
+    assert result.plan.status != orch_planner.AVAILABLE
+    assert result.manifests == ()
+    assert not out_dir.exists()

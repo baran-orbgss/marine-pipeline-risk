@@ -52,7 +52,7 @@ class EarthquakeScenario:
     scenario_id: str
     moment_magnitude_mw: float
     pga_g: float
-    pga_reference: str = contract.FREE_FIELD_SEABED_SURFACE_PGA
+    pga_reference: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.scenario_id, str) or not self.scenario_id.strip():

@@ -31,8 +31,10 @@ __all__ = [
     "FinesDeclaration",
     "SoilApplicabilityDeclaration",
     "TRIGGERING_PROFILE_COLUMNS",
+    "GENERAL_CORRELATION_SENSITIVITY_VARIANT_TAGS",
     "stress_reduction_factor",
     "cyclic_stress_ratio",
+    "expand_general_correlation_sensitivity_fines",
     "evaluate_triggering_profile",
 ]
 
@@ -110,8 +112,16 @@ class TipResistanceDeclaration:
 @dataclass(frozen=True)
 class FinesDeclaration:
     """Section 12: the accepted fines-content source. `fc_percent` is required for every source
-    except CPT_ESTIMATED_FC_GENERAL_CORRELATION, which instead requires `c_fc` to be one of the
-    three literature-defined sensitivity values (Section 14) -- never a silently-chosen 0.0."""
+    except CPT_ESTIMATED_FC_GENERAL_CORRELATION and GENERAL_CORRELATION_SENSITIVITY.
+
+    CPT_ESTIMATED_FC_GENERAL_CORRELATION (the single-C_FC "expert mode") requires `c_fc` to be
+    one of the three literature-defined sensitivity values (Section 14) -- never a
+    silently-chosen 0.0. GENERAL_CORRELATION_SENSITIVITY (MAR-033A: the automatic mode that
+    evaluates all three C_FC variants -- never one silently-chosen value) requires NEITHER
+    `fc_percent` NOR `c_fc`: the three variants are resolved by
+    `expand_general_correlation_sensitivity_fines`, one level above `evaluate_triggering_profile`,
+    never by this declaration picking a single value.
+    """
 
     source: str
     basis: str
@@ -137,6 +147,18 @@ class FinesDeclaration:
                     "fc_percent is not meaningful for CPT_ESTIMATED_FC_GENERAL_CORRELATION (it is "
                     "derived per-row from Ic); declare c_fc instead"
                 )
+        elif self.source == contract.GENERAL_CORRELATION_SENSITIVITY:
+            if self.c_fc is not None:
+                raise LiquefactionInputError(
+                    "GENERAL_CORRELATION_SENSITIVITY evaluates all three literature C_FC values "
+                    "automatically -- declare a single c_fc only for the semantically distinct "
+                    f"CPT_ESTIMATED_FC_GENERAL_CORRELATION expert mode, got c_fc={self.c_fc!r}"
+                )
+            if self.fc_percent is not None:
+                raise LiquefactionInputError(
+                    "fc_percent is not meaningful for GENERAL_CORRELATION_SENSITIVITY (it is "
+                    "derived per-row, per-variant, from Ic)"
+                )
         else:
             if self.fc_percent is None:
                 raise LiquefactionInputError(f"{self.source} requires an explicit fc_percent value")
@@ -144,6 +166,39 @@ class FinesDeclaration:
                 raise LiquefactionInputError(
                     f"fc_percent must be within [{contract.FC_BOUND_LOW}, {contract.FC_BOUND_HIGH}]"
                 )
+
+
+# GENERAL_CORRELATION_SENSITIVITY product-identity tags (MAR-033A): a fixed, explicit mapping over
+# the three literal `contract.GENERAL_CORRELATION_C_FC_VALUES` -- never a formatted/derived string
+# that could collide or drift if the literal values ever changed order.
+GENERAL_CORRELATION_SENSITIVITY_VARIANT_TAGS: dict[float, str] = {
+    -0.29: "C_FC_MINUS_0P29",
+    0.0: "C_FC_0P00",
+    0.29: "C_FC_PLUS_0P29",
+}
+
+
+def expand_general_correlation_sensitivity_fines(
+    fines: FinesDeclaration,
+) -> tuple[FinesDeclaration, ...]:
+    """MAR-033A Part A item 6: expands one GENERAL_CORRELATION_SENSITIVITY declaration into the
+    three literature-defined CPT_ESTIMATED_FC_GENERAL_CORRELATION variant declarations, one per
+    C_FC in `contract.GENERAL_CORRELATION_C_FC_VALUES` (-0.29, 0.0, +0.29) -- never averaged,
+    never reduced to one value, never converted into a probability. Each returned declaration is
+    the semantically distinct single-C_FC "expert mode" (Section 7), used internally to compute
+    one independent profile per variant."""
+
+    if fines.source != contract.GENERAL_CORRELATION_SENSITIVITY:
+        raise LiquefactionInputError(
+            "expand_general_correlation_sensitivity_fines requires source="
+            f"{contract.GENERAL_CORRELATION_SENSITIVITY!r}, got {fines.source!r}"
+        )
+    return tuple(
+        FinesDeclaration(
+            source=contract.CPT_ESTIMATED_FC_GENERAL_CORRELATION, basis=fines.basis, c_fc=c_fc
+        )
+        for c_fc in contract.GENERAL_CORRELATION_C_FC_VALUES
+    )
 
 
 @dataclass(frozen=True)
@@ -378,15 +433,34 @@ def evaluate_triggering_profile(
         fc_percent = np.full(n, np.nan)
         fc_source: str | None = None
         _block_all(contract.MISSING_FINES_OR_APPLICABILITY)
+    elif fines.source == contract.GENERAL_CORRELATION_SENSITIVITY:
+        # evaluate_triggering_profile computes exactly ONE profile per call. GENERAL_CORRELATION_
+        # SENSITIVITY must be expanded into its three CPT_ESTIMATED_FC_GENERAL_CORRELATION variant
+        # declarations (`expand_general_correlation_sensitivity_fines`) by the caller -- never
+        # silently collapsed to one value here.
+        raise LiquefactionInputError(
+            "evaluate_triggering_profile computes exactly one profile; "
+            f"{contract.GENERAL_CORRELATION_SENSITIVITY} must be expanded into three "
+            f"{contract.CPT_ESTIMATED_FC_GENERAL_CORRELATION} variants via "
+            "expand_general_correlation_sensitivity_fines before calling this function "
+            "(see orchestration.execution for the per-variant fan-out)"
+        )
     elif fines.source == contract.CPT_ESTIMATED_FC_GENERAL_CORRELATION:
         assert ic_result is not None
+        # Section 14/MAR-033A: a non-converged Ic/n iteration must never be silently consumed to
+        # derive fines content, even where it was mathematically `evaluable` (net resistance and
+        # effective stress both positive) -- convergence is a separate, independently-gated fact.
+        ic_usable = ic_result.evaluable & ic_result.converged
         fc_percent = np.where(
-            ic_result.evaluable,
+            ic_usable,
             cpt_normalization.estimate_fc_general_correlation(ic_result.ic, fines.c_fc),
             np.nan,
         )
         fc_source = fines.source
         _block_where(~ic_result.evaluable, contract.MISSING_FINES_OR_APPLICABILITY)
+        _block_where(
+            ic_result.evaluable & ~ic_result.converged, contract.IC_ITERATION_NOT_CONVERGED
+        )
     else:
         fc_percent = np.full(n, fines.fc_percent)
         fc_source = fines.source
@@ -396,13 +470,23 @@ def evaluate_triggering_profile(
         _block_all(contract.COHESIONLESS_SOIL_APPLICABILITY_NOT_ESTABLISHED)
     elif soil_applicability.basis_kind == contract.CPT_IC_SCREEN:
         assert ic_result is not None
-        not_applicable = ~ic_result.evaluable | (ic_result.ic > soil_applicability.ic_cutoff)
-        _block_where(not_applicable, contract.COHESIONLESS_SOIL_APPLICABILITY_NOT_ESTABLISHED)
+        # Same dual evaluable/converged gate as the fines branch above: a non-converged Ic/n
+        # result must not be silently used to decide cohesionless-soil applicability either.
+        ic_usable = ic_result.evaluable & ic_result.converged
+        _block_where(~ic_result.evaluable, contract.COHESIONLESS_SOIL_APPLICABILITY_NOT_ESTABLISHED)
+        _block_where(
+            ic_result.evaluable & ~ic_result.converged, contract.IC_ITERATION_NOT_CONVERGED
+        )
+        exceeds_cutoff = ic_usable & (ic_result.ic > soil_applicability.ic_cutoff)
+        _block_where(exceeds_cutoff, contract.COHESIONLESS_SOIL_APPLICABILITY_NOT_ESTABLISHED)
     # SOURCE_ESTABLISHED: every row is treated as applicable; nothing further to gate.
 
     # --- Section 11: overburden normalization (NaN naturally propagates from any missing input)
     cn_result = cpt_normalization.iterate_cn_qc1ncs(corrected_tip_kpa, sigma_eff_safe, fc_percent)
-    _note_where(~cn_result.converged, contract.CN_ITERATION_NOT_CONVERGED)
+    # MAR-033A: CN non-convergence is BLOCKING -- a numerical FS_liq built on a qc1Ncs the fixed
+    # point never actually settled on is not an accepted model result (never MODEL_FS_*), even
+    # though the intermediate CN/qc1Ncs values are still preserved in the row for auditability.
+    _block_where(~cn_result.converged, contract.CN_ITERATION_NOT_CONVERGED)
 
     # --- Section 8 (limitation only, not blocking) ---------------------------------------------
     _note_where(
