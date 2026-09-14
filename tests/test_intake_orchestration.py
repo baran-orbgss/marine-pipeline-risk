@@ -173,6 +173,7 @@ def test_ambiguous_candidates_block_the_plan():
     candidate_a = recognition.SemanticCandidate(
         role="ROLE_A",
         confidence=recognition.CONFIDENCE_INSUFFICIENT,
+        evidence_level=recognition.STRUCTURAL_CANDIDATE,
         evidence=(),
         contradictions=(),
         required_confirmation=True,
@@ -181,6 +182,7 @@ def test_ambiguous_candidates_block_the_plan():
     candidate_b = recognition.SemanticCandidate(
         role="ROLE_B",
         confidence=recognition.CONFIDENCE_INSUFFICIENT,
+        evidence_level=recognition.STRUCTURAL_CANDIDATE,
         evidence=(),
         contradictions=(),
         required_confirmation=True,
@@ -203,6 +205,7 @@ def test_contradicted_sufficient_candidates_block_the_plan():
     candidate_a = recognition.SemanticCandidate(
         role="ROLE_A",
         confidence=recognition.CONFIDENCE_SUFFICIENT,
+        evidence_level=recognition.CANONICAL_VERIFIED,
         evidence=("x",),
         contradictions=(),
         required_confirmation=False,
@@ -211,6 +214,7 @@ def test_contradicted_sufficient_candidates_block_the_plan():
     candidate_b = recognition.SemanticCandidate(
         role="ROLE_B",
         confidence=recognition.CONFIDENCE_SUFFICIENT,
+        evidence_level=recognition.CANONICAL_VERIFIED,
         evidence=("y",),
         contradictions=(),
         required_confirmation=False,

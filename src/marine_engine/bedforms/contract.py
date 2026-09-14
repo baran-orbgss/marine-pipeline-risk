@@ -8,6 +8,11 @@ from __future__ import annotations
 
 from typing import Any
 
+# MAR-034: the orchestration-facing scientific_role a generated bedform-morphology product
+# manifest carries -- the same name already used by the standalone
+# `build-bedform-morphodynamics-poc` CLI report, now given one authoritative, importable name.
+SANDBED_BEDFORM_MORPHOLOGY_AND_OBSERVED_CHANGE = "SANDBED_BEDFORM_MORPHOLOGY_AND_OBSERVED_CHANGE"
+
 REQUIRED_FIELDS_STATIC: tuple[dict[str, str], ...] = (
     {
         "field": "high_resolution_analytical_bathymetry",

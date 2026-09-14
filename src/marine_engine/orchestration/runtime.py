@@ -75,6 +75,16 @@ class CapabilityRuntime:
     readiness_adapter: Callable[[PlanningContext], Any]
     planner_adapter: Callable[[PlanningContext, Any], CapabilityPlan]
     executor: Callable[[PlanningContext, CapabilityPlan], CapabilityExecutionOutcome]
+    declaration_adapter: Callable[[Any], Any] | None = None
+    """MAR-034 Section 8: an optional, capability-owned adapter turning generic, uninterpreted
+    declaration material (`orchestration.declaration.DeclarationRequest`) into this capability's
+    own typed declaration (or `None`, meaning "nothing declared"). Capability-specific declaration
+    PARSING belongs here, never in the generic CLI: `auto-process`/`plan-processing` hand every
+    registered runtime the same raw request and store whatever comes back in
+    `PlanningContext.capability_declarations[capability_id]`, without ever importing or
+    understanding the declaration type itself. A capability with no capability-level declaration
+    (e.g. one whose facts are entirely per-asset, via `PlanningContext.asset_declarations`) simply
+    leaves this `None`."""
 
 
 CAPABILITY_RUNTIMES: dict[str, CapabilityRuntime] = {}
@@ -84,13 +94,25 @@ def register_capability_runtime(runtime: CapabilityRuntime) -> None:
     """Section 10-11: the registry owns capability dispatch. Registration requires the
     capability_id to already be declared in `orchestration.capability.CAPABILITY_REGISTRY` --
     the declarative "what" (`CapabilityDefinition`) and the executable "how" (`CapabilityRuntime`)
-    stay two separate registries that must agree on identity, never silently diverge."""
+    stay two separate registries that must agree on identity, never silently diverge.
+
+    MAR-034 Section 47: a capability_id that is ALREADY registered is refused outright (never
+    silently replaced by a second, potentially different, runtime) -- re-registering the exact
+    same capability_id is always a bug (a double bootstrap call, or two recognizers/adapters
+    racing to own one identity), never a legitimate update path. An idempotent bootstrap (Section
+    10) guards itself at a higher level instead of relying on this function tolerating repeats.
+    """
 
     capability_id = runtime.definition.capability_id
     if capability_id not in CAPABILITY_REGISTRY:
         raise ValueError(
             f"cannot register a runtime for unregistered capability_id {capability_id!r}; "
             "declare a CapabilityDefinition in orchestration.capability.CAPABILITY_REGISTRY first"
+        )
+    if capability_id in CAPABILITY_RUNTIMES:
+        raise ValueError(
+            f"capability runtime {capability_id!r} is already registered -- duplicate "
+            "registration is refused rather than silently replacing it"
         )
     CAPABILITY_RUNTIMES[capability_id] = runtime
 

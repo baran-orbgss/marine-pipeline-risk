@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from marine_engine.intake.declaration import AssetDeclaration
 from marine_engine.intake.fingerprint import DataFingerprint
 from marine_engine.intake.recognition import RECOGNIZED, RecognitionDecision
 from marine_engine.orchestration.product_manifest import AnalysisProductManifest
@@ -25,11 +26,24 @@ __all__ = ["RecognizedAsset", "PlanningContext"]
 @dataclass(frozen=True)
 class RecognizedAsset:
     """One inspected input file: its observed structure plus its semantic recognition decision
-    (Sections 26-29), unmodified."""
+    (Sections 26-29), unmodified.
+
+    `asset_id` / `declaration` (MAR-034 Section 6) are the generic, engine-owned declared facts
+    for THIS asset, if a run manifest's `assets:` section named one -- resolved once, by the
+    caller that builds this `RecognizedAsset`, from the manifest's own path matching
+    (`intake.manifest.RunManifest.asset_declaration_for_path`). `asset_id` defaults to the file
+    stem when nothing was declared, so every asset still has a stable identifier for
+    `AnalysisProductManifest.source_asset_ids` (Section 36) even with no manifest at all."""
 
     path: Path
     fingerprint: DataFingerprint
     recognition: RecognitionDecision
+    asset_id: str = ""
+    declaration: AssetDeclaration | None = None
+
+    def __post_init__(self) -> None:
+        if not self.asset_id:
+            object.__setattr__(self, "asset_id", self.path.stem)
 
 
 @dataclass(frozen=True)

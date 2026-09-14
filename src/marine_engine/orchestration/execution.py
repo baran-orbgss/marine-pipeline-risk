@@ -29,6 +29,7 @@ from marine_engine.geotechnical.cpt_readiness import CptEvidenceFacts
 from marine_engine.intake.recognition import UNCLASSIFIED, RecognitionDecision
 from marine_engine.intake.registry import inspect_and_recognize
 from marine_engine.liquefaction import contract as liq_contract
+from marine_engine.liquefaction import manifest as liq_manifest
 from marine_engine.liquefaction import products
 from marine_engine.liquefaction.earthquake_triggering import (
     GENERAL_CORRELATION_SENSITIVITY_VARIANT_TAGS as _VARIANT_TAGS,
@@ -51,6 +52,7 @@ from marine_engine.orchestration.capability import (
     EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING,
 )
 from marine_engine.orchestration.context import PlanningContext, RecognizedAsset
+from marine_engine.orchestration.declaration import DeclarationRequest
 from marine_engine.orchestration.planner import (
     AVAILABLE,
     CapabilityPlan,
@@ -74,9 +76,11 @@ __all__ = [
     "ExecutionResult",
     "execute_earthquake_cpt_liquefaction_triggering",
     "EarthquakeTriggeringDeclaration",
+    "earthquake_triggering_declaration_adapter",
     "earthquake_triggering_readiness_adapter",
     "earthquake_triggering_planner_adapter",
     "earthquake_triggering_executor",
+    "register_earthquake_triggering_runtime",
 ]
 
 
@@ -494,6 +498,36 @@ class EarthquakeTriggeringDeclaration:
     out_dir: Path | None = None
 
 
+def earthquake_triggering_declaration_adapter(
+    request: DeclarationRequest,
+) -> EarthquakeTriggeringDeclaration | None:
+    """MAR-034 Section 8: capability-specific declaration PARSING, moved here from `cli.py`'s
+    former `_build_earthquake_triggering_declaration` (which the generic `_cmd_auto_process`/
+    `_cmd_plan_processing` called directly). The generic CLI now hands every registered
+    capability the SAME raw `DeclarationRequest`; only this capability's own adapter knows what
+    `--scenario-manifest`/`--locations`/`--evidence-id`/`--out` mean for it. Returns `None`
+    (never a fabricated declaration) when no scenario manifest was supplied."""
+
+    if request.scenario_manifest_path is None:
+        return None
+    raw_manifest = liq_manifest.load_liquefaction_scenario_manifest(request.scenario_manifest_path)
+    scenario, tip_resistance, stress_model, fines, soil_applicability = raw_manifest.to_core()
+    locations_gdf = (
+        gpd.read_file(request.locations_path) if request.locations_path is not None else None
+    )
+    return EarthquakeTriggeringDeclaration(
+        scenario=scenario,
+        tip_resistance=tip_resistance,
+        stress_model=stress_model,
+        fines=fines,
+        soil_applicability=soil_applicability,
+        static_shear_material=raw_manifest.static_shear_material,
+        evidence_id=request.evidence_id,
+        locations_gdf=locations_gdf,
+        out_dir=request.out_dir,
+    )
+
+
 def _matched_cpt_asset(context: PlanningContext) -> RecognizedAsset | None:
     matched = context.assets_with_role(cpt_contract.MEASURED_CPT_CPTU_PROFILE)
     return matched[0] if matched else None
@@ -600,11 +634,19 @@ def earthquake_triggering_executor(
     )
 
 
-register_capability_runtime(
-    CapabilityRuntime(
-        definition=CAPABILITY_REGISTRY[EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING],
-        readiness_adapter=earthquake_triggering_readiness_adapter,
-        planner_adapter=earthquake_triggering_planner_adapter,
-        executor=earthquake_triggering_executor,
+def register_earthquake_triggering_runtime() -> None:
+    """MAR-034 Section 10: registration is now an explicit call the engine bootstrap makes
+    (`orchestration.bootstrap.register_builtin_runtimes`), never an import-time side effect --
+    merely importing this module no longer registers anything. `register_builtin_runtimes` itself
+    is idempotent; `register_capability_runtime` still refuses an outright duplicate
+    registration, so this function must not be called more than once directly."""
+
+    register_capability_runtime(
+        CapabilityRuntime(
+            definition=CAPABILITY_REGISTRY[EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING],
+            readiness_adapter=earthquake_triggering_readiness_adapter,
+            planner_adapter=earthquake_triggering_planner_adapter,
+            executor=earthquake_triggering_executor,
+            declaration_adapter=earthquake_triggering_declaration_adapter,
+        )
     )
-)

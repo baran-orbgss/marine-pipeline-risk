@@ -21,6 +21,11 @@ OBSERVED_SEABED_ELEVATION_CHANGE = "OBSERVED_SEABED_ELEVATION_CHANGE"
 OBSERVED_SEABED_RAISING = "OBSERVED_SEABED_RAISING"
 OBSERVED_SEABED_LOWERING = "OBSERVED_SEABED_LOWERING"
 
+# MAR-034: the orchestration-facing scientific_role a generated multi-epoch change product
+# manifest carries -- the same name already used by the standalone `build-seabed-change-poc` CLI
+# report's own embedded raster tag, now given one authoritative, importable name.
+MULTI_EPOCH_SEABED_CHANGE_POC = "MULTI_EPOCH_SEABED_CHANGE_POC"
+
 ANNUALIZATION_DISCLAIMER = (
     "ANNUALIZED OBSERVED CHANGE IS NOT A FUTURE CHANGE RATE PREDICTION. It is the observed "
     "total change over the survey interval divided by the elapsed time -- a descriptive rate, "

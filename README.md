@@ -4173,3 +4173,169 @@ availability value).
   latter's positional argument becoming `paths` with `nargs="+"`; no other
   CLI command's argument shape changed). UI-003A remains deferred; no
   React/MapLibre file was touched. No further ticket has started.
+
+- **MAR-034 (generic spatial intake + terrain/bedform/change
+  auto-processing; registers existing accepted `terrain`/`bedforms`/
+  `change` science behind the MAR-033A runtime -- no new equation,
+  threshold, sign-convention rule, or hazard interpretation introduced).**
+  Extends the one-capability MAR-033A architecture into the first real
+  multi-capability, multi-package auto-processing workflow.
+
+  **Architectural debt repaid (Section 8/10).** `cli.py`'s
+  `_cmd_auto_process`/`_cmd_plan_processing` no longer construct
+  `EarthquakeTriggeringDeclaration` (or any other capability's declaration
+  type) themselves: a new `CapabilityRuntime.declaration_adapter` slot lets
+  each capability interpret its own raw `orchestration.declaration.
+  DeclarationRequest` (the legacy `--scenario-manifest`/`--locations`/
+  `--evidence-id`/`--out` flags, plus an optional generic run manifest's
+  own `capabilities.<id>` section); the generic CLI dispatches to every
+  registered runtime's adapter identically and never imports a
+  capability-specific declaration symbol (`_build_earthquake_triggering_
+  declaration` is gone from `cli.py` entirely, moved into `orchestration.
+  execution.earthquake_triggering_declaration_adapter`). Separately,
+  `orchestration.bootstrap.register_builtin_runtimes()` replaces the old
+  import-time registration side effect (`import orchestration.execution`
+  used to populate `CAPABILITY_RUNTIMES` as a side effect); it is
+  idempotent and import-order-independent, and is what `cli.py`/tests now
+  call explicitly. `register_capability_runtime` additionally refuses an
+  outright duplicate registration rather than silently replacing it.
+
+  **Generic asset declaration (Section 6/7/9).** A new `intake.declaration.
+  AssetDeclaration` (asset_id, semantic_role, source_sign_convention,
+  vertical_datum, survey_epoch, evidence_role, source_description) is the
+  one generic, engine-owned place an operator states facts a canonical
+  marker or embedded source metadata does not already establish -- loaded
+  from an optional run manifest (`intake.manifest.load_run_manifest`, new
+  `--run-manifest` CLI flag) whose `assets:` section this generic loader
+  parses and whose `capabilities:` section it leaves entirely raw/opaque
+  (only a capability's own `declaration_adapter` reads its own key --
+  Section 48). `orchestration.context.RecognizedAsset` now carries its own
+  `asset_id`/`declaration` (defaulting `asset_id` to the file stem when
+  nothing was declared) so every downstream adapter can reach an asset's
+  declared facts directly, without a second registry to keep in sync.
+  Declared and observed facts are never merged: `RasterFacts.vertical_
+  datum`/`survey_epoch` come from the declaration, everything else on it
+  from the raster's own bytes.
+
+  **Recognition evidence levels (Section 5).** `intake.recognition.
+  SemanticCandidate` gained an `evidence_level` axis (`CANONICAL_VERIFIED`
+  / `SOURCE_METADATA_VERIFIED` / `USER_DECLARED` / `STRUCTURAL_CANDIDATE`
+  / `UNKNOWN`), orthogonal to the existing `confidence` axis. A new
+  `NEEDS_SEMANTIC_CONFIRMATION` decision state replaces the branch that
+  used to collapse "a candidate exists but requires confirmation" into
+  plain `UNCLASSIFIED` (the true "nothing to say" case, zero candidates,
+  is untouched); `plan_earthquake_cpt_liquefaction_triggering` maps it to
+  `BLOCKED_AMBIGUOUS_SEMANTICS`, same as `AMBIGUOUS`. Five new recognizers
+  register alongside the existing CPT one: `recognize_verified_analytical_
+  bathymetry` (succeeds ONLY through an explicit `AssetDeclaration`
+  claiming `semantic_role=BATHYMETRY_RASTER` -- reusing the existing
+  MAR-026 category name, never a competing one -- plus structural raster
+  compatibility; a bare undeclared GeoTIFF produces zero candidates and
+  stays `UNCLASSIFIED`, confirmed by a dedicated negative test),
+  `recognize_canonical_terrain_product`/`recognize_terrain_derivative_
+  product`/`recognize_generated_change_product` (each reads a raster's own
+  embedded `scientific_role`/`layer` GDAL tags -- the SAME identity
+  `slope_stability.contract` already consumes for canonical terrain, so a
+  product this ticket's capabilities write is recognized identically to
+  one written by the standalone MAR-020/021 POC commands).
+
+  **Four new capabilities, one runtime each, all in `orchestration.
+  adapters.*`:**
+  - `canonicalize_bathymetry` -- every recognized `BATHYMETRY_RASTER` asset
+    canonicalized independently (never merged across epochs). Calls
+    `terrain.readiness.assess_bathymetry_readiness`/`terrain.canonical.
+    build_canonical_bed_elevation` unmodified. Sign convention is a hard
+    gate this capability's OWN plan adds on top of terrain's intrinsic
+    readiness (which has no sign-convention concept at all) -- missing it
+    blocks with the exact `SOURCE_SIGN_CONVENTION_REQUIRED` reason,
+    mirroring MAR-026A's intrinsic/effective readiness split; never
+    inferred from raster values or a filename.
+  - `terrain_derivatives` -- depends on `canonicalize_bathymetry`; consumes
+    a canonical product from EITHER a recognized input or one just
+    produced earlier in the same run (the real MAR-033A generated-product-
+    unlocks-a-dependent-capability proof, now exercised with real science
+    instead of a synthetic stand-in). Calls the unmodified `terrain.
+    derivatives` windowed-moment functions (slope, aspect, profile/plan
+    curvature, local relief, terrain roughness), one `AnalysisProductManifest`
+    per layer.
+  - `observed_multi_epoch_seabed_change` -- epoch pairing/order comes ONLY
+    from each source's own DECLARED `survey_epoch` text (a year is parsed
+    out of it; never a filename, never a filesystem timestamp); fewer than
+    two distinct declared years blocks with `SURVEY_EPOCH_ORDER_NOT_
+    ESTABLISHED`, and a declared year shared by more than one asset blocks
+    `BLOCKED_AMBIGUOUS_SEMANTICS` rather than guessing. Calls the
+    unmodified `change.epoch_compatibility` (hard vertical-datum gate),
+    `change.alignment`, `change.common_support`, `change.dod` exactly as
+    the standalone `build-seabed-change-poc` command does. The product
+    manifest's `limitations` field carries the signed-change definition,
+    both epochs' labels, datum evidence, and alignment method explicitly --
+    never an erosion/deposition label, never a risk class.
+  - `bedform_morphodynamics` -- automatic tile DISCOVERY (the standalone
+    POC's own 2000 m/1000 m cascading search) is out of scope: choosing a
+    canonical tile's centre/size/crest-azimuth is a genuinely missing,
+    DECLARED fact (a new `BedformDeclaration`, loaded through the same
+    `declaration_adapter` mechanism), never guessed. Calls the unmodified
+    `bedforms.extraction.extract_tile_bedforms` per declared tile; when
+    exactly two canonical epochs are available, additionally calls
+    `bedforms.matching.match_crests_within_tile` unmodified. Per-tile
+    canonical-scale eligibility reuses `sandwave_morphometry.
+    meets_wavelengths_across_tile` applied to the tile's own detected
+    median wavelength (never a new threshold), and natural/anthropogenic
+    context reuses `bedforms.natural_context.assess_natural_bedform_
+    validation_status` -- both reported transparently in a
+    `tile_validation_status` table product, never silently upgraded.
+    Outputs are Parquet/GeoPackage, never forced into a raster.
+
+  **No science in the CLI (Section 39).** `_cmd_auto_process`/
+  `_cmd_plan_processing` still contain no capability-specific execution
+  OR declaration-parsing branch, confirmed by an `inspect.getsource`
+  regression test alongside the existing MAR-033A one.
+
+  **Real Sheringham Shoal verification (`data/raw/sheringham_shoal_2020/`,
+  no MAR-020/021 command invoked manually -- the generic planner/executor
+  drove the entire chain via `auto-process --run-manifest`).** Single-
+  epoch: the real, full-resolution 2020 MBES GeoTIFF (9,855 x 25,610 px,
+  ~252M cells) fingerprinted, recognized via a declared `AssetDeclaration`,
+  and canonicalized end-to-end (`READY`, zero limitations, real bed
+  elevation -24.4 m to -3.19 m) in one run; full-resolution
+  `terrain_derivatives` on that same 252M-cell array hit a real
+  `numpy.core._exceptions._ArrayMemoryError` inside the unmodified
+  `terrain.derivatives.compute_neighborhood_moments` (this environment had
+  ~9.6 GB free RAM at the time; the underlying accepted function needs
+  more for an untiled array this large -- an environmental resource
+  limit, not a MAR-034 defect, consistent with this repository's own
+  prior documented experience reprocessing this exact raster). The full
+  chain -- recognition, readiness, canonicalization, all seven terrain
+  derivatives, product manifests -- was then proved on a real, fully-valid
+  2,000 x 2,000 px window of the SAME survey (genuine measured values, a
+  smaller real extent, clearly declared as a spatial subset, never
+  synthetic data). Multi-epoch: a real 2018 subset was extracted directly
+  from the actual TCE-1975 XYZ export (chunked-scanned for the ~4.0M real
+  rows falling inside the 2020 subset's exact grid, ~23 s, no full ~2.2 GB
+  in-memory load) and declared with its real survey period/vertical datum
+  (LAT, matching the 2020 survey's own documented datum); `auto-process`
+  on both real epochs together paired them by declared year (2018/2020,
+  never filename), confirmed `VERTICAL_DATUM_HARMONIZED`, classified
+  `EXACT_GRID_ALIGNMENT`, and computed a real `delta_bed_elevation_m`
+  (3,999,842 common valid cells, mean -0.051 m, std 0.122 m) -- terrain
+  derivatives and bedform morphodynamics (one real declared 1,000 m tile)
+  also executed for both real epochs in the same run: 33/35 real bedform
+  observations (2018/2020), median wavelength 61-66 m (canonical
+  sand-wave scale, `canonical_scale_eligible=True`), 24 real canonical
+  crest matches between epochs, `natural_bedform_validation_status=
+  INFRASTRUCTURE_CONTEXT_INSUFFICIENT` (honestly reported -- no
+  interpretation shapefile was declared for this demonstration, never
+  assumed natural).
+
+  Local verification: `uv lock --check` clean; repo-wide `ruff format
+  --check` / `ruff check` clean; full offline suite passed, zero
+  regressions (exact counts in the final MAR-034 ticket report). `uv
+  audit --frozen` clean. Protected `geotechnical/`, `liquefaction/`,
+  `burial/`, `project/` and the pre-existing `terrain/`, `bedforms/`,
+  `change/`, `slope_stability/` science modules untouched except for
+  purely additive, zero-behavior-change constants (`terrain.
+  product_roles`, and one new named constant each in `bedforms.contract`
+  and `change.dod`, both reusing string values the standalone POC commands
+  already embed). `route/`, `scour/`, `metocean/`, `sediment/` untouched;
+  UI-003A remains deferred; no React/MapLibre file was touched. No further
+  ticket has started.

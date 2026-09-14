@@ -30,6 +30,7 @@ from marine_engine.intake.recognition import (
     AMBIGUOUS,
     CONTRADICTED,
     INVALID,
+    NEEDS_SEMANTIC_CONFIRMATION,
     RECOGNIZED,
     UNCLASSIFIED,
     RecognitionDecision,
@@ -136,6 +137,17 @@ def plan_earthquake_cpt_liquefaction_triggering(
             capability_id, BLOCKED_AMBIGUOUS_SEMANTICS, tuple(recognition.reasons), ()
         )
     if recognition.state == AMBIGUOUS:
+        return CapabilityPlan(
+            capability_id,
+            BLOCKED_AMBIGUOUS_SEMANTICS,
+            tuple(recognition.reasons),
+            ("explicit semantic confirmation of the CPT role",),
+        )
+    if recognition.state == NEEDS_SEMANTIC_CONFIRMATION:
+        # MAR-034 Section 5: a candidate exists (e.g. a structurally CPT-lookalike parquet with
+        # no verified marker) but nothing confirms it -- blocked pending confirmation, distinct
+        # from UNCLASSIFIED's "genuinely nothing to say" (Section 43 regression: a lookalike must
+        # never quietly become measured CPT evidence).
         return CapabilityPlan(
             capability_id,
             BLOCKED_AMBIGUOUS_SEMANTICS,

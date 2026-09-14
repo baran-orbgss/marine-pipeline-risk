@@ -17,20 +17,20 @@ from pathlib import Path
 
 import pytest
 
+from marine_engine.orchestration import bootstrap as orch_bootstrap
 from marine_engine.orchestration import capability as orch_capability
 from marine_engine.orchestration import context as orch_context
-
-# Importing `orchestration.execution` (unused directly here otherwise) is required, not
-# incidental: it is what registers the real EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING runtime into
-# `orchestration.runtime.CAPABILITY_RUNTIMES` as an import-time side effect. Without it, this test
-# module run in isolation (rather than alongside test_intake_orchestration.py, which also imports
-# it) would see an empty real registry and `test_new_capability_registers_alongside_the_real_one_
-# unmodified` below would fail to find the real capability regardless of the fix it tests for.
-from marine_engine.orchestration import execution as _orch_execution  # noqa: F401
 from marine_engine.orchestration import planner as orch_planner
 from marine_engine.orchestration import runtime as orch_runtime
 from marine_engine.orchestration.capability import EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING
 from marine_engine.orchestration.product_manifest import AnalysisProductManifest
+
+# MAR-034 Section 10: registration is now an explicit, idempotent bootstrap call -- never an
+# import-time side effect. This module-level call (not incidental) is what populates the REAL
+# registries before `test_new_capability_registers_alongside_the_real_one_unmodified` below runs;
+# without it, this test module run in isolation would see an empty real registry regardless of
+# the fix it tests for. Calling it again inside any individual test is always safe (idempotent).
+orch_bootstrap.register_builtin_runtimes()
 
 
 def _synthetic_definition(

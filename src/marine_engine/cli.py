@@ -64,6 +64,7 @@ from marine_engine.freespan import synthetic as fs_synthetic
 from marine_engine.geotechnical import evidence_build as cpt_evidence_build
 from marine_engine.geotechnical import manifest as cpt_manifest
 from marine_engine.geotechnical import report as cpt_report
+from marine_engine.intake import manifest as intake_manifest
 from marine_engine.intake import registry as intake_registry
 from marine_engine.liquefaction import contract as liq_contract
 from marine_engine.liquefaction import manifest as liq_manifest
@@ -80,8 +81,9 @@ from marine_engine.metocean import evidence as metocean_evidence
 from marine_engine.morphology import regional
 from marine_engine.morphology import sandwave_morphometry as swm
 from marine_engine.morphology import sandwave_morphometry_map as swmap
-from marine_engine.orchestration import capability as orch_capability
+from marine_engine.orchestration import bootstrap as orch_bootstrap
 from marine_engine.orchestration import context as orch_context
+from marine_engine.orchestration import declaration as orch_declaration
 from marine_engine.orchestration import execution as orch_execution
 from marine_engine.orchestration import planner as orch_planner
 from marine_engine.orchestration import runtime as orch_runtime
@@ -11239,58 +11241,102 @@ def _load_liquefaction_scenario(
     return raw_manifest, scenario, tip_resistance, stress_model, fines, soil_applicability
 
 
-def _build_earthquake_triggering_declaration(
-    args: argparse.Namespace,
-) -> orch_execution.EarthquakeTriggeringDeclaration | None:
-    """Shared by `plan-processing`/`auto-process`: loads `--scenario-manifest` (if given) into the
-    generic `PlanningContext.capability_declarations` shape this capability's runtime adapters
-    expect. Returns `None` (never a fabricated declaration) when no manifest was supplied."""
+def _load_run_manifest_if_given(args: argparse.Namespace) -> intake_manifest.RunManifest | None:
+    """MAR-034 Section 9: the generic, OPTIONAL run manifest -- `assets:` (parsed into generic
+    `AssetDeclaration`s here) and `capabilities:` (left as raw, uninterpreted dicts; only each
+    capability's own `declaration_adapter` reads its own section -- Section 48)."""
 
-    if args.scenario_manifest is None:
+    run_manifest_path = getattr(args, "run_manifest", None)
+    if run_manifest_path is None:
         return None
-    raw_manifest, scenario, tip, stress, fines, applicability = _load_liquefaction_scenario(
-        args.scenario_manifest
-    )
-    locations_gdf = (
-        gpd.read_file(args.locations) if getattr(args, "locations", None) is not None else None
-    )
-    return orch_execution.EarthquakeTriggeringDeclaration(
-        scenario=scenario,
-        tip_resistance=tip,
-        stress_model=stress,
-        fines=fines,
-        soil_applicability=applicability,
-        static_shear_material=raw_manifest.static_shear_material,
-        evidence_id=getattr(args, "evidence_id", None),
-        locations_gdf=locations_gdf,
-        out_dir=getattr(args, "out", None),
-    )
+    return intake_manifest.load_run_manifest(run_manifest_path)
+
+
+def _build_recognized_assets(
+    paths: list[Path], run_manifest: intake_manifest.RunManifest | None
+) -> list[orch_context.RecognizedAsset]:
+    """Fingerprints and recognizes every input path, resolving each one's own `AssetDeclaration`
+    (if the run manifest names it) before recognition -- Section 6/11: a recognizer may consult a
+    declaration, but nothing here decides scientific semantics itself."""
+
+    recognized_assets: list[orch_context.RecognizedAsset] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        declaration = (
+            run_manifest.asset_declaration_for_path(path) if run_manifest is not None else None
+        )
+        fingerprint, decision = intake_registry.inspect_and_recognize(
+            path, asset_declaration=declaration
+        )
+        print(f"{path}: {decision.state} ({decision.recognized_role})")
+        for reason in decision.reasons:
+            print(f"  {reason}")
+        asset_id = declaration.asset_id if declaration is not None else path.stem
+        recognized_assets.append(
+            orch_context.RecognizedAsset(
+                path, fingerprint, decision, asset_id=asset_id, declaration=declaration
+            )
+        )
+    return recognized_assets
+
+
+def _build_capability_declarations(
+    args: argparse.Namespace, run_manifest: intake_manifest.RunManifest | None
+) -> dict[str, Any]:
+    """MAR-034 Section 8/48: the ONLY place `auto-process`/`plan-processing` touch capability
+    declarations, and it dispatches entirely generically -- every registered capability's OWN
+    `declaration_adapter` (if it has one) receives the SAME raw `DeclarationRequest` and decides
+    for itself what, if anything, it needs. This function never imports or understands
+    `EarthquakeTriggeringDeclaration`, a bedform/change declaration, or any other capability-
+    specific type."""
+
+    manifest_dir = run_manifest.manifest_dir if run_manifest is not None else None
+    raw_sections = run_manifest.raw_capability_sections if run_manifest is not None else {}
+    declarations: dict[str, Any] = {}
+    for capability_id, runtime in orch_runtime.CAPABILITY_RUNTIMES.items():
+        if runtime.declaration_adapter is None:
+            continue
+        request = orch_declaration.DeclarationRequest(
+            capability_id=capability_id,
+            raw_capability_section=raw_sections.get(capability_id),
+            scenario_manifest_path=getattr(args, "scenario_manifest", None),
+            locations_path=getattr(args, "locations", None),
+            evidence_id=getattr(args, "evidence_id", None),
+            out_dir=getattr(args, "out", None),
+            manifest_dir=manifest_dir,
+        )
+        declaration = runtime.declaration_adapter(request)
+        if declaration is not None:
+            declarations[capability_id] = declaration
+    return declarations
 
 
 def _cmd_plan_processing(args: argparse.Namespace) -> int:
-    """MAR-033 Section 31 / MAR-033A Section 12: for one input, report exactly which registered
-    capabilities are AVAILABLE / BLOCKED_MISSING_INPUT / BLOCKED_AMBIGUOUS_SEMANTICS /
-    BLOCKED_INVALID_INPUT / NOT_APPLICABLE, why, and (when blocked on a missing declaration)
-    exactly what a scenario manifest would need to supply to unlock it. Performs no scientific
-    write. Dispatches generically through `orchestration.runtime.plan_all` -- no capability-
-    specific branch here.
+    """MAR-033 Section 31 / MAR-033A Section 12 / MAR-034 Section 8: for one input, report exactly
+    which registered capabilities are AVAILABLE / BLOCKED_MISSING_INPUT /
+    BLOCKED_AMBIGUOUS_SEMANTICS / BLOCKED_INVALID_INPUT / NOT_APPLICABLE, why, and (when blocked)
+    exactly what would unlock it. Performs no scientific write. Dispatches generically through
+    `orchestration.runtime.plan_all` and every registered capability's own `declaration_adapter`
+    -- no capability-specific branch here, and this function never constructs a capability-
+    specific declaration type itself.
     """
 
-    fingerprint, decision = intake_registry.inspect_and_recognize(args.path)
-    print(f"Recognition: {decision.state} ({decision.recognized_role})")
-
-    declarations: dict[str, Any] = {}
+    orch_bootstrap.register_builtin_runtimes()
     try:
-        declaration = _build_earthquake_triggering_declaration(args)
+        run_manifest = _load_run_manifest_if_given(args)
     except (OSError, ValueError) as exc:
-        print(f"ERROR: scenario manifest {args.scenario_manifest} rejected: {exc}")
+        print(f"ERROR: run manifest {getattr(args, 'run_manifest', None)} rejected: {exc}")
         return 1
-    if declaration is not None:
-        declarations[orch_capability.EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING] = declaration
+
+    recognized_assets = _build_recognized_assets([args.path], run_manifest)
+    try:
+        declarations = _build_capability_declarations(args, run_manifest)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: declaration material rejected: {exc}")
+        return 1
 
     context = orch_context.PlanningContext(
-        recognized_assets=(orch_context.RecognizedAsset(Path(args.path), fingerprint, decision),),
-        capability_declarations=declarations,
+        recognized_assets=tuple(recognized_assets), capability_declarations=declarations
     )
     for plan in orch_runtime.plan_all(context):
         print(f"Capability {plan.capability_id}: {plan.status}")
@@ -11303,33 +11349,32 @@ def _cmd_plan_processing(args: argparse.Namespace) -> int:
 
 
 def _cmd_auto_process(args: argparse.Namespace) -> int:
-    """MAR-033A Sections 15-16: generic inspect -> recognize -> plan -> (unless --plan-only)
-    execute every AVAILABLE registered capability's safe local computation -> write product
-    manifests, for one or more input files. A controlled STOP (reporting exact blockers) replaces
-    any missing scientific/user input -- never an improvised default. No free-form command
-    execution occurs anywhere. Dispatch is entirely through the capability runtime registry
-    (`orchestration.runtime`): this function contains no CPT/liquefaction-specific execution
-    branch -- it never calls `plan_earthquake_cpt_liquefaction_triggering` or
-    `execute_earthquake_cpt_liquefaction_triggering` itself.
+    """MAR-033A Sections 15-16 / MAR-034 Section 8: generic inspect -> recognize -> plan ->
+    (unless --plan-only) execute every AVAILABLE registered capability's safe local computation ->
+    write product manifests, for one or more input files. A controlled STOP (reporting exact
+    blockers) replaces any missing scientific/user input -- never an improvised default. No
+    free-form command execution occurs anywhere. Dispatch is entirely through the capability
+    runtime registry (`orchestration.runtime`) and each capability's own `declaration_adapter`:
+    this function contains no CPT/liquefaction-specific (or bathymetry/bedform/change-specific)
+    execution or declaration-parsing branch -- it never calls
+    `plan_earthquake_cpt_liquefaction_triggering`, `execute_earthquake_cpt_liquefaction_triggering`,
+    or constructs `EarthquakeTriggeringDeclaration` (or any other capability's declaration type)
+    directly.
     """
 
-    recognized_assets = []
-    for raw_path in args.paths:
-        path = Path(raw_path)
-        fingerprint, decision = intake_registry.inspect_and_recognize(path)
-        print(f"{path}: {decision.state} ({decision.recognized_role})")
-        for reason in decision.reasons:
-            print(f"  {reason}")
-        recognized_assets.append(orch_context.RecognizedAsset(path, fingerprint, decision))
-
-    declarations: dict[str, Any] = {}
+    orch_bootstrap.register_builtin_runtimes()
     try:
-        declaration = _build_earthquake_triggering_declaration(args)
+        run_manifest = _load_run_manifest_if_given(args)
     except (OSError, ValueError) as exc:
-        print(f"ERROR: scenario manifest {args.scenario_manifest} rejected: {exc}")
+        print(f"ERROR: run manifest {getattr(args, 'run_manifest', None)} rejected: {exc}")
         return 1
-    if declaration is not None:
-        declarations[orch_capability.EARTHQUAKE_CPT_LIQUEFACTION_TRIGGERING] = declaration
+
+    recognized_assets = _build_recognized_assets(args.paths, run_manifest)
+    try:
+        declarations = _build_capability_declarations(args, run_manifest)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: declaration material rejected: {exc}")
+        return 1
 
     context = orch_context.PlanningContext(
         recognized_assets=tuple(recognized_assets), capability_declarations=declarations
@@ -12074,6 +12119,17 @@ def build_parser() -> argparse.ArgumentParser:
             "availability is reported using only automatic recognition."
         ),
     )
+    plan_processing_parser.add_argument(
+        "--run-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "MAR-034: optional generic run manifest YAML (top-level `assets:`/`capabilities:` "
+            "sections) supplying facts a canonical marker or embedded source metadata does not "
+            "already establish (e.g. bathymetry source_sign_convention/vertical_datum/"
+            "survey_epoch). Never required merely to unlock something already establishable."
+        ),
+    )
     plan_processing_parser.set_defaults(func=_cmd_plan_processing)
 
     auto_process_parser = subparsers.add_parser(
@@ -12138,6 +12194,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Output directory for written products (default: "
             "data/processed/<evidence-id>/liquefaction)."
+        ),
+    )
+    auto_process_parser.add_argument(
+        "--run-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "MAR-034: optional generic run manifest YAML (top-level `assets:`/`capabilities:` "
+            "sections) supplying facts a canonical marker or embedded source metadata does not "
+            "already establish (e.g. bathymetry source_sign_convention/vertical_datum/"
+            "survey_epoch; bedform tile declarations). Never required merely to unlock something "
+            "already establishable."
         ),
     )
     auto_process_parser.set_defaults(func=_cmd_auto_process)
